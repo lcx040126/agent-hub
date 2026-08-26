@@ -312,7 +312,8 @@ v0.2.0 发布验证（2026-08-26）
 - `pnpm typecheck` 通过两套 TypeScript 配置检查。
 - `pnpm test` 通过 41 个测试文件、188 项自动化测试。
 - `pnpm build` 通过 Vite 客户端构建和服务端/桌面端 TypeScript 编译。
-- Windows x64 NSIS 发布候选已在 D 盘短路径构建成功：`AgentHub-Setup-0.2.0-x64.exe`，119,634,964 字节，SHA-256 `D9873FF64241EC967887B0AFE3F9B80618B3DD818A9A4C589C84C63A61921EF5`。
+- Windows x64 NSIS 发布候选已在 D 盘短路径构建成功：`AgentHub-Setup-0.2.0-x64.exe`，119,635,267 字节，SHA-256 `119072ED02E285A34CD58C989804834644728E4C7CD1775A5FD01EE3DA770650`。
+- GitHub Windows Release 首次运行暴露了较慢虚拟机上的 PowerShell watchdog 冷启动竞态；默认握手预算有限调整为 30 秒，截止点会再读取一次 ready/heartbeat 标记，超时诊断包含子进程与标记状态。修复后 watchdog 测试 7/7、关键真实握手连续 5/5、全量 188/188 通过。
 - 发布候选的 `app.asar` 通过真实 `ELECTRON_RUN_AS_NODE` 子进程健康探针，返回 v0.2.0、MCP bridge 和 Codex Hook 均为 `ok`。
 - 安装包未配置商业 Authenticode 证书；已确认签名状态为 `NotSigned`。Ed25519 只用于验证更新清单，不能消除 Windows 的未知发布者提示。
 

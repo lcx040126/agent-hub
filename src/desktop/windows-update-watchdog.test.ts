@@ -10,6 +10,7 @@ import { WindowsUpdateRecoveryExecutor } from "./windows-update-watchdog.js";
 
 const execFileAsync = promisify(execFile);
 const directories: string[] = [];
+const WINDOWS_HANDSHAKE_TIMEOUT_MS = 30_000;
 
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -40,7 +41,7 @@ describe("Windows update recovery watchdog", () => {
       const executor = new WindowsUpdateRecoveryExecutor(recoveryRoot, {
         timeoutSeconds: 30,
         restartExecutable: false,
-        handshakeTimeoutMs: 10_000,
+        handshakeTimeoutMs: WINDOWS_HANDSHAKE_TIMEOUT_MS,
       });
       await executor.arm(plan({
         applicationDirectory,
@@ -69,7 +70,7 @@ describe("Windows update recovery watchdog", () => {
       await executor.disarm("0.3.0");
       await waitUntilMissing(activePath);
     },
-    15_000,
+    45_000,
   );
 
   it.skipIf(process.platform !== "win32")(
@@ -95,7 +96,7 @@ describe("Windows update recovery watchdog", () => {
       const executor = new WindowsUpdateRecoveryExecutor(recoveryRoot, {
         timeoutSeconds: 30,
         restartExecutable: false,
-        handshakeTimeoutMs: 10_000,
+        handshakeTimeoutMs: WINDOWS_HANDSHAKE_TIMEOUT_MS,
       });
       await expect(executor.arm(plan({
         applicationDirectory,
@@ -112,7 +113,7 @@ describe("Windows update recovery watchdog", () => {
       await expect(stat(path.join(recoveryRoot, "watchdog-active.json")))
         .rejects.toMatchObject({ code: "ENOENT" });
     },
-    15_000,
+    45_000,
   );
 
   it.skipIf(process.platform !== "win32")(
@@ -155,7 +156,7 @@ const input = JSON.parse(await readFile(process.argv[2], "utf8"));
 const executor = new WindowsUpdateRecoveryExecutor(input.recoveryRoot, {
   timeoutSeconds: 5,
   restartExecutable: false,
-  handshakeTimeoutMs: 10_000,
+  handshakeTimeoutMs: ${WINDOWS_HANDSHAKE_TIMEOUT_MS},
 });
 await executor.arm(input.recoveryPlan);
 `);
@@ -164,7 +165,7 @@ await executor.arm(input.recoveryPlan);
         path.resolve("node_modules/tsx/dist/cli.mjs"),
         helperPath,
         helperInputPath,
-      ], { timeout: 15_000 });
+      ], { timeout: 40_000 });
 
       const activePath = path.join(recoveryRoot, "watchdog-active.json");
       const active = JSON.parse(await readFile(activePath, "utf8")) as { resultPath: string };
@@ -174,7 +175,7 @@ await executor.arm(input.recoveryPlan);
       await expect(readFile(applicationExecutablePath, "utf8")).resolves.toBe("healthy-old-version");
       await expect(readFile(databasePath, "utf8")).resolves.toBe("pre-update-database");
     },
-    20_000,
+    60_000,
   );
 
   it.skipIf(process.platform !== "win32")(
@@ -189,9 +190,13 @@ await executor.arm(input.recoveryPlan);
       const databasePath = path.join(databaseRoot, "server", "agent-hub.sqlite");
       const databaseBackupPath = path.join(recoveryRoot, "backups", "update-03", "server", "agent-hub.sqlite");
       const launches: string[] = [];
+      const handshakeTimeouts: number[] = [];
       const executor = new WindowsUpdateRecoveryExecutor(recoveryRoot, {
         restartExecutable: false,
-        launch: async (input) => { launches.push(input.recoveryId); },
+        launch: async (input) => {
+          launches.push(input.recoveryId);
+          handshakeTimeouts.push(input.handshakeTimeoutMs);
+        },
       });
       const recoveryPlan = plan({
         applicationDirectory,
@@ -220,6 +225,10 @@ await executor.arm(input.recoveryPlan);
       };
 
       expect(launches).toHaveLength(2);
+      expect(handshakeTimeouts).toEqual([
+        WINDOWS_HANDSHAKE_TIMEOUT_MS,
+        WINDOWS_HANDSHAKE_TIMEOUT_MS,
+      ]);
       expect(secondActive.recoveryId).not.toBe(firstActive.recoveryId);
       expect(superseded).toMatchObject({
         recoveryId: firstActive.recoveryId,

@@ -71,7 +71,7 @@ export class WindowsUpdateRecoveryExecutor implements DesktopUpdateRecoveryExecu
     this.scriptPath = path.join(rootDirectory, "agent-hub-update-watchdog.ps1");
     this.timeoutSeconds = options.timeoutSeconds ?? 180;
     this.restartExecutable = options.restartExecutable ?? true;
-    this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 15_000;
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 30_000;
     this.launch = options.launch ?? launchWatchdog;
   }
 
@@ -279,6 +279,9 @@ async function waitForWatchdogHandshake(
   let exitDescription: string | undefined;
   let diagnosticOutput = "";
   let markerDiagnostic = "ready marker missing";
+  let heartbeatDiagnostic = input.requireHeartbeat
+    ? "heartbeat marker not checked"
+    : "heartbeat not required";
   const collectDiagnostic = (chunk: Buffer | string) => {
     if (diagnosticOutput.length < 4_000) diagnosticOutput += chunk.toString();
   };
@@ -289,7 +292,7 @@ async function waitForWatchdogHandshake(
     exitDescription = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
   });
   const deadline = Date.now() + input.handshakeTimeoutMs;
-  while (Date.now() < deadline) {
+  while (true) {
     if (spawnError) throw spawnError;
     const ready = await readMarker(input.readyMarkerPath, parseReadyMarker);
     const readyMatches = Boolean(
@@ -304,6 +307,9 @@ async function waitForWatchdogHandshake(
     if (readyMatches) {
       if (!input.requireHeartbeat) return;
       const heartbeat = await readMarker(input.heartbeatMarkerPath, parseHeartbeatMarker);
+      heartbeatDiagnostic = heartbeat
+        ? `heartbeat recovery=${heartbeat.recoveryId}, pid=${heartbeat.pid}, sequence=${heartbeat.sequence}`
+        : "heartbeat marker missing";
       if (
         heartbeat
         && heartbeat.recoveryId === input.recoveryId
@@ -312,23 +318,33 @@ async function waitForWatchdogHandshake(
       ) {
         return;
       }
+    } else if (ready) {
+      heartbeatDiagnostic = "heartbeat not checked because the ready marker did not match";
     }
     const result = await readMarker(input.resultPath, parseWatchdogResultMarker);
     if (result) {
       const detail = diagnosticOutput.trim();
       throw new Error(
-        `The Agent Hub update watchdog failed before it was ready (${result.status}; ${markerDiagnostic}).${result.error ? ` ${result.error}` : ""}${detail ? ` ${detail}` : ""}`,
+        `The Agent Hub update watchdog failed before it was ready (${result.status}; ${markerDiagnostic}; ${heartbeatDiagnostic}).${result.error ? ` ${result.error}` : ""}${detail ? ` ${detail}` : ""}`,
       );
     }
-    await delay(50);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    await delay(Math.min(50, remainingMs));
   }
   if (exitDescription) {
     const detail = diagnosticOutput.trim();
     throw new Error(
-      `The Agent Hub update watchdog exited before it was ready (${exitDescription}; ${markerDiagnostic}).${detail ? ` ${detail}` : ""}`,
+      `The Agent Hub update watchdog exited before it was ready (${exitDescription}; ${markerDiagnostic}; ${heartbeatDiagnostic}).${detail ? ` ${detail}` : ""}`,
     );
   }
-  throw new Error("The Agent Hub update watchdog did not become ready in time.");
+  const detail = diagnosticOutput.trim();
+  const childDiagnostic = child.pid
+    ? `child pid ${child.pid} still running`
+    : "child pid unavailable";
+  throw new Error(
+    `The Agent Hub update watchdog did not become ready within ${input.handshakeTimeoutMs} ms (${childDiagnostic}; ${markerDiagnostic}; ${heartbeatDiagnostic}).${detail ? ` ${detail}` : ""}`,
+  );
 }
 
 interface ReadyMarker {
