@@ -1,0 +1,15 @@
+services:
+  agent-hub:
+    build: .
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 4173
+      AGENT_HUB_DATA_DIR: /app/data
+    ports:
+      - "4173:4173"
+    volumes:
+      - agent-hub-data:/app/data
+
+volumes:
+  agent-hub-data:

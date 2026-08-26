@@ -1,0 +1,104 @@
+# Agent Hub 与 Codex 连接
+
+Agent Hub 安装版可以把已经加入的协作房间连接到本机 Codex。连接完成后，Codex 会通过 MCP 读取房间中的实时项目状态，并通过四类 Hook 在写入前后自动协调工作范围。日常使用不需要手工复制 Token，也不需要为每次任务重复配置。
+
+## 使用前准备
+
+- 使用 Windows 安装版（文件名包含 `Setup`），不要使用 Portable 便携版完成自动接入。
+- 每位成员都要在自己的电脑上准备好该项目的本地 Git 仓库。
+- `git` 命令必须已安装并加入系统 `PATH`。如果刚安装 Git，请重新启动 Agent Hub 和 Codex，使新的环境变量生效。
+- 房主创建的局域网房间依赖房主电脑上的 Agent Hub 持续运行；其他成员还需要能够访问房主提供的邀请地址。
+
+## 首次连接步骤
+
+1. 安装并打开 Agent Hub。
+2. 点击“选择项目”，选择本机对应的 Git 项目目录。房主和成员可以使用不同的本地路径，但应当是同一个项目。
+3. 房主选择“创建房间”；其他成员选择“加入房间”，填写房主发来的邀请地址和房间码。
+4. 成功进入房间后，打开“连接设置”，在“Codex 自动接入”区域点击“安装连接”。
+5. 等待界面提示连接已经安装，然后完全关闭并重新启动 Codex。
+6. Codex 第一次加载 Agent Hub 的非托管 Hook 时会要求用户确认信任。确认命令确实指向本机安装的 Agent Hub 启动器后，允许这些 Hook 运行。这是 Codex 的安全确认，Agent Hub 不会也不应绕过它。
+
+每位协作成员都应在自己的电脑上执行一次上述流程。房主安装连接不能代替其他成员的本机安装。
+
+## 安装连接后发生了什么
+
+Agent Hub 会修改当前 Windows 用户的全局 Codex 配置：
+
+```text
+~/.codex/config.toml
+```
+
+在常见 Windows 环境中，它位于 `C:\Users\<用户名>\.codex\config.toml`。Agent Hub 会保留能够识别的现有配置，并新增：
+
+- 一个名称以 `agent_hub_` 开头的 MCP 服务配置；
+- `SessionStart`、`PreToolUse`、`PostToolUse`、`SessionEnd` 四类 Hook；
+- Codex 的 Hook 功能开关。
+
+如果 `config.toml` 原本已经存在，写入前会在同一目录生成带时间戳的备份：
+
+```text
+config.toml.agent-hub-<时间戳>.bak
+```
+
+安装完成后必须重启 Codex，新配置才会在新会话中生效。
+
+## 凭证和通信原理
+
+加入房间后得到的成员凭证不会写入 `config.toml`、PowerShell 脚本或项目仓库。Agent Hub 将凭证保存在自己的本机连接存储中，并使用 Windows DPAPI 加密。通常只有保存凭证的同一 Windows 用户能够解密；不要把 Agent Hub 的用户数据目录当作可跨账号复制的登录文件。
+
+MCP 不经过 PowerShell。对应的 `agent_hub_*` 配置会直接把 `command` 指向安装版的 `Agent Hub.exe`，把安装包 `app.asar` 中的 headless runner、本机用户数据目录和房间连接 ID 放入 `args`，并通过 `env.ELECTRON_RUN_AS_NODE=1` 让程序以无界面的 Node 进程运行。这个进程从本机安全存储读取相应房间凭证，再连接房主的 Agent Hub 房间服务。
+
+Codex 与该进程之间使用标准输入输出（stdio）运行本地 MCP bridge。因此 Codex 配置中不需要出现房间 Token，也不需要直接把远程 HTTP 地址配置成 MCP 服务。
+
+四类 Hook 使用另一条启动链：Codex 调用 Agent Hub 生成的 PowerShell headless sidecar，再由 sidecar 以 Node 模式执行对应 Hook。这个 PowerShell 脚本只保存已安装程序、headless runner 和本机用户数据目录的路径，不包含 Token。
+
+## 四类 Hook 的职责
+
+- `SessionStart`：Codex 会话开始、恢复或压缩后，读取当前仓库、分支和房间实时快照，把相关工作范围、风险、决定和验证状态提供给 Agent。
+- `PreToolUse`：在 `apply_patch` 或常见命令行写入前识别目标路径，自动申请尽可能小的工作范围并检查冲突。无法确认写入范围或遇到严格冲突时会暂停该次写入。
+- `PostToolUse`：写入后读取实际 Git 变更，登记真正修改的路径。会话开始前已经 dirty 的文件会使用本地指纹识别后续变化；出现未被工作范围覆盖的变更时会记录风险并隔离当前会话，后续写操作保持拒绝。
+- `SessionEnd`：同步本次会话的实际变更，释放工作范围并关闭 Agent Hub 会话。
+
+每次 Codex 会话都会在房间中取得独立的 Agent Hub 会话 ID。领取、续期、写入检查、验证、交接和结束操作都使用同一个 ID；即使同一成员同时运行多个 Codex 会话，也不能把其中一个会话的租约当作另一个会话的写入许可。会话结束时，服务端会自动取消该会话遗漏的剩余租约。
+
+这些 Hook 安装在全局 Codex 配置中，但会根据当前工作目录匹配已经保存在 Agent Hub 中的本地仓库。对于没有加入任何房间的仓库，Agent Hub 会静默跳过，不应阻止普通 Codex 工作。
+
+## Portable 便携版限制
+
+Portable 版本允许体验桌面界面，但禁止“安装 Codex 连接”。便携程序通常从临时且可能变化的解压路径运行；把该路径写入 Codex 全局配置后，下次启动很可能失效。
+
+需要自动 MCP 和 Hook 接入时，请安装 Setup 版本，再从房间的“连接设置”点击一次“安装连接”。
+
+## 对 Git 操作的影响
+
+Agent Hub 不会替代 Git，也不会改变日常的 `commit`、`pull`、`push` 操作方式。它通过 Git 读取仓库根目录、当前分支、提交和实际改动，因此 `git` 必须能够从 `PATH` 直接运行。
+
+房间状态和 Hook 主要负责写入前后的协作检查；Git 仓库、项目源码、项目自身规则和测试结果仍然是事实来源。Agent Hub 能降低多人 Agent 互相覆盖和忽略依赖的概率，但不能在没有测试或运行时验证的情况下保证业务语义绝对兼容。
+
+## 多房间和卸载前清理
+
+每次为一个保存的房间点击“安装连接”，都会创建或更新一个独立的 `agent_hub_*` MCP 配置。当前版本没有一键移除 Codex 连接的功能，因此使用多个房间后，`~/.codex/config.toml` 中可能保留多个旧房间的 MCP 条目。卸载 Agent Hub 本身不会保证清除这些 Codex 全局配置。
+
+卸载 Agent Hub 前，请先完全退出 Codex，然后选择以下一种方式处理：
+
+1. 使用 Agent Hub 写入时生成的 `.bak` 备份恢复 `config.toml`。恢复前先比较备份和当前文件；直接覆盖会丢失备份创建之后新增的其他 Codex 配置。
+2. 手工编辑 `~/.codex/config.toml`，删除不再需要的 `mcp_servers.agent_hub_*` 条目，并删除命令指向 Agent Hub、包含 `--codex-hook` 的 Agent Hub Hook 处理器。只删除 Agent Hub 对应内容，保留其他 MCP、Hook 和用户配置。
+
+清理完成后再次启动 Codex。如果仍看到失效的 Agent Hub 服务或 Hook，重新检查全局 `config.toml` 是否还有对应的 `agent_hub_*` 或 Agent Hub Hook 配置。
+
+## 常见问题
+
+**点击安装连接时提示必须使用安装版**
+当前运行的是 Portable 版本。安装 Setup 版本并从已保存的房间重新点击“安装连接”。
+
+**Codex 启动后没有房间上下文**
+确认已经在 Agent Hub 中保存该本地 Git 项目与房间的连接，安装连接后完整重启 Codex，并在首次提示时信任 Agent Hub Hook。
+
+**提示找不到 Git 或无法识别仓库**
+确认所选目录是 Git 仓库，并确认在新的终端中可以直接运行 `git`。修改 `PATH` 后重新启动 Agent Hub 和 Codex。
+
+**成员无法连接房间**
+确认房主的 Agent Hub 正在运行，成员使用的是房主提供的局域网邀请地址和正确房间码，并检查 Windows 防火墙与局域网连通性。
+
+**拒绝了首次 Hook 信任**
+未经信任的 Hook 不会执行，自动领取范围和写入拦截也就不会完整生效。先核对 `~/.codex/config.toml` 中命令指向本机 Agent Hub 生成的 PowerShell 启动器，再按 Codex 的安全流程重新确认。

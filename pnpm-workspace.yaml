@@ -1,0 +1,8 @@
+allowBuilds:
+  '@ast-grep/lang-csharp': true
+  "@ast-grep/napi": true
+  electron: true
+  electron-winstaller: true
+  esbuild: true
+minimumReleaseAgeExclude:
+  - electron@44.0.0

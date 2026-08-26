@@ -1,0 +1,39 @@
+appId: com.agenthub.desktop
+productName: Agent Hub
+copyright: Copyright (c) 2026 Agent Hub contributors
+
+directories:
+  output: release
+
+files:
+  - dist/**/*
+  - assets/**/*
+  - package.json
+  - node_modules/**/*
+
+asar: true
+asarUnpack:
+  - node_modules/@ast-grep/napi/**/*
+  - node_modules/@ast-grep/lang-csharp/**/*
+
+win:
+  icon: assets/agent-hub-icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+
+nsis:
+  artifactName: AgentHub-Setup-${version}-${arch}.${ext}
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Agent Hub
+  runAfterFinish: true
+
+portable:
+  artifactName: AgentHub-Portable-${version}-${arch}.${ext}

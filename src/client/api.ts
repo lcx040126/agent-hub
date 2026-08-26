@@ -1,0 +1,1048 @@
+export type Room = {
+  id: string;
+  name: string;
+  code?: string;
+  projectName: string;
+  repository: string;
+  defaultBranch: string;
+  createdAt?: string;
+};
+
+export type Member = {
+  id: string;
+  name: string;
+  role: "host" | "member" | "viewer" | string;
+  status: "online" | "away" | "offline";
+  agent?: string;
+  lastSeenAt?: string;
+  joinedAt?: string;
+};
+
+export type Lease = {
+  id: string;
+  title: string;
+  objective?: string;
+  memberId?: string;
+  memberName: string;
+  branch?: string;
+  baseCommit?: string;
+  paths: string[];
+  highRiskPaths: string[];
+  mode: "write" | "read";
+  status: string;
+  createdAt?: string;
+  expiresAt?: string;
+  updatedAt?: string;
+  completionSummary?: string;
+};
+
+export type Conflict = {
+  id: string;
+  title: string;
+  summary: string;
+  severity: "blocking" | "warning" | "notice";
+  decision: "allow" | "warn" | "deny";
+  paths: string[];
+  memberNames: string[];
+  leaseId?: string;
+  createdAt?: string;
+  status?: string;
+};
+
+export type RecordKind = "decision" | "validation" | "handoff" | "risk" | "context";
+
+export type ProjectRecord = {
+  id: string;
+  kind: RecordKind;
+  title: string;
+  summary: string;
+  memberName?: string;
+  paths: string[];
+  status?: string;
+  evidence?: string;
+  command?: string;
+  commitHash?: string;
+  createdAt?: string;
+  details?: string[];
+};
+
+export type ActivityItem = {
+  id: string;
+  type?: string;
+  title: string;
+  summary?: string;
+  memberName?: string;
+  createdAt?: string;
+};
+
+export type AgentSession = {
+  id: string;
+  memberId: string;
+  clientName?: string;
+  agentName?: string;
+  task?: string;
+  branch?: string;
+  baseCommit?: string;
+  status: string;
+  lastSeenAt?: string;
+};
+
+export type LocalScan = {
+  id: string;
+  sessionId?: string;
+  memberId: string;
+  changedPaths: string[];
+  systems: string[];
+  ruleFiles: string[];
+  scannedAt?: string;
+};
+
+export type Dashboard = {
+  room: Room;
+  currentMember: Member;
+  members: Member[];
+  leases: Lease[];
+  conflicts: Conflict[];
+  records: ProjectRecord[];
+  activity: ActivityItem[];
+  sessions: AgentSession[];
+  localScans: LocalScan[];
+  generatedAt?: string;
+  server: { mcpUrl: string };
+};
+
+export type Session = {
+  memberToken?: string;
+  connectionId?: string;
+  serverUrl?: string;
+  inviteServerUrl?: string;
+  repositoryPath?: string;
+  roomToken?: string;
+  room: Room;
+  member: Member;
+};
+
+export type SavedRoomConnection = {
+  id: string;
+  serverUrl: string;
+  repositoryPath: string;
+  roomId?: string;
+  roomName?: string;
+  memberName?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type RepositorySnapshot = {
+  repository: {
+    root: string;
+    name: string;
+    remote: string | null;
+    branch: string;
+    headCommit: string;
+    fingerprint: string;
+  };
+};
+
+type RoomServerRequest =
+  | { serverUrl: string; method: "GET" | "POST"; path: string; body?: unknown }
+  | { connectionId: string; method: "GET" | "POST"; path: string; body?: unknown };
+
+type DesktopApi = {
+  chooseRepository(): Promise<string | null>;
+  inspectRepository(repositoryPath: string): Promise<RepositorySnapshot>;
+  getServerInfo(): Promise<DesktopServerInfo>;
+  saveRoomConnection(input: {
+    id?: string;
+    serverUrl: string;
+    memberToken: string;
+    repositoryPath: string;
+    roomId?: string;
+    roomName?: string;
+    memberName?: string;
+  }): Promise<SavedRoomConnection>;
+  listRoomConnections(): Promise<SavedRoomConnection[]>;
+  requestRoomServer(input: RoomServerRequest): Promise<{ status: number; body: unknown }>;
+  installCodexIntegration(connectionId: string): Promise<{
+    configPath: string;
+    mcpServerName: string;
+    restartRequired: true;
+  }>;
+};
+
+export type DesktopServerInfo = {
+  localServerUrl: string;
+  lanUrls: string[];
+  port: number;
+};
+
+declare global {
+  interface Window {
+    agentHubDesktop?: DesktopApi;
+  }
+}
+
+export type CreateRoomInput = {
+  roomName: string;
+  projectName: string;
+  repository: string;
+  defaultBranch: string;
+  ownerName: string;
+  agent?: string;
+};
+
+export type JoinRoomInput = {
+  serverUrl: string;
+  roomToken: string;
+  memberName: string;
+  agent?: string;
+};
+
+export type CreateLeaseInput = {
+  title: string;
+  objective?: string;
+  branch?: string;
+  baseCommit?: string;
+  paths: string[];
+  ttlMinutes: number;
+};
+
+export type CloseLeaseInput = {
+  outcome: string;
+  changedPaths?: string[];
+  commitHash?: string;
+  validations?: string[];
+  remainingRisks?: string[];
+  handoff?: string;
+};
+
+export type CreateRecordInput = {
+  kind: Exclude<RecordKind, "context">;
+  title: string;
+  summary: string;
+  paths?: string[];
+  status?: string;
+  evidence?: string;
+  command?: string;
+  leaseId?: string;
+  toMemberId?: string;
+  completed?: string[];
+  remaining?: string[];
+  risks?: string[];
+};
+
+export type LeaseDecision = {
+  acquired: boolean;
+  lease?: Lease;
+  conflicts: Conflict[];
+  decision: "allow" | "warn" | "deny";
+};
+
+const SESSION_POINTER_KEY = "agent-hub.session.public.v3";
+const SESSION_RUNTIME_KEY = "agent-hub.session.runtime.v1";
+const LEGACY_SESSION_KEYS = ["agent-hub.session.v2", "agent-hub.session.v1"];
+
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+function asObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function asString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function firstArray(...values: unknown[]): unknown[] {
+  for (const value of values) {
+    if (Array.isArray(value)) return value;
+  }
+  return [];
+}
+
+function pathValues(value: unknown): { paths: string[]; highRiskPaths: string[] } {
+  if (!Array.isArray(value)) return { paths: [], highRiskPaths: [] };
+  const paths: string[] = [];
+  const highRiskPaths: string[] = [];
+  for (const item of value) {
+    if (typeof item === "string") {
+      paths.push(item);
+      continue;
+    }
+    const entry = asObject(item);
+    const path = asString(entry.path);
+    if (!path) continue;
+    paths.push(path);
+    if (entry.risk === "high") highRiskPaths.push(path);
+  }
+  return { paths, highRiskPaths };
+}
+
+function statusFromLastSeen(value: unknown): Member["status"] {
+  const explicit = asString(value);
+  if (["online", "away", "offline"].includes(explicit)) return explicit as Member["status"];
+  return "offline";
+}
+
+function normalizeRoom(value: unknown, roomToken?: string): Room {
+  const room = asObject(value);
+  const name = asString(room.name, asString(room.roomName, "未命名房间"));
+  return {
+    id: asString(room.id),
+    name,
+    code: asString(room.code, asString(room.inviteCode, roomToken)) || undefined,
+    projectName: asString(room.projectName, asString(room.project, name)),
+    repository: asString(room.repository, asString(room.repositoryUrl)),
+    defaultBranch: asString(room.defaultBranch, "main"),
+    createdAt: asString(room.createdAt) || undefined,
+  };
+}
+
+function normalizeMember(value: unknown): Member {
+  const member = asObject(value);
+  const lastSeenAt = asString(member.lastSeenAt) || undefined;
+  let status = statusFromLastSeen(member.status);
+  if (!member.status && lastSeenAt) {
+    const age = Date.now() - new Date(lastSeenAt).getTime();
+    status = age < 120_000 ? "online" : age < 600_000 ? "away" : "offline";
+  }
+  const rawRole = asString(member.role, "member");
+  return {
+    id: asString(member.id),
+    name: asString(member.name, asString(member.displayName, "未知成员")),
+    role: rawRole === "owner" ? "host" : rawRole,
+    status,
+    agent: asString(member.agent, asString(member.clientName)) || undefined,
+    lastSeenAt,
+    joinedAt: asString(member.joinedAt, asString(member.createdAt)) || undefined,
+  };
+}
+
+function normalizeLease(value: unknown): Lease {
+  const lease = asObject(value);
+  const member = asObject(lease.member);
+  const normalizedPaths = pathValues(lease.paths);
+  const detailedPaths = pathValues(lease.pathDetails);
+  return {
+    id: asString(lease.id),
+    title: asString(lease.title, "未命名工作"),
+    objective: asString(lease.objective, asString(lease.intent, asString(lease.description))) || undefined,
+    memberId: asString(lease.memberId, asString(member.id)) || undefined,
+    memberName: asString(lease.memberName, asString(member.name, "未知成员")),
+    branch: asString(lease.branch) || undefined,
+    baseCommit: asString(lease.baseCommit) || undefined,
+    paths: normalizedPaths.paths,
+    highRiskPaths: [...new Set([...normalizedPaths.highRiskPaths, ...detailedPaths.highRiskPaths])],
+    mode: lease.mode === "read" ? "read" : "write",
+    status: asString(lease.status, "active"),
+    createdAt: asString(lease.createdAt) || undefined,
+    updatedAt: asString(lease.updatedAt) || undefined,
+    expiresAt: asString(lease.expiresAt) || undefined,
+    completionSummary: asString(lease.completionSummary) || undefined,
+  };
+}
+
+function normalizeConflict(value: unknown, index = 0): Conflict {
+  const conflict = asObject(value);
+  const requestedPath = asString(conflict.requestedPath);
+  const existingPath = asString(conflict.existingPath, asString(conflict.conflictingPath));
+  const paths = asStringArray(conflict.paths);
+  if (requestedPath) paths.push(requestedPath);
+  if (existingPath && !paths.includes(existingPath)) paths.push(existingPath);
+  const rawSeverity = asString(conflict.severity, "warning");
+  const severity: Conflict["severity"] = ["blocking", "critical", "high"].includes(rawSeverity)
+    ? "blocking"
+    : ["notice", "low"].includes(rawSeverity)
+      ? "notice"
+      : "warning";
+  const rawDecision = asString(conflict.decision, severity === "blocking" ? "deny" : "warn");
+  const memberName = asString(conflict.memberName);
+  const rawTitle = asString(conflict.title);
+  const rawSummary = asString(conflict.summary, asString(conflict.reason, asString(conflict.description)));
+  const title = rawTitle === "Exclusive scope overlap"
+    ? "独占范围已被占用"
+    : rawTitle === "Registered scope overlap"
+      ? "检测到工作范围重叠"
+      : rawTitle;
+  const summary = rawSummary === "The overlap includes a Unity, configuration, or Luban scope that requires exclusive access."
+    ? "重叠范围包含 Unity 资源、配置或 Luban 数据，必须独占修改。"
+    : rawSummary === "Ordinary source write scopes overlap; provide an explicit override reason to continue."
+      ? "普通代码写入范围重叠，需要明确说明后才能继续。"
+      : rawSummary;
+  return {
+    id: asString(conflict.id, `${asString(conflict.leaseId, "conflict")}-${index}`),
+    title: title || (severity === "blocking" ? "工作范围被占用" : "检测到范围重叠"),
+    summary: summary || "多个进行中的工作涉及相同或相交的范围。",
+    severity,
+    decision: ["allow", "warn", "deny"].includes(rawDecision)
+      ? (rawDecision as Conflict["decision"])
+      : severity === "blocking"
+        ? "deny"
+        : "warn",
+    paths: [...new Set(paths)],
+    memberNames: asStringArray(conflict.memberNames).concat(memberName ? [memberName] : []),
+    leaseId: asString(conflict.leaseId) || undefined,
+    createdAt: asString(conflict.createdAt) || undefined,
+    status: asString(conflict.status) || undefined,
+  };
+}
+
+function normalizeGenericRecord(value: unknown, fallbackKind: RecordKind): ProjectRecord {
+  const record = asObject(value);
+  const rawKind = asString(record.kind, asString(record.type, fallbackKind));
+  const kind = ["decision", "validation", "handoff", "risk", "context"].includes(rawKind)
+    ? (rawKind as RecordKind)
+    : fallbackKind;
+  const rawEvidence = record.evidence;
+  const evidence = Array.isArray(rawEvidence)
+    ? asStringArray(rawEvidence).join("；")
+    : asString(rawEvidence) || undefined;
+  let title = asString(record.title, "未命名记录");
+  const validationMatch = title.match(/^(static|automated_test|unity_edit_mode|unity_play_mode|manual): (passed|failed|pending)$/);
+  if (validationMatch) {
+    const kindLabels: Record<string, string> = {
+      static: "静态检查",
+      automated_test: "自动化测试",
+      unity_edit_mode: "Unity Edit Mode",
+      unity_play_mode: "Unity Play Mode",
+      manual: "人工验收",
+    };
+    const resultLabels: Record<string, string> = { passed: "通过", failed: "失败", pending: "待验证" };
+    title = `${kindLabels[validationMatch[1]]} · ${resultLabels[validationMatch[2]]}`;
+  } else if (title === "Team handoff") {
+    title = "团队交接";
+  } else if (title.startsWith("Handoff to ")) {
+    title = `交接给 ${title.slice("Handoff to ".length)}`;
+  } else if (title.endsWith(": reported validation")) {
+    title = `${title.slice(0, -": reported validation".length)}：验证结果`;
+  } else if (title.endsWith(": remaining risks")) {
+    title = `${title.slice(0, -": remaining risks".length)}：遗留风险`;
+  } else if (title.endsWith(": handoff")) {
+    title = `${title.slice(0, -": handoff".length)}：工作交接`;
+  }
+  return {
+    id: asString(record.id),
+    kind,
+    title,
+    summary: asString(record.summary, asString(record.content, asString(record.decision))),
+    memberName:
+      asString(record.memberName, asString(record.authorName, asString(record.fromMemberName))) || undefined,
+    paths: pathValues(record.paths).paths,
+    status: asString(record.status, asString(record.result, asString(record.kind))) || undefined,
+    evidence,
+    command: asString(record.command) || undefined,
+    commitHash: asString(record.commitHash) || undefined,
+    createdAt: asString(record.createdAt) || undefined,
+  };
+}
+
+function normalizeDecision(value: unknown): ProjectRecord {
+  const record = asObject(value);
+  const decision = asString(record.decision, asString(record.summary));
+  const rationale = asString(record.rationale);
+  return {
+    ...normalizeGenericRecord(value, "decision"),
+    kind: "decision",
+    summary: decision,
+    details: rationale ? [`原因：${rationale}`] : undefined,
+  };
+}
+
+function normalizeVerification(value: unknown): ProjectRecord {
+  const record = asObject(value);
+  return {
+    ...normalizeGenericRecord(value, "validation"),
+    kind: "validation",
+    title: asString(record.title, asString(record.summary, "验证记录")),
+    summary: asString(record.summary),
+    status: asString(record.result, asString(record.status, "pending")),
+  };
+}
+
+function normalizeHandoff(value: unknown): ProjectRecord {
+  const record = asObject(value);
+  const completed = asStringArray(record.completed).map((item) => `已完成：${item}`);
+  const remaining = asStringArray(record.remaining).map((item) => `待处理：${item}`);
+  const risks = asStringArray(record.risks).map((item) => `风险：${item}`);
+  const toName = asString(record.toMemberName);
+  return {
+    ...normalizeGenericRecord(value, "handoff"),
+    kind: "handoff",
+    title: asString(record.title, toName ? `交接给 ${toName}` : "团队交接"),
+    summary: asString(record.summary),
+    details: [...completed, ...remaining, ...risks],
+  };
+}
+
+function normalizeContext(value: unknown): ProjectRecord {
+  const record = asObject(value);
+  const contextKind = asString(record.kind, "note");
+  return {
+    ...normalizeGenericRecord(value, contextKind === "risk" ? "risk" : "context"),
+    kind: contextKind === "risk" ? "risk" : "context",
+    status: contextKind,
+  };
+}
+
+function normalizeActivity(value: unknown): ActivityItem {
+  const activity = asObject(value);
+  const rawSummary = asString(activity.summary, asString(activity.description));
+  const type = asString(activity.type);
+  const actorName = asString(activity.memberName, asString(activity.actorName, asString(asObject(activity.member).name))) || "Agent Hub";
+  let summary = rawSummary;
+  if (type === "room.created") summary = `${actorName} 创建了协作房间`;
+  else if (type === "member.joined") summary = `${actorName} 加入了房间`;
+  else if (type === "lease.rejected") summary = `${actorName} 的工作范围因独占冲突未被登记`;
+  else if (type === "lease.renewed") summary = `${actorName} 延长了工作范围保护`;
+  else if (type === "lease.expired") summary = "一项工作范围保护已过期";
+  else if (type === "lease.acquired") {
+    const match = rawSummary.match(/registered (?:read|write) work: (.+)\.$/);
+    summary = match ? `${actorName} 开始了工作：${match[1]}` : `${actorName} 登记了工作范围`;
+  } else if (type === "lease.closed") {
+    const match = rawSummary.match(/ (?:completed|cancelled) (.+)\.$/);
+    summary = match ? `${actorName} 完成了工作：${match[1]}` : `${actorName} 结束并释放了工作范围`;
+  } else if (type === "decision.added") {
+    const match = rawSummary.match(/^Recorded decision: (.+)\.$/);
+    summary = match ? `${actorName} 记录了决定：${match[1]}` : `${actorName} 记录了团队决定`;
+  } else if (type === "verification.added") {
+    summary = `${actorName} 记录了验证结果`;
+  } else if (type === "handoff.added") {
+    summary = `${actorName} 记录了项目交接`;
+  } else if (type === "context.added" || type === "record.added") {
+    summary = `${actorName} 补充了项目上下文`;
+  } else if (type === "session.opened") {
+    summary = `${actorName} 的本地组件已连接`;
+  } else if (type === "session.closed") {
+    summary = `${actorName} 的本地组件已断开`;
+  } else if (type === "session.scanned") {
+    summary = `${actorName} 完成了本地项目扫描`;
+  }
+  return {
+    id: asString(activity.id),
+    type: type || undefined,
+    title: summary || asString(activity.title, asString(activity.action, "项目动态")),
+    summary: undefined,
+    memberName: actorName === "Agent Hub" ? undefined : actorName,
+    createdAt: asString(activity.createdAt) || undefined,
+  };
+}
+
+function normalizeAgentSession(value: unknown): AgentSession {
+  const session = asObject(value);
+  return {
+    id: asString(session.id),
+    memberId: asString(session.memberId),
+    clientName: asString(session.clientName) || undefined,
+    agentName: asString(session.agentName) || undefined,
+    task: asString(session.task) || undefined,
+    branch: asString(session.branch) || undefined,
+    baseCommit: asString(session.baseCommit) || undefined,
+    status: asString(session.status, "active"),
+    lastSeenAt: asString(session.lastSeenAt) || undefined,
+  };
+}
+
+function normalizeLocalScan(value: unknown): LocalScan {
+  const scan = asObject(value);
+  return {
+    id: asString(scan.id),
+    sessionId: asString(scan.sessionId) || undefined,
+    memberId: asString(scan.memberId),
+    changedPaths: asStringArray(scan.changedPaths),
+    systems: asStringArray(scan.systems),
+    ruleFiles: asStringArray(scan.ruleFiles),
+    scannedAt: asString(scan.scannedAt) || undefined,
+  };
+}
+
+type RequestAccess = string | Pick<Session, "memberToken" | "connectionId" | "serverUrl"> | undefined;
+
+function accessToken(access: RequestAccess): string | undefined {
+  return typeof access === "string" ? access : access?.memberToken;
+}
+
+function accessConnectionId(access: RequestAccess): string | undefined {
+  return typeof access === "string" ? undefined : access?.connectionId;
+}
+
+function accessServerUrl(access: RequestAccess): string | undefined {
+  return typeof access === "string" ? undefined : access?.serverUrl;
+}
+
+function requestBody(init: RequestInit): unknown {
+  if (init.body === undefined || init.body === null) return undefined;
+  if (typeof init.body !== "string") throw new ApiError("请求内容格式不正确。", 400);
+  try {
+    return JSON.parse(init.body) as unknown;
+  } catch {
+    throw new ApiError("请求内容格式不正确。", 400);
+  }
+}
+
+function translatedError(payload: Record<string, unknown>, status: number): ApiError {
+  const code = asString(payload.error);
+  const translated: Record<string, string> = {
+    invite_not_found: "房间码无效或房间已不存在。",
+    invalid_invite: "房间码格式不正确。",
+    unauthorized: "成员凭证已失效，请重新加入房间。",
+    invalid_input: "填写内容不完整或格式不正确。",
+    lease_not_active: "这项工作已结束，无法继续操作。",
+    lease_not_found: "没有找到这项工作，它可能已经被释放。",
+    lease_forbidden: "只能操作自己领取的工作范围。",
+    member_not_found: "没有找到指定成员。",
+    invalid_verification_kind: "请选择有效的验证类型。",
+    invalid_verification_result: "请选择有效的验证结果。",
+  };
+  return new ApiError(
+    translated[code] ?? asString(payload.message, code || "请求未完成，请稍后重试。"),
+    status,
+  );
+}
+
+function friendlyDesktopError(error: unknown): Error {
+  const raw = error instanceof Error ? error.message : "无法连接房主服务。";
+  const message = raw.replace(/^Error invoking remote method '[^']+':\s*/i, "");
+  if (message.includes("could not reach the room server")) {
+    return new Error("无法连接房主服务，请确认邀请地址正确且房主电脑在线。");
+  }
+  if (message.includes("selected room connection does not exist")) {
+    return new Error("保存的房间连接已不存在，请重新加入。");
+  }
+  if (message.includes("Windows secure storage is unavailable")) {
+    return new Error("Windows 安全存储当前不可用，无法保存房间连接。");
+  }
+  return new Error(message);
+}
+
+async function request<T>(
+  path: string,
+  init: RequestInit = {},
+  access?: RequestAccess,
+  bootstrapServerUrl?: string,
+): Promise<T> {
+  const desktop = window.agentHubDesktop;
+  const connectionId = accessConnectionId(access);
+  const method = (init.method ?? "GET").toUpperCase();
+  if (desktop && (connectionId || bootstrapServerUrl)) {
+    if (method !== "GET" && method !== "POST") throw new ApiError("不支持这项请求。", 405);
+    try {
+      const response = await desktop.requestRoomServer({
+        ...(connectionId ? { connectionId } : { serverUrl: bootstrapServerUrl! }),
+        method,
+        path,
+        ...(method === "POST" ? { body: requestBody(init) } : {}),
+      } as RoomServerRequest);
+      const payload = asObject(response.body);
+      if (response.status < 200 || response.status >= 300) throw translatedError(payload, response.status);
+      return response.body as T;
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw friendlyDesktopError(error);
+    }
+  }
+
+  const headers = new Headers(init.headers);
+  headers.set("Accept", "application/json");
+  if (init.body) headers.set("Content-Type", "application/json");
+  const token = accessToken(access);
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  const baseUrl = bootstrapServerUrl ?? accessServerUrl(access);
+  const target = baseUrl ? new URL(path, `${baseUrl.replace(/\/+$/, "")}/`).toString() : path;
+
+  let response: Response;
+  try {
+    response = await fetch(target, { ...init, headers });
+  } catch {
+    throw new ApiError("无法连接 Agent Hub，请确认房主服务正在运行。", 0);
+  }
+
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok) throw translatedError(payload, response.status);
+  return payload as T;
+}
+
+async function requestFirst<T>(
+  candidates: Array<{ path: string; init?: RequestInit }>,
+  access?: RequestAccess,
+): Promise<T> {
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      return await request<T>(candidate.path, candidate.init, access);
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof ApiError) || ![404, 405].includes(error.status)) throw error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new ApiError("服务接口不可用。", 404);
+}
+
+export function loadSession(): Session | null {
+  try {
+    let raw = sessionStorage.getItem(SESSION_RUNTIME_KEY);
+    if (!raw) raw = localStorage.getItem(SESSION_POINTER_KEY);
+    if (!raw) {
+      for (const key of LEGACY_SESSION_KEYS) {
+        const legacy = localStorage.getItem(key);
+        if (!legacy) continue;
+        sessionStorage.setItem(SESSION_RUNTIME_KEY, legacy);
+        localStorage.removeItem(key);
+        raw = legacy;
+        break;
+      }
+    }
+    if (!raw) return null;
+    const parsed = asObject(JSON.parse(raw));
+    const memberToken = asString(parsed.memberToken, asString(parsed.token));
+    const connectionId = asString(parsed.connectionId) || undefined;
+    if (!memberToken && !connectionId) return null;
+    const roomToken = asString(parsed.roomToken) || undefined;
+    return {
+      memberToken: memberToken || undefined,
+      connectionId,
+      serverUrl: asString(parsed.serverUrl) || undefined,
+      inviteServerUrl: asString(parsed.inviteServerUrl) || undefined,
+      repositoryPath: asString(parsed.repositoryPath) || undefined,
+      roomToken,
+      room: normalizeRoom(parsed.room, roomToken),
+      member: normalizeMember(parsed.member),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function saveSession(session: Session): void {
+  for (const key of LEGACY_SESSION_KEYS) localStorage.removeItem(key);
+  if (session.connectionId) {
+    const publicSession: Session = {
+      connectionId: session.connectionId,
+      serverUrl: session.serverUrl,
+      inviteServerUrl: session.inviteServerUrl,
+      repositoryPath: session.repositoryPath,
+      room: { ...session.room, code: undefined },
+      member: session.member,
+    };
+    localStorage.setItem(SESSION_POINTER_KEY, JSON.stringify(publicSession));
+    sessionStorage.removeItem(SESSION_RUNTIME_KEY);
+    return;
+  }
+  localStorage.removeItem(SESSION_POINTER_KEY);
+  sessionStorage.setItem(SESSION_RUNTIME_KEY, JSON.stringify(session));
+}
+
+export function clearSession(): void {
+  localStorage.removeItem(SESSION_POINTER_KEY);
+  sessionStorage.removeItem(SESSION_RUNTIME_KEY);
+  for (const key of LEGACY_SESSION_KEYS) localStorage.removeItem(key);
+}
+
+function normalizeSession(value: unknown): Session {
+  const payload = asObject(value);
+  const memberToken = asString(payload.memberToken, asString(payload.token));
+  const roomToken = asString(payload.roomToken, asString(payload.inviteCode)) || undefined;
+  if (!memberToken) throw new ApiError("服务没有返回成员凭证，请重新创建或加入房间。", 500);
+  return {
+    memberToken,
+    roomToken,
+    room: normalizeRoom(payload.room, roomToken),
+    member: normalizeMember(payload.member),
+  };
+}
+
+export async function checkHealth(): Promise<boolean> {
+  try {
+    await request("/api/health");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isDesktopApp(): boolean {
+  return Boolean(window.agentHubDesktop);
+}
+
+export async function getDesktopServerInfo(): Promise<DesktopServerInfo | null> {
+  try {
+    return (await window.agentHubDesktop?.getServerInfo()) ?? null;
+  } catch (error) {
+    throw friendlyDesktopError(error);
+  }
+}
+
+export async function chooseRepository(): Promise<{ path: string; snapshot: RepositorySnapshot } | null> {
+  const desktop = window.agentHubDesktop;
+  if (!desktop) return null;
+  try {
+    const path = await desktop.chooseRepository();
+    if (!path) return null;
+    return { path, snapshot: await desktop.inspectRepository(path) };
+  } catch (error) {
+    throw friendlyDesktopError(error);
+  }
+}
+
+export async function listSavedConnections(): Promise<SavedRoomConnection[]> {
+  try {
+    return (await window.agentHubDesktop?.listRoomConnections()) ?? [];
+  } catch (error) {
+    throw friendlyDesktopError(error);
+  }
+}
+
+export function resumeSavedConnection(connection: SavedRoomConnection): Session {
+  return {
+    connectionId: connection.id,
+    serverUrl: connection.serverUrl,
+    repositoryPath: connection.repositoryPath,
+    room: normalizeRoom({ id: connection.roomId, name: connection.roomName }),
+    member: normalizeMember({ name: connection.memberName }),
+  };
+}
+
+export async function secureDesktopSession(
+  session: Session,
+  serverUrl: string,
+  repositoryPath: string,
+): Promise<Session> {
+  const desktop = window.agentHubDesktop;
+  if (!desktop) return session;
+  if (!session.memberToken) throw new ApiError("服务没有返回成员凭证，请重新创建或加入房间。", 500);
+  try {
+    const saved = await desktop.saveRoomConnection({
+      serverUrl,
+      memberToken: session.memberToken,
+      repositoryPath,
+      roomId: session.room.id,
+      roomName: session.room.name,
+      memberName: session.member.name,
+    });
+    return {
+      ...session,
+      memberToken: undefined,
+      connectionId: saved.id,
+      serverUrl: saved.serverUrl,
+      repositoryPath: saved.repositoryPath,
+    };
+  } catch (error) {
+    throw friendlyDesktopError(error);
+  }
+}
+
+export async function installCodexConnection(connectionId: string): Promise<string> {
+  const desktop = window.agentHubDesktop;
+  if (!desktop) throw new Error("请在 Agent Hub 桌面客户端中安装 Codex 连接。");
+  try {
+    const result = await desktop.installCodexIntegration(connectionId);
+    return `${result.mcpServerName} 已安装，重启 Codex 后生效。`;
+  } catch (error) {
+    throw friendlyDesktopError(error);
+  }
+}
+
+export async function createRoom(input: CreateRoomInput): Promise<Session> {
+  const desktopServerInfo = await getDesktopServerInfo();
+  const desktopServerUrl = desktopServerInfo?.localServerUrl;
+  const result = await request("/api/rooms", {
+    method: "POST",
+    body: JSON.stringify({
+      roomName: input.roomName,
+      projectName: input.projectName,
+      repository: input.repository,
+      defaultBranch: input.defaultBranch || "main",
+      ownerName: input.ownerName,
+      clientName: input.agent || "Codex",
+    }),
+  }, undefined, desktopServerUrl);
+  const session = normalizeSession(result);
+  session.serverUrl = desktopServerUrl ?? window.location.origin;
+  session.inviteServerUrl = desktopServerInfo?.lanUrls[0] ?? session.serverUrl;
+  return session;
+}
+
+export async function joinRoom(input: JoinRoomInput): Promise<Session> {
+  const result = await request("/api/rooms/join", {
+    method: "POST",
+    body: JSON.stringify({
+      inviteCode: input.roomToken,
+      memberName: input.memberName,
+      clientName: input.agent || "Codex",
+    }),
+  }, undefined, input.serverUrl);
+  const session = normalizeSession(result);
+  session.serverUrl = input.serverUrl.replace(/\/+$/, "");
+  session.roomToken = input.roomToken;
+  session.room.code ||= input.roomToken;
+  return session;
+}
+
+export async function getDashboard(access: RequestAccess, roomToken?: string): Promise<Dashboard> {
+  const payload = asObject(
+    await requestFirst(
+      [
+        { path: "/api/dashboard" },
+        { path: "/api/snapshot" },
+      ],
+      access,
+    ),
+  );
+  const records = firstArray(payload.records).map((record) => normalizeGenericRecord(record, "context"));
+  records.push(...firstArray(payload.contextEntries, payload.context).map(normalizeContext));
+  records.push(...firstArray(payload.decisions).map(normalizeDecision));
+  records.push(...firstArray(payload.verifications, payload.validations).map(normalizeVerification));
+  records.push(...firstArray(payload.handoffs).map(normalizeHandoff));
+  records.sort((left, right) => (right.createdAt ?? "").localeCompare(left.createdAt ?? ""));
+  const rawConflicts = firstArray(payload.conflicts, payload.blockers);
+  return {
+    room: normalizeRoom(payload.room, roomToken),
+    currentMember: normalizeMember(payload.currentMember),
+    members: firstArray(payload.members).map(normalizeMember),
+    leases: firstArray(payload.leases, payload.activeLeases).map(normalizeLease),
+    conflicts: rawConflicts.map(normalizeConflict),
+    records,
+    activity: firstArray(payload.activity, payload.activities).map(normalizeActivity),
+    sessions: firstArray(payload.sessions).map(normalizeAgentSession),
+    localScans: firstArray(payload.localScans).map(normalizeLocalScan),
+    generatedAt: asString(payload.generatedAt) || undefined,
+    server: {
+      mcpUrl: asString(asObject(payload.server).mcpUrl, `${accessServerUrl(access) ?? window.location.origin}/mcp`),
+    },
+  };
+}
+
+export async function createLease(access: RequestAccess, input: CreateLeaseInput): Promise<LeaseDecision> {
+  const body = JSON.stringify({
+    title: input.title,
+    intent: input.objective ?? "",
+    branch: input.branch ?? "",
+    baseCommit: input.baseCommit,
+    paths: input.paths,
+    mode: "write",
+    ttlMinutes: input.ttlMinutes,
+  });
+  const payload = asObject(
+    await requestFirst(
+      [
+        { path: "/api/leases", init: { method: "POST", body } },
+      ],
+      access,
+    ),
+  );
+  const conflicts = firstArray(payload.conflicts).map(normalizeConflict);
+  const acquired = typeof payload.acquired === "boolean" ? payload.acquired : Boolean(payload.lease);
+  const rawDecision = asString(payload.decision, acquired ? (conflicts.length ? "warn" : "allow") : "deny");
+  return {
+    acquired,
+    lease: payload.lease ? normalizeLease(payload.lease) : undefined,
+    conflicts,
+    decision: ["allow", "warn", "deny"].includes(rawDecision)
+      ? (rawDecision as LeaseDecision["decision"])
+      : acquired
+        ? "allow"
+        : "deny",
+  };
+}
+
+export async function renewLease(access: RequestAccess, leaseId: string, ttlMinutes = 120): Promise<void> {
+  const body = JSON.stringify({ ttlMinutes });
+  await requestFirst(
+    [
+      { path: `/api/leases/${encodeURIComponent(leaseId)}/renew`, init: { method: "POST", body } },
+    ],
+    access,
+  );
+}
+
+export async function closeLease(
+  access: RequestAccess,
+  leaseId: string,
+  input: CloseLeaseInput,
+): Promise<void> {
+  const body = JSON.stringify({
+    outcome: input.outcome,
+    changedPaths: input.changedPaths ?? [],
+    commitHash: input.commitHash,
+    validations: input.validations ?? [],
+    remainingRisks: input.remainingRisks ?? [],
+    handoff: input.handoff,
+  });
+  await requestFirst(
+    [
+      { path: `/api/leases/${encodeURIComponent(leaseId)}/close`, init: { method: "POST", body } },
+    ],
+    access,
+  );
+}
+
+function recordRequest(input: CreateRecordInput): { path: string; body: string } {
+  const common = { paths: input.paths ?? [] };
+  if (input.kind === "decision") {
+    return {
+      path: "/api/decisions",
+      body: JSON.stringify({
+        ...common,
+        title: input.title,
+        decision: input.summary,
+        rationale: input.evidence,
+      }),
+    };
+  }
+  if (input.kind === "validation") {
+    return {
+      path: "/api/verifications",
+      body: JSON.stringify({
+        leaseId: input.leaseId,
+        kind: input.title || "manual",
+        result: input.status || "pending",
+        summary: input.summary,
+        command: input.command,
+        evidence: input.evidence,
+      }),
+    };
+  }
+  if (input.kind === "handoff") {
+    return {
+      path: "/api/handoffs",
+      body: JSON.stringify({
+        leaseId: input.leaseId,
+        toMemberId: input.toMemberId,
+        summary: input.summary,
+        completed: input.completed ?? [],
+        remaining: input.remaining ?? [],
+        risks: input.risks ?? [],
+      }),
+    };
+  }
+  return {
+    path: "/api/context",
+    body: JSON.stringify({ ...common, kind: "risk", title: input.title, content: input.summary }),
+  };
+}
+
+export async function createRecord(access: RequestAccess, input: CreateRecordInput): Promise<void> {
+  const specific = recordRequest(input);
+  await requestFirst(
+    [
+      { path: specific.path, init: { method: "POST", body: specific.body } },
+      {
+        path: "/api/records",
+        init: { method: "POST", body: JSON.stringify(input) },
+      },
+    ],
+    access,
+  );
+}

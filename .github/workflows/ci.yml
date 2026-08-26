@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      AGENT_HUB_URL: ${{ vars.AGENT_HUB_GATE_URL }}
+      AGENT_HUB_TOKEN: ${{ secrets.AGENT_HUB_GATE_TOKEN }}
+      AGENT_HUB_SHARED_BRANCHES: ${{ vars.AGENT_HUB_SHARED_BRANCHES }}
+      AGENT_HUB_BRANCH: ${{ github.base_ref || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+      - name: Agent Hub shared-branch gate
+        if: env.AGENT_HUB_URL != '' && env.AGENT_HUB_TOKEN != ''
+        run: pnpm gate:publish -- --branch "$AGENT_HUB_BRANCH"
+
+      - name: Agent Hub gate not configured
+        if: env.AGENT_HUB_URL == '' || env.AGENT_HUB_TOKEN == ''
+        run: echo "Agent Hub publication gate is not configured for this repository yet."

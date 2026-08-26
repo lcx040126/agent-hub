@@ -1,0 +1,97 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      AGENT_HUB_URL: ${{ vars.AGENT_HUB_GATE_URL }}
+      AGENT_HUB_TOKEN: ${{ secrets.AGENT_HUB_GATE_TOKEN }}
+      AGENT_HUB_SHARED_BRANCHES: ${{ vars.AGENT_HUB_SHARED_BRANCHES }}
+      AGENT_HUB_BRANCH: ${{ vars.AGENT_HUB_RELEASE_BRANCH || 'main' }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Agent Hub release gate
+        if: env.AGENT_HUB_URL != '' && env.AGENT_HUB_TOKEN != ''
+        run: pnpm gate:publish -- --branch "$env:AGENT_HUB_BRANCH"
+
+      - name: Agent Hub gate not configured
+        if: env.AGENT_HUB_URL == '' || env.AGENT_HUB_TOKEN == ''
+        run: Write-Host "Agent Hub publication gate is not configured for this repository yet."
+
+      - name: Build NSIS and portable packages
+        run: pnpm desktop:pack:ci
+
+      - name: Verify and checksum packages
+        shell: pwsh
+        run: |
+          $setup = @(Get-ChildItem -LiteralPath release -Filter "AgentHub-Setup-*.exe")
+          $portable = @(Get-ChildItem -LiteralPath release -Filter "AgentHub-Portable-*.exe")
+          if ($setup.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($setup.Count)." }
+          if ($portable.Count -ne 1) { throw "Expected exactly one portable package, found $($portable.Count)." }
+          @($setup + $portable) |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $([System.IO.Path]::GetFileName($_.Path))" } |
+            Set-Content -LiteralPath release/SHA256SUMS.txt -Encoding utf8
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentHub-${{ github.ref_name }}-windows-x64
+          path: |
+            release/AgentHub-Setup-*.exe
+            release/AgentHub-Portable-*.exe
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Create GitHub Release and upload packages
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ github.ref_name }}" *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "${{ github.ref_name }}" --verify-tag --generate-notes --title "Agent Hub ${{ github.ref_name }}"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $releaseFiles = @(
+            (Resolve-Path release/AgentHub-Setup-*.exe).Path
+            (Resolve-Path release/AgentHub-Portable-*.exe).Path
+            (Resolve-Path release/SHA256SUMS.txt).Path
+          )
+          gh release upload "${{ github.ref_name }}" @releaseFiles --clobber
