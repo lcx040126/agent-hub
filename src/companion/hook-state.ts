@@ -14,6 +14,28 @@ export interface HookQuarantineState {
   detectedAt: string;
 }
 
+export interface HookProposedEditState {
+  path: string;
+  precision: "symbol" | "resource" | "path";
+  symbols: string[];
+  operation: "add" | "update" | "delete" | "move" | "unknown";
+}
+
+export interface HookPendingWriteState {
+  proposalHash: string;
+  toolName: string;
+  proposedEdits: HookProposedEditState[];
+  attributedSideEffects: boolean;
+  baselineChangedPaths: string[];
+  baselineChangedFingerprints: Record<string, string>;
+  recordedAt: string;
+}
+
+export interface HookExternalChangeDiagnostic {
+  paths: string[];
+  detectedAt: string;
+}
+
 export interface CodexHookSessionState {
   version: 1;
   codexSessionId: string;
@@ -26,7 +48,13 @@ export interface CodexHookSessionState {
   initialChangedFingerprints: Record<string, string>;
   observedChangedPaths: string[];
   observedChangedFingerprints: Record<string, string>;
+  attributedChangedPaths?: string[];
+  attributedPathsTruncated?: boolean;
   leases: HookLeaseState[];
+  pendingWrite?: HookPendingWriteState;
+  externalChangeDiagnostics?: HookExternalChangeDiagnostic[];
+  loadedFeatureVersions?: Record<string, string>;
+  lastHeartbeatAt?: string;
   quarantine?: HookQuarantineState;
   openedAt: string;
   updatedAt: string;
@@ -101,11 +129,64 @@ export function parseState(raw: string): CodexHookSessionState {
     initialChangedFingerprints: stringMap(value.initialChangedFingerprints),
     observedChangedPaths: stringArray(value.observedChangedPaths),
     observedChangedFingerprints: stringMap(value.observedChangedFingerprints),
+    attributedChangedPaths: value.attributedChangedPaths === undefined
+      ? undefined
+      : stringArray(value.attributedChangedPaths),
+    attributedPathsTruncated: value.attributedPathsTruncated === true,
     leases: Array.isArray(value.leases) ? value.leases.map(parseLease) : [],
+    pendingWrite: value.pendingWrite === undefined ? undefined : parsePendingWrite(value.pendingWrite),
+    externalChangeDiagnostics: value.externalChangeDiagnostics === undefined
+      ? undefined
+      : parseExternalDiagnostics(value.externalChangeDiagnostics),
+    loadedFeatureVersions: value.loadedFeatureVersions === undefined
+      ? undefined
+      : stringMap(value.loadedFeatureVersions),
+    lastHeartbeatAt: value.lastHeartbeatAt === undefined
+      ? undefined
+      : isoText(value.lastHeartbeatAt, "lastHeartbeatAt"),
     quarantine: value.quarantine === undefined ? undefined : parseQuarantine(value.quarantine),
     openedAt: isoText(value.openedAt, "openedAt"),
     updatedAt: isoText(value.updatedAt, "updatedAt"),
   };
+}
+
+function parsePendingWrite(value: unknown): HookPendingWriteState {
+  if (!isRecord(value)) throw new Error("The Agent Hub hook state contains an invalid pending write.");
+  if (!Array.isArray(value.proposedEdits)) throw new Error("The Agent Hub hook state contains invalid proposed edits.");
+  return {
+    proposalHash: requiredHash(value.proposalHash, "proposal hash"),
+    toolName: requiredText(value.toolName, "tool name"),
+    proposedEdits: value.proposedEdits.map(parseProposedEdit),
+    attributedSideEffects: value.attributedSideEffects === true,
+    baselineChangedPaths: stringArray(value.baselineChangedPaths),
+    baselineChangedFingerprints: stringMap(value.baselineChangedFingerprints),
+    recordedAt: isoText(value.recordedAt, "pending write recordedAt"),
+  };
+}
+
+function parseProposedEdit(value: unknown): HookProposedEditState {
+  if (!isRecord(value)) throw new Error("The Agent Hub hook state contains an invalid proposed edit.");
+  const precision = requiredText(value.precision, "edit precision");
+  const operation = requiredText(value.operation, "edit operation");
+  if (!["symbol", "resource", "path"].includes(precision)) throw new Error("The Agent Hub hook state contains an invalid edit precision.");
+  if (!["add", "update", "delete", "move", "unknown", "generate"].includes(operation)) throw new Error("The Agent Hub hook state contains an invalid edit operation.");
+  return {
+    path: requiredText(value.path, "edit path"),
+    precision: precision as HookProposedEditState["precision"],
+    symbols: stringArray(value.symbols),
+    operation: operation === "generate" ? "unknown" : operation as HookProposedEditState["operation"],
+  };
+}
+
+function parseExternalDiagnostics(value: unknown): HookExternalChangeDiagnostic[] {
+  if (!Array.isArray(value)) throw new Error("The Agent Hub hook state contains invalid external change diagnostics.");
+  return value.slice(-20).map((entry) => {
+    if (!isRecord(entry)) throw new Error("The Agent Hub hook state contains an invalid external change diagnostic.");
+    return {
+      paths: stringArray(entry.paths),
+      detectedAt: isoText(entry.detectedAt, "external change detectedAt"),
+    };
+  });
 }
 
 function parseQuarantine(value: unknown): HookQuarantineState {
@@ -149,6 +230,12 @@ function stringMap(value: unknown): Record<string, string> {
 function requiredText(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`The ${name} is required.`);
   return value.trim();
+}
+
+function requiredHash(value: unknown, name: string): string {
+  const text = requiredText(value, name);
+  if (!/^[a-f0-9]{64}$/i.test(text)) throw new Error(`The ${name} is invalid.`);
+  return text.toLocaleLowerCase("en-US");
 }
 
 function isoText(value: unknown, name: string): string {

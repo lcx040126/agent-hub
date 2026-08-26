@@ -1,10 +1,16 @@
 {
   "name": "agent-hub",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "dist/desktop/main.js",
   "description": "A shared coordination room for coding agents and their teams.",
+  "agentHub": {
+    "protocolVersion": 1,
+    "schemaVersion": 3,
+    "minimumSourceProtocolVersion": 1,
+    "minimumSourceSchemaVersion": 2
+  },
   "engines": {
     "node": ">=22.13.0"
   },
@@ -18,14 +24,15 @@
     "test:watch": "vitest",
     "gate:publish": "tsx src/server/publication-gate.ts",
     "desktop:run": "electron dist/desktop/main.js",
-    "desktop:pack": "pnpm build && electron-builder --win nsis portable",
-    "desktop:pack:ci": "pnpm build && electron-builder --win nsis portable --publish never",
+    "desktop:pack": "pnpm build && electron-builder --win nsis",
+    "desktop:pack:ci": "pnpm build && electron-builder --win nsis --publish never",
     "desktop:dir": "pnpm build && electron-builder --dir"
   },
   "dependencies": {
-    "@ast-grep/napi": "0.45.2",
     "@ast-grep/lang-csharp": "0.0.6",
+    "@ast-grep/napi": "0.45.2",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "electron-updater": "6.8.9",
     "express": "5.2.1",
     "lucide-react": "1.34.0",
     "react": "19.2.8",
@@ -38,11 +45,11 @@
     "@types/node": "24.10.1",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
+    "@types/supertest": "6.0.3",
     "@vitejs/plugin-react": "5.1.4",
     "electron": "44.0.0",
     "electron-builder": "26.15.3",
     "supertest": "7.2.2",
-    "@types/supertest": "6.0.3",
     "tsx": "4.23.12",
     "typescript": "5.9.3",
     "vite": "8.2.2",

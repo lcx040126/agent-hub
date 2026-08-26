@@ -239,7 +239,7 @@ describe("session persistence", () => {
         repository: "https://github.com/example/project-vanguard.git",
         defaultBranch: "main",
       },
-      member: { id: "member-b", name: "成员 B", role: "member", status: "online" },
+      member: { id: "member-b", name: "成员 B", role: "member", status: "online", compatibility: "unknown" },
     };
 
     saveSession(base);

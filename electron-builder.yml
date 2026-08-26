@@ -22,18 +22,19 @@ win:
     - target: nsis
       arch:
         - x64
-    - target: portable
-      arch:
-        - x64
+  publish:
+    - provider: github
+      owner: lcx040126
+      repo: agent-hub
+      releaseType: release
 
 nsis:
   artifactName: AgentHub-Setup-${version}-${arch}.${ext}
   oneClick: false
+  perMachine: false
+  allowElevation: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: Agent Hub
   runAfterFinish: true
-
-portable:
-  artifactName: AgentHub-Portable-${version}-${arch}.${ext}

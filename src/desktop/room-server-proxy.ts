@@ -16,22 +16,33 @@ const SAVED_GET_ROUTES = new Set([
   "/api/snapshot",
   "/api/context",
   "/api/activity",
+  "/api/release-requests",
+  "/api/sessions",
   "/api/room/settings",
   "/api/room/context/export",
   "/api/update/status",
 ]);
 
+const SAVED_GET_ROUTE_PATTERNS = [
+  /^\/api\/features\/[A-Za-z0-9_-]{1,128}\/history$/,
+];
+
 const SAVED_POST_ROUTES = [
   /^\/api\/context$/,
   /^\/api\/leases$/,
   /^\/api\/leases\/[A-Za-z0-9_-]{1,128}\/(?:renew|close)$/,
+  /^\/api\/release-requests\/[A-Za-z0-9_-]{1,128}\/resolve$/,
   /^\/api\/edits\/check$/,
+  /^\/api\/features\/query$/,
+  /^\/api\/features\/revisions$/,
+  /^\/api\/features\/[A-Za-z0-9_-]{1,128}\/rollback$/,
+  /^\/api\/feature-confirmations\/[A-Za-z0-9_-]{1,128}\/resolve$/,
   /^\/api\/records$/,
   /^\/api\/decisions$/,
   /^\/api\/verifications$/,
   /^\/api\/handoffs$/,
   /^\/api\/sessions$/,
-  /^\/api\/sessions\/[A-Za-z0-9_-]{1,128}\/(?:scan|close|sync|rebaseline)$/,
+  /^\/api\/sessions\/[A-Za-z0-9_-]{1,128}\/(?:heartbeat|scan|close|sync|rebaseline)$/,
   /^\/api\/room\/settings$/,
   /^\/api\/room\/transfer$/,
   /^\/api\/room\/dissolve$/,
@@ -95,6 +106,10 @@ export async function requestRoomServer(
     throw new Error(`Agent Hub could not reach the room server: ${message}`);
   }
 
+  if (response.status === 204) {
+    await response.body?.cancel().catch(() => undefined);
+    return { status: response.status, body: null };
+  }
   const contentType = response.headers.get("content-type") ?? "";
   if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
     await response.body?.cancel().catch(() => undefined);
@@ -164,7 +179,10 @@ function validateBootstrapRoute(method: "GET" | "POST", target: URL): void {
 
 function validateSavedRoute(method: "GET" | "POST", target: URL): void {
   if (method === "GET") {
-    if (!SAVED_GET_ROUTES.has(target.pathname)) {
+    if (
+      !SAVED_GET_ROUTES.has(target.pathname)
+      && !SAVED_GET_ROUTE_PATTERNS.some((pattern) => pattern.test(target.pathname))
+    ) {
       throw new Error("This Agent Hub GET route is not allowed through the desktop proxy.");
     }
     validateQuery(target);
@@ -180,6 +198,8 @@ function validateQuery(target: URL): void {
     ? new Set(["path", "paths"])
     : target.pathname === "/api/activity"
       ? new Set(["limit", "after"])
+      : target.pathname === "/api/release-requests"
+        ? new Set(["status"])
       : new Set<string>();
   for (const key of target.searchParams.keys()) {
     if (!allowed.has(key)) throw new Error("The Agent Hub API query parameter is not allowed.");

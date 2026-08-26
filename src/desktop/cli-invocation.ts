@@ -2,7 +2,8 @@ export type CodexHookEventName = "SessionStart" | "PreToolUse" | "PostToolUse" |
 
 export type HeadlessInvocation =
   | { mode: "mcp-bridge"; connectionId: string }
-  | { mode: "codex-hook"; eventName: CodexHookEventName };
+  | { mode: "codex-hook"; eventName: CodexHookEventName }
+  | { mode: "health-probe" };
 
 const HOOK_EVENTS = new Set<CodexHookEventName>([
   "SessionStart",
@@ -14,9 +15,13 @@ const HOOK_EVENTS = new Set<CodexHookEventName>([
 export function parseHeadlessInvocation(argv: string[]): HeadlessInvocation | null {
   const bridgeIndex = argv.indexOf("--mcp-bridge");
   const hookIndex = argv.indexOf("--codex-hook");
-  if (bridgeIndex >= 0 && hookIndex >= 0) {
-    throw new Error("Agent Hub cannot run the MCP bridge and a Codex hook in the same process.");
+  const healthIndex = argv.indexOf("--health-probe");
+  if ([bridgeIndex, hookIndex, healthIndex].filter((index) => index >= 0).length > 1) {
+    throw new Error(
+      "Agent Hub cannot run the MCP bridge, a Codex hook, or a health probe in the same process.",
+    );
   }
+  if (healthIndex >= 0) return { mode: "health-probe" };
   if (bridgeIndex >= 0) {
     const connectionIndex = argv.indexOf("--connection-id", bridgeIndex + 1);
     const connectionId = connectionIndex >= 0 ? argv[connectionIndex + 1]?.trim() : undefined;

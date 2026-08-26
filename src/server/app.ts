@@ -1,5 +1,21 @@
 import express, { type NextFunction, type Request, type Response } from "express";
-import type { RecordKind } from "./domain.js";
+import type {
+  FeatureContractChange,
+  FeatureRevisionRelation,
+  FeatureRevisionStatus,
+  FeatureTargetInput,
+  FeatureVerificationEvidence,
+  LeaseKind,
+  ProposedFeatureEdit,
+  RecordKind,
+  ReleaseRequestStatus,
+} from "./domain.js";
+import type { RiskPolicyRule } from "./risk-policy.js";
+import {
+  AGENT_HUB_PROTOCOL_VERSION,
+  AGENT_HUB_SCHEMA_VERSION,
+  AGENT_HUB_VERSION,
+} from "../shared/version.js";
 import { AgentHubDatabase } from "./db.js";
 import { createMcpServiceAdapter } from "./mcp-adapter.js";
 import { createMcpRouter } from "./mcp.js";
@@ -51,7 +67,25 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
   });
   app.use(express.json({ limit: "256kb" }));
   app.get("/api/health", (_request, response) => {
-    response.json({ status: "ok", service: "agent-hub", version: "0.1.0", protocolVersion: 1, schemaVersion: 2, update: updates?.getStatus() ?? { state: "unconfigured" } });
+    // 同时核对迁移版本和核心表可读性，避免只靠静态版本常量误报健康。
+    const databaseSchema = database.connection.prepare("PRAGMA user_version").get() as {
+      user_version?: number;
+    };
+    if (databaseSchema.user_version !== AGENT_HUB_SCHEMA_VERSION) {
+      throw new Error(
+        `Agent Hub database schema mismatch: expected ${AGENT_HUB_SCHEMA_VERSION}, received ${String(databaseSchema.user_version)}.`,
+      );
+    }
+    database.connection.prepare("SELECT 1 FROM rooms LIMIT 1").all();
+    response.json({
+      status: "ok",
+      service: "agent-hub",
+      version: AGENT_HUB_VERSION,
+      protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+      database: { status: "ok", schemaVersion: databaseSchema.user_version },
+      update: updates?.getStatus() ?? { state: "unconfigured" },
+    });
   });
 
   app.get("/api/update/status", (request, response) => {
@@ -82,6 +116,9 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       defaultBranch: optionalValue(body, "defaultBranch"),
       hostName: value(body, "ownerName", "hostName"),
       hostAgent: optionalValue(body, "clientName", "hostAgent"),
+      clientVersion: optionalValue(body, "clientVersion"),
+      protocolVersion: optionalNumber(body.protocolVersion),
+      schemaVersion: optionalNumber(body.schemaVersion),
     });
     response.status(201).json({
       token: result.memberToken,
@@ -98,6 +135,9 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       roomToken: value(body, "inviteCode", "roomToken", "code"),
       displayName: value(body, "memberName", "displayName"),
       agent: optionalValue(body, "clientName", "agent"),
+      clientVersion: optionalValue(body, "clientVersion"),
+      protocolVersion: optionalNumber(body.protocolVersion),
+      schemaVersion: optionalNumber(body.schemaVersion),
     });
     response.status(201).json({
       token: result.memberToken,
@@ -120,6 +160,8 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       activity: dashboard.activity.map(activityResponse),
       sessions: dashboard.sessions,
       localScans: dashboard.localScans,
+      settings: dashboard.settings,
+      releaseRequests: dashboard.releaseRequests,
       server: { mcpUrl: resolveMcpUrl(request, options.mcpUrl) },
     });
   });
@@ -134,7 +176,19 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
 
   app.post("/api/room/settings", (request, response) => {
     const body = bodyObject(request);
-    response.json({ settings: service.updateRoomSettings({ memberToken: bearerToken(request), autoLockAfterAutoClaim: Boolean(body.autoLockAfterAutoClaim) }) });
+    response.json({
+      settings: service.updateRoomSettings({
+        memberToken: bearerToken(request),
+        autoLockAfterAutoClaim: optionalBoolean(body.autoLockAfterAutoClaim),
+        blockingProtectionEnabled: optionalBoolean(body.blockingProtectionEnabled),
+        automaticLeaseTtlMinutes: optionalNumber(body.automaticLeaseTtlMinutes),
+        maximumExclusiveLeaseMinutes: optionalNumber(body.maximumExclusiveLeaseMinutes),
+        riskRules: body.riskRules === undefined
+          ? undefined
+          : objectArrayValue(body.riskRules) as unknown as RiskPolicyRule[],
+        resetRiskPolicy: optionalBoolean(body.resetRiskPolicy),
+      }),
+    });
   });
 
   app.post("/api/room/members/:id/role", (request, response) => {
@@ -193,15 +247,18 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       baseCommit: optionalValue(body, "baseCommit"),
       paths: stringArrayValue(body.paths),
       mode: optionalValue(body, "mode") as "read" | "write" | undefined,
+      kind: optionalValue(body, "kind") as LeaseKind | undefined,
       overrideReason: optionalValue(body, "overrideReason"),
       autoClaim: body.autoClaim === true,
-      ttlMs: ttlMinutes === undefined ? optionalNumber(body.ttlMs) : ttlMinutes * 60_000,
+      ttlMinutes,
+      ttlMs: optionalNumber(body.ttlMs),
     });
     response.status(result.acquired ? 201 : 200).json({
       acquired: result.acquired,
       decision: result.decision,
       lease: result.acquired ? leaseResponse(result.lease) : undefined,
       conflicts: result.conflicts.map(conflictResponse),
+      releaseRequests: result.releaseRequests,
     });
   });
 
@@ -212,7 +269,8 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       memberToken: bearerToken(request),
       leaseId: parameter(request, "id"),
       sessionId: optionalValue(body, "sessionId"),
-      ttlMs: ttlMinutes === undefined ? optionalNumber(body.ttlMs) : ttlMinutes * 60_000,
+      ttlMinutes,
+      ttlMs: optionalNumber(body.ttlMs),
     });
     response.json({ lease: leaseResponse(lease) });
   });
@@ -247,8 +305,115 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
         sessionId: optionalValue(body, "sessionId"),
         paths: stringArrayValue(body.paths),
         leaseId: optionalValue(body, "leaseId"),
+        proposedEdits: objectArrayValue(body.proposedEdits) as unknown as ProposedFeatureEdit[],
       }),
     );
+  });
+
+  app.get("/api/release-requests", (request, response) => {
+    const rawStatus = typeof request.query.status === "string" ? request.query.status : undefined;
+    response.json({
+      releaseRequests: service.listReleaseRequests({
+        memberToken: bearerToken(request),
+        status: rawStatus as ReleaseRequestStatus | "all" | undefined,
+      }),
+    });
+  });
+
+  app.post("/api/release-requests/:id/resolve", (request, response) => {
+    const body = bodyObject(request);
+    const decision = value(body, "decision");
+    response.json({
+      releaseRequest: service.resolveReleaseRequest({
+        memberToken: bearerToken(request),
+        requestId: parameter(request, "id"),
+        decision: decision as "approve" | "reject",
+        reason: optionalValue(body, "reason"),
+      }),
+    });
+  });
+
+  app.post("/api/features/query", (request, response) => {
+    const body = bodyObject(request);
+    response.json(service.queryFeatureMemories({
+      memberToken: bearerToken(request),
+      sessionId: optionalValue(body, "sessionId"),
+      level: body.level === "detail" ? "detail" : "cards",
+      query: optionalValue(body, "query"),
+      featureIds: stringArrayValue(body.featureIds),
+      paths: stringArrayValue(body.paths),
+      systems: stringArrayValue(body.systems),
+      symbols: stringArrayValue(body.symbols),
+      statuses: stringArrayValue(body.statuses) as FeatureRevisionStatus[],
+      limit: optionalNumber(body.limit),
+      cursor: optionalValue(body, "cursor"),
+    }));
+  });
+
+  app.get("/api/features/:id/history", (request, response) => {
+    response.json(service.getFeatureHistory(bearerToken(request), parameter(request, "id")));
+  });
+
+  app.post("/api/features/revisions", (request, response) => {
+    const body = bodyObject(request);
+    const revision = service.submitFeatureRevision({
+      memberToken: bearerToken(request),
+      sessionId: value(body, "sessionId"),
+      featureKey: value(body, "featureKey"),
+      name: value(body, "name"),
+      systemId: value(body, "systemId"),
+      parentRevisionId: optionalValue(body, "parentRevisionId"),
+      relation: optionalValue(body, "relation") as Exclude<FeatureRevisionRelation, "rollback"> | undefined,
+      objective: value(body, "objective"),
+      changeSummary: value(body, "changeSummary"),
+      contractChanges: objectArrayValue(body.contractChanges) as unknown as FeatureContractChange[],
+      constraints: stringArrayValue(body.constraints),
+      dependencies: stringArrayValue(body.dependencies),
+      targets: objectArrayValue(body.targets) as unknown as FeatureTargetInput[],
+      finalCommit: optionalValue(body, "finalCommit"),
+      completed: body.completed === true,
+      verifications: objectArrayValue(body.verifications) as unknown as FeatureVerificationEvidence[],
+      remainingRisks: stringArrayValue(body.remainingRisks),
+      gitEvidence: objectOrUndefined(body.gitEvidence),
+    });
+    response.status(201).json({ revision });
+  });
+
+  app.post("/api/features/:id/rollback", (request, response) => {
+    const body = bodyObject(request);
+    const revision = service.rollbackFeatureRevision({
+      memberToken: bearerToken(request),
+      sessionId: value(body, "sessionId"),
+      featureId: parameter(request, "id"),
+      targetRevisionId: value(body, "targetRevisionId"),
+      changeSummary: value(body, "changeSummary"),
+      finalCommit: optionalValue(body, "finalCommit"),
+      completed: body.completed === true,
+      verifications: objectArrayValue(body.verifications) as unknown as FeatureVerificationEvidence[],
+      gitEvidence: objectOrUndefined(body.gitEvidence),
+    });
+    response.status(201).json({ revision });
+  });
+
+  app.post("/api/feature-confirmations/:id/resolve", (request, response) => {
+    const body = bodyObject(request);
+    const decision = value(body, "decision");
+    if (decision !== "approved" && decision !== "rejected") {
+      throw new AgentHubError(
+        "invalid_feature_confirmation_decision",
+        "Feature confirmation decision must be explicitly approved or rejected.",
+        400,
+      );
+    }
+    response.json({
+      confirmation: service.resolveFeatureConfirmation({
+        memberToken: bearerToken(request),
+        sessionId: value(body, "sessionId"),
+        confirmationId: parameter(request, "id"),
+        decision,
+        reason: optionalValue(body, "reason"),
+      }),
+    });
   });
 
   app.post("/api/records", (request, response) => {
@@ -288,6 +453,7 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
     const body = bodyObject(request);
     const verification = service.addVerification({
       memberToken: bearerToken(request),
+      sessionId: optionalValue(body, "sessionId"),
       leaseId: optionalValue(body, "leaseId"),
       kind: value(body, "kind") as Parameters<AgentHubService["addVerification"]>[0]["kind"],
       result: value(body, "result") as Parameters<AgentHubService["addVerification"]>[0]["result"],
@@ -332,12 +498,26 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       baseCommit: optionalValue(body, "baseCommit"),
       task: optionalValue(body, "task"),
       metadata: objectOrUndefined(body.metadata),
+      clientVersion: optionalValue(body, "clientVersion"),
+      protocolVersion: optionalNumber(body.protocolVersion),
+      schemaVersion: optionalNumber(body.schemaVersion),
     });
     response.status(201).json({ session });
   });
 
   app.get("/api/sessions", (request, response) => {
     response.json(service.listRoomSessions(bearerToken(request)));
+  });
+
+  app.post("/api/sessions/:id/heartbeat", (request, response) => {
+    const body = optionalBodyObject(request);
+    response.json(service.heartbeatSession({
+      memberToken: bearerToken(request),
+      sessionId: parameter(request, "id"),
+      clientVersion: optionalValue(body, "clientVersion"),
+      protocolVersion: optionalNumber(body.protocolVersion),
+      schemaVersion: optionalNumber(body.schemaVersion),
+    }));
   });
 
   app.post("/api/sessions/:id/scan", (request, response) => {
@@ -429,6 +609,10 @@ function memberResponse(member: ReturnType<AgentHubService["authenticateMemberTo
     removedAt: member.removedAt ?? undefined,
     clientName: member.agent ?? undefined,
     agent: member.agent,
+    clientVersion: member.clientVersion,
+    protocolVersion: member.protocolVersion,
+    schemaVersion: member.schemaVersion,
+    compatibility: member.compatibility,
     lastSeenAt: member.lastSeenAt,
     joinedAt: member.createdAt,
   };
@@ -448,6 +632,7 @@ function leaseResponse(lease: ReturnType<AgentHubService["renewLease"]>) {
     paths: lease.paths.map((path) => path.path),
     pathDetails: lease.paths,
     mode: lease.mode,
+    kind: lease.kind,
     status: lease.status === "cancelled" ? "released" : lease.status,
     decision: lease.decision,
     overrideReason: lease.overrideReason ?? undefined,
@@ -475,6 +660,7 @@ function conflictResponse(conflict: ReturnType<AgentHubService["claimLease"]>["c
     reason: conflict.reason,
     expiresAt: conflict.expiresAt,
     status: conflict.decision,
+    existingLeaseKind: conflict.existingLeaseKind,
   };
 }
 
@@ -537,6 +723,12 @@ function stringArrayValue(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
+function objectArrayValue(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+    : [];
+}
+
 function objectOrUndefined(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -550,6 +742,14 @@ function optionalNumber(value: unknown): number | undefined {
     throw new AgentHubError("invalid_input", "Expected a finite number.");
   }
   return number;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "boolean") {
+    throw new AgentHubError("invalid_input", "Expected a boolean value.");
+  }
+  return value;
 }
 
 function bearerToken(request: Request): string {

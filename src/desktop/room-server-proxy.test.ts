@@ -75,6 +75,42 @@ describe("createRequestPlan", () => {
     ).toThrow(/not allowed/i);
   });
 
+  it("allows v0.2 collaboration routes without opening arbitrary API access", () => {
+    const allowedRequests = [
+      { method: "GET", path: "/api/release-requests?status=pending" },
+      { method: "GET", path: "/api/sessions" },
+      { method: "GET", path: "/api/features/feature_01/history" },
+      { method: "POST", path: "/api/release-requests/request_01/resolve", body: {} },
+      { method: "POST", path: "/api/features/query", body: {} },
+      { method: "POST", path: "/api/features/revisions", body: {} },
+      { method: "POST", path: "/api/features/feature_01/rollback", body: {} },
+      { method: "POST", path: "/api/feature-confirmations/confirmation_01/resolve", body: {} },
+      { method: "POST", path: "/api/sessions/session_01/heartbeat", body: {} },
+    ];
+
+    for (const request of allowedRequests) {
+      expect(() =>
+        createRequestPlan(request, "https://hub.example", "secret", true),
+      ).not.toThrow();
+    }
+    expect(() =>
+      createRequestPlan(
+        { method: "GET", path: "/api/release-requests?memberToken=leak" },
+        "https://hub.example",
+        "secret",
+        true,
+      ),
+    ).toThrow(/query parameter/i);
+    expect(() =>
+      createRequestPlan(
+        { method: "POST", path: "/api/features/feature_01/delete", body: {} },
+        "https://hub.example",
+        "secret",
+        true,
+      ),
+    ).toThrow(/not allowed/i);
+  });
+
   it("rejects tokens and oversized JSON in request bodies", () => {
     expect(() =>
       createRequestPlan(
@@ -141,5 +177,32 @@ describe("requestRoomServer", () => {
         fetchMock as typeof fetch,
       ),
     ).rejects.toThrow(/non-JSON/i);
+  });
+
+  it("accepts an empty 204 response from owner management routes", async () => {
+    const connections = {
+      get: vi.fn(async () => ({
+        id: "connection-1",
+        serverUrl: "https://hub.example",
+        repositoryPath: "C:\\repo",
+        createdAt: "2026-08-25T00:00:00.000Z",
+        updatedAt: "2026-08-25T00:00:00.000Z",
+      })),
+      readMemberToken: vi.fn(async () => "private-member-token"),
+    };
+    const fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
+
+    await expect(
+      requestRoomServer(
+        {
+          connectionId: "connection-1",
+          method: "POST",
+          path: "/api/room/dissolve",
+          body: {},
+        },
+        connections,
+        fetchMock as typeof fetch,
+      ),
+    ).resolves.toEqual({ status: 204, body: null });
   });
 });

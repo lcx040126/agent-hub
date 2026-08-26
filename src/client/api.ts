@@ -20,6 +20,28 @@ export type Member = {
   agent?: string;
   lastSeenAt?: string;
   joinedAt?: string;
+  clientVersion?: string;
+  protocolVersion?: number;
+  schemaVersion?: number;
+  compatibility: "compatible" | "incompatible" | "unknown";
+};
+
+export type RiskRule = {
+  id?: string;
+  kind: "category" | "extension" | "file" | "directory";
+  selector: string;
+  level: "warning" | "blocking";
+};
+
+export type RoomSettings = {
+  autoLockAfterAutoClaim: boolean;
+  blockingProtectionEnabled: boolean;
+  automaticLeaseTtlMinutes: 5 | 10 | 15 | 30 | 60;
+  maximumExclusiveLeaseMinutes: number;
+  riskPolicyVersion: number;
+  riskRules: RiskRule[];
+  updatedAt?: string;
+  updatedBy?: string;
 };
 
 export type Lease = {
@@ -33,6 +55,7 @@ export type Lease = {
   paths: string[];
   highRiskPaths: string[];
   mode: "write" | "read";
+  kind: "automatic" | "standard" | "exclusive";
   status: string;
   createdAt?: string;
   expiresAt?: string;
@@ -89,6 +112,37 @@ export type AgentSession = {
   baseCommit?: string;
   status: string;
   lastSeenAt?: string;
+  clientVersion?: string;
+  protocolVersion?: number;
+  schemaVersion?: number;
+};
+
+export type ReleaseRequest = {
+  id: string;
+  requesterMemberId: string;
+  requesterName: string;
+  requesterSessionId?: string;
+  requesterLeaseId?: string;
+  holderMemberId: string;
+  holderName: string;
+  conflictingLeaseId: string;
+  conflictingLeaseTitle: string;
+  conflictingLeaseKind: "automatic" | "standard" | "exclusive";
+  requestTitle: string;
+  requestObjective?: string;
+  requestedKind: "automatic" | "standard" | "exclusive";
+  requestedMode: "read" | "write";
+  requestedPaths: string[];
+  overlapPaths: Array<{ requestedPath: string; existingPath: string }>;
+  reason: string;
+  status: "pending" | "approved" | "rejected" | "cancelled";
+  rejectionReason?: string;
+  transferredLeaseId?: string;
+  occurrenceCount: number;
+  requestedAt: string;
+  lastRequestedAt: string;
+  resolvedAt?: string;
+  holderLeaseExpiresAt: string;
 };
 
 export type LocalScan = {
@@ -111,6 +165,8 @@ export type Dashboard = {
   activity: ActivityItem[];
   sessions: AgentSession[];
   localScans: LocalScan[];
+  settings: RoomSettings;
+  releaseRequests: ReleaseRequest[];
   generatedAt?: string;
   server: { mcpUrl: string };
 };
@@ -172,13 +228,46 @@ type DesktopApi = {
     mcpServerName: string;
     restartRequired: true;
   }>;
-  applyRoomServerUpdate(): Promise<{ restarted: true; port: number }>;
+  getDesktopUpdateStatus(): Promise<DesktopUpdateStatus>;
+  checkDesktopUpdate(): Promise<DesktopUpdateStatus>;
+  downloadDesktopUpdate(): Promise<DesktopUpdateStatus>;
+  installDesktopUpdate(): Promise<DesktopUpdateStatus>;
+  onDesktopUpdateStatus(listener: (status: DesktopUpdateStatus) => void): () => void;
 };
 
 export type DesktopServerInfo = {
   localServerUrl: string;
   lanUrls: string[];
   port: number;
+  appVersion: string;
+  protocolVersion: number;
+  schemaVersion: number;
+};
+
+export type DesktopUpdatePhase =
+  | "disabled"
+  | "idle"
+  | "checking"
+  | "up-to-date"
+  | "available"
+  | "downloading"
+  | "ready"
+  | "installing"
+  | "failed";
+
+export type DesktopUpdateStatus = {
+  phase: DesktopUpdatePhase;
+  currentVersion: string;
+  availableVersion?: string;
+  publishedAt?: string;
+  notes?: string;
+  sizeBytes?: number;
+  progressPercent?: number;
+  transferredBytes?: number;
+  bytesPerSecond?: number;
+  checkedAt?: string;
+  error?: string;
+  canRetry: boolean;
 };
 
 declare global {
@@ -210,6 +299,7 @@ export type CreateLeaseInput = {
   baseCommit?: string;
   paths: string[];
   ttlMinutes: number;
+  kind?: "standard" | "exclusive";
   autoClaim?: boolean;
 };
 
@@ -242,6 +332,7 @@ export type LeaseDecision = {
   lease?: Lease;
   conflicts: Conflict[];
   decision: "allow" | "warn" | "deny";
+  releaseRequests: ReleaseRequest[];
 };
 
 const SESSION_POINTER_KEY = "agent-hub.session.public.v3";
@@ -269,6 +360,10 @@ function asString(value: unknown, fallback = ""): string {
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === "string");
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 function firstArray(...values: unknown[]): unknown[] {
@@ -336,6 +431,12 @@ function normalizeMember(value: unknown): Member {
     agent: asString(member.agent, asString(member.clientName)) || undefined,
     lastSeenAt,
     joinedAt: asString(member.joinedAt, asString(member.createdAt)) || undefined,
+    clientVersion: asString(member.clientVersion) || undefined,
+    protocolVersion: typeof member.protocolVersion === "number" ? member.protocolVersion : undefined,
+    schemaVersion: typeof member.schemaVersion === "number" ? member.schemaVersion : undefined,
+    compatibility: ["compatible", "incompatible", "unknown"].includes(asString(member.compatibility))
+      ? asString(member.compatibility) as Member["compatibility"]
+      : "unknown",
   };
 }
 
@@ -355,6 +456,9 @@ function normalizeLease(value: unknown): Lease {
     paths: normalizedPaths.paths,
     highRiskPaths: [...new Set([...normalizedPaths.highRiskPaths, ...detailedPaths.highRiskPaths])],
     mode: lease.mode === "read" ? "read" : "write",
+    kind: ["automatic", "standard", "exclusive"].includes(asString(lease.kind))
+      ? asString(lease.kind) as Lease["kind"]
+      : "standard",
     status: asString(lease.status, "active"),
     createdAt: asString(lease.createdAt) || undefined,
     updatedAt: asString(lease.updatedAt) || undefined,
@@ -560,6 +664,85 @@ function normalizeAgentSession(value: unknown): AgentSession {
     baseCommit: asString(session.baseCommit) || undefined,
     status: asString(session.status, "active"),
     lastSeenAt: asString(session.lastSeenAt) || undefined,
+    clientVersion: asString(session.clientVersion) || undefined,
+    protocolVersion: typeof session.protocolVersion === "number" ? session.protocolVersion : undefined,
+    schemaVersion: typeof session.schemaVersion === "number" ? session.schemaVersion : undefined,
+  };
+}
+
+function normalizeRiskRule(value: unknown): RiskRule | undefined {
+  const rule = asObject(value);
+  const kind = asString(rule.kind);
+  const selector = asString(rule.selector);
+  const level = asString(rule.level);
+  if (!["category", "extension", "file", "directory"].includes(kind) || !selector) return undefined;
+  if (level !== "warning" && level !== "blocking") return undefined;
+  return {
+    id: asString(rule.id) || undefined,
+    kind: kind as RiskRule["kind"],
+    selector,
+    level,
+  };
+}
+
+function normalizeRoomSettings(value: unknown, room?: Room): RoomSettings {
+  const settings = asObject(value);
+  const rawTtl = asNumber(settings.automaticLeaseTtlMinutes, 10);
+  const automaticLeaseTtlMinutes = [5, 10, 15, 30, 60].includes(rawTtl)
+    ? rawTtl as RoomSettings["automaticLeaseTtlMinutes"]
+    : 10;
+  const blockingProtectionEnabled = typeof settings.blockingProtectionEnabled === "boolean"
+    ? settings.blockingProtectionEnabled
+    : room?.autoLockAfterAutoClaim !== false;
+  return {
+    autoLockAfterAutoClaim: blockingProtectionEnabled,
+    blockingProtectionEnabled,
+    automaticLeaseTtlMinutes,
+    maximumExclusiveLeaseMinutes: Math.max(5, Math.round(asNumber(settings.maximumExclusiveLeaseMinutes, 1440))),
+    riskPolicyVersion: Math.max(1, Math.round(asNumber(settings.riskPolicyVersion, 1))),
+    riskRules: firstArray(settings.riskRules).map(normalizeRiskRule).filter((rule): rule is RiskRule => Boolean(rule)),
+    updatedAt: asString(settings.updatedAt) || undefined,
+    updatedBy: asString(settings.updatedBy) || undefined,
+  };
+}
+
+function normalizeReleaseRequest(value: unknown): ReleaseRequest {
+  const request = asObject(value);
+  const leaseKind = (raw: unknown): Lease["kind"] => ["automatic", "standard", "exclusive"].includes(asString(raw))
+    ? asString(raw) as Lease["kind"]
+    : "automatic";
+  const rawStatus = asString(request.status, "pending");
+  return {
+    id: asString(request.id),
+    requesterMemberId: asString(request.requesterMemberId),
+    requesterName: asString(request.requesterName, "团队成员"),
+    requesterSessionId: asString(request.requesterSessionId) || undefined,
+    requesterLeaseId: asString(request.requesterLeaseId) || undefined,
+    holderMemberId: asString(request.holderMemberId),
+    holderName: asString(request.holderName, "范围持有人"),
+    conflictingLeaseId: asString(request.conflictingLeaseId),
+    conflictingLeaseTitle: asString(request.conflictingLeaseTitle, "受保护范围"),
+    conflictingLeaseKind: leaseKind(request.conflictingLeaseKind),
+    requestTitle: asString(request.requestTitle, "请求修改受保护范围"),
+    requestObjective: asString(request.requestObjective) || undefined,
+    requestedKind: leaseKind(request.requestedKind),
+    requestedMode: request.requestedMode === "read" ? "read" : "write",
+    requestedPaths: asStringArray(request.requestedPaths),
+    overlapPaths: firstArray(request.overlapPaths).map((item) => {
+      const overlap = asObject(item);
+      return { requestedPath: asString(overlap.requestedPath), existingPath: asString(overlap.existingPath) };
+    }).filter((item) => item.requestedPath && item.existingPath),
+    reason: asString(request.reason, "请求范围与现有保护重叠。"),
+    status: ["pending", "approved", "rejected", "cancelled"].includes(rawStatus)
+      ? rawStatus as ReleaseRequest["status"]
+      : "pending",
+    rejectionReason: asString(request.rejectionReason) || undefined,
+    transferredLeaseId: asString(request.transferredLeaseId) || undefined,
+    occurrenceCount: Math.max(1, Math.round(asNumber(request.occurrenceCount, 1))),
+    requestedAt: asString(request.requestedAt),
+    lastRequestedAt: asString(request.lastRequestedAt, asString(request.requestedAt)),
+    resolvedAt: asString(request.resolvedAt) || undefined,
+    holderLeaseExpiresAt: asString(request.holderLeaseExpiresAt),
   };
 }
 
@@ -787,7 +970,9 @@ export function isDesktopApp(): boolean {
 
 export async function getDesktopServerInfo(): Promise<DesktopServerInfo | null> {
   try {
-    return (await window.agentHubDesktop?.getServerInfo()) ?? null;
+    const desktop = window.agentHubDesktop;
+    if (!desktop || typeof desktop.getServerInfo !== "function") return null;
+    return (await desktop.getServerInfo()) ?? null;
   } catch (error) {
     throw friendlyDesktopError(error);
   }
@@ -875,6 +1060,9 @@ export async function createRoom(input: CreateRoomInput): Promise<Session> {
       defaultBranch: input.defaultBranch || "main",
       ownerName: input.ownerName,
       clientName: input.agent || "Codex",
+      clientVersion: desktopServerInfo?.appVersion,
+      protocolVersion: desktopServerInfo?.protocolVersion,
+      schemaVersion: desktopServerInfo?.schemaVersion,
     }),
   }, undefined, desktopServerUrl);
   const session = normalizeSession(result);
@@ -884,12 +1072,16 @@ export async function createRoom(input: CreateRoomInput): Promise<Session> {
 }
 
 export async function joinRoom(input: JoinRoomInput): Promise<Session> {
+  const desktopServerInfo = await getDesktopServerInfo();
   const result = await request("/api/rooms/join", {
     method: "POST",
     body: JSON.stringify({
       inviteCode: input.roomToken,
       memberName: input.memberName,
       clientName: input.agent || "Codex",
+      clientVersion: desktopServerInfo?.appVersion,
+      protocolVersion: desktopServerInfo?.protocolVersion,
+      schemaVersion: desktopServerInfo?.schemaVersion,
     }),
   }, undefined, input.serverUrl);
   const session = normalizeSession(result);
@@ -916,8 +1108,9 @@ export async function getDashboard(access: RequestAccess, roomToken?: string): P
   records.push(...firstArray(payload.handoffs).map(normalizeHandoff));
   records.sort((left, right) => (right.createdAt ?? "").localeCompare(left.createdAt ?? ""));
   const rawConflicts = firstArray(payload.conflicts, payload.blockers);
+  const room = normalizeRoom(payload.room, roomToken);
   return {
-    room: normalizeRoom(payload.room, roomToken),
+    room,
     currentMember: normalizeMember(payload.currentMember),
     members: firstArray(payload.members).map(normalizeMember),
     leases: firstArray(payload.leases, payload.activeLeases).map(normalizeLease),
@@ -926,6 +1119,8 @@ export async function getDashboard(access: RequestAccess, roomToken?: string): P
     activity: firstArray(payload.activity, payload.activities).map(normalizeActivity),
     sessions: firstArray(payload.sessions).map(normalizeAgentSession),
     localScans: firstArray(payload.localScans).map(normalizeLocalScan),
+    settings: normalizeRoomSettings(payload.settings, room),
+    releaseRequests: firstArray(payload.releaseRequests).map(normalizeReleaseRequest),
     generatedAt: asString(payload.generatedAt) || undefined,
     server: {
       mcpUrl: asString(asObject(payload.server).mcpUrl, `${accessServerUrl(access) ?? window.location.origin}/mcp`),
@@ -942,6 +1137,7 @@ export async function createLease(access: RequestAccess, input: CreateLeaseInput
     paths: input.paths,
     mode: "write",
     ttlMinutes: input.ttlMinutes,
+    kind: input.kind,
     autoClaim: input.autoClaim,
   });
   const payload = asObject(
@@ -964,16 +1160,51 @@ export async function createLease(access: RequestAccess, input: CreateLeaseInput
       : acquired
         ? "allow"
         : "deny",
+    releaseRequests: firstArray(payload.releaseRequests).map(normalizeReleaseRequest),
   };
 }
 
-export async function getRoomSettings(access: RequestAccess): Promise<{ autoLockAfterAutoClaim: boolean; updatedAt?: string; updatedBy?: string }> {
+export type UpdateRoomSettingsInput = Partial<Pick<
+  RoomSettings,
+  "blockingProtectionEnabled" | "automaticLeaseTtlMinutes" | "maximumExclusiveLeaseMinutes" | "riskRules"
+>> & {
+  resetRiskPolicy?: boolean;
+};
+
+export async function getRoomSettings(access: RequestAccess): Promise<RoomSettings> {
   const payload = asObject(await requestFirst([{ path: "/api/room/settings" }], access));
-  return asObject(payload.settings) as { autoLockAfterAutoClaim: boolean; updatedAt?: string; updatedBy?: string };
+  return normalizeRoomSettings(payload.settings);
 }
 
-export async function updateRoomSettings(access: RequestAccess, autoLockAfterAutoClaim: boolean): Promise<void> {
-  await requestFirst([{ path: "/api/room/settings", init: { method: "POST", body: JSON.stringify({ autoLockAfterAutoClaim }) } }], access);
+export async function updateRoomSettings(
+  access: RequestAccess,
+  input: UpdateRoomSettingsInput,
+): Promise<RoomSettings> {
+  const payload = asObject(await requestFirst([{ path: "/api/room/settings", init: { method: "POST", body: JSON.stringify(input) } }], access));
+  return normalizeRoomSettings(payload.settings);
+}
+
+export async function listReleaseRequests(
+  access: RequestAccess,
+  status: ReleaseRequest["status"] | "all" = "pending",
+): Promise<ReleaseRequest[]> {
+  const payload = asObject(await requestFirst([
+    { path: `/api/release-requests?status=${encodeURIComponent(status)}` },
+  ], access));
+  return firstArray(payload.releaseRequests).map(normalizeReleaseRequest);
+}
+
+export async function resolveReleaseRequest(
+  access: RequestAccess,
+  requestId: string,
+  decision: "approve" | "reject",
+  reason?: string,
+): Promise<ReleaseRequest> {
+  const payload = asObject(await requestFirst([{
+    path: `/api/release-requests/${encodeURIComponent(requestId)}/resolve`,
+    init: { method: "POST", body: JSON.stringify({ decision, reason }) },
+  }], access));
+  return normalizeReleaseRequest(payload.releaseRequest);
 }
 
 export async function manageMember(access: RequestAccess, memberId: string, action: "admin" | "remove", isAdmin?: boolean): Promise<void> {
@@ -1019,9 +1250,28 @@ export async function stageUpdate(access: RequestAccess): Promise<Record<string,
   return asObject(payload.update);
 }
 
-export async function applyRoomServerUpdate(): Promise<void> {
-  if (!window.agentHubDesktop) throw new ApiError("请在桌面版中应用房间服务更新。", 400);
-  await window.agentHubDesktop.applyRoomServerUpdate();
+export async function getDesktopUpdateStatus(): Promise<DesktopUpdateStatus> {
+  if (!window.agentHubDesktop) throw new ApiError("软件更新仅在 Agent Hub 桌面版中可用。", 400);
+  return window.agentHubDesktop.getDesktopUpdateStatus();
+}
+
+export async function checkDesktopUpdate(): Promise<DesktopUpdateStatus> {
+  if (!window.agentHubDesktop) throw new ApiError("软件更新仅在 Agent Hub 桌面版中可用。", 400);
+  return window.agentHubDesktop.checkDesktopUpdate();
+}
+
+export async function downloadDesktopUpdate(): Promise<DesktopUpdateStatus> {
+  if (!window.agentHubDesktop) throw new ApiError("软件更新仅在 Agent Hub 桌面版中可用。", 400);
+  return window.agentHubDesktop.downloadDesktopUpdate();
+}
+
+export async function installDesktopUpdate(): Promise<DesktopUpdateStatus> {
+  if (!window.agentHubDesktop) throw new ApiError("软件更新仅在 Agent Hub 桌面版中可用。", 400);
+  return window.agentHubDesktop.installDesktopUpdate();
+}
+
+export function subscribeDesktopUpdateStatus(listener: (status: DesktopUpdateStatus) => void): () => void {
+  return window.agentHubDesktop?.onDesktopUpdateStatus(listener) ?? (() => undefined);
 }
 
 export async function renewLease(access: RequestAccess, leaseId: string, ttlMinutes = 120): Promise<void> {

@@ -4,6 +4,7 @@ import {
   Activity,
   AlertTriangle,
   ArrowRight,
+  Bell,
   Bot,
   Check,
   CheckCircle2,
@@ -40,21 +41,23 @@ import {
 import {
   ApiError,
   clearSession,
+  checkDesktopUpdate,
   chooseRepository,
   closeLease,
   createLease,
   createRecord,
   createRoom,
+  downloadDesktopUpdate,
   getDashboard,
+  getDesktopUpdateStatus,
+  installDesktopUpdate,
   manageMember,
   transferOwnership,
   dissolveRoom,
   exportRoomContext,
   importRoomContext,
+  resolveReleaseRequest,
   rebaselineSession,
-  checkForUpdate,
-  stageUpdate,
-  applyRoomServerUpdate,
   updateRoomSettings,
   getDesktopServerInfo,
   installCodexConnection,
@@ -66,20 +69,59 @@ import {
   resumeSavedConnection,
   saveSession,
   secureDesktopSession,
+  subscribeDesktopUpdateStatus,
   type Conflict,
+  type CreateLeaseInput,
   type CreateRecordInput,
   type Dashboard,
+  type DesktopUpdateStatus,
   type Lease,
   type ProjectRecord,
   type RecordKind,
+  type ReleaseRequest,
+  type RiskRule,
+  type RoomSettings,
   type SavedRoomConnection,
   type Session,
 } from "./api";
 
 type View = "work" | "records" | "connection" | "management";
 type Notice = { tone: "success" | "warning" | "danger"; message: string };
+type RecordModalKind = Exclude<RecordKind, "context">;
+
+export type DashboardModal =
+  | { type: "claim" }
+  | { type: "close"; lease: Lease }
+  | { type: "record"; recordKind: RecordModalKind }
+  | { type: "release"; requestId: string };
+
+export function nextPendingReleaseRequestId(
+  activeModal: DashboardModal | null,
+  requests: ReadonlyArray<Pick<ReleaseRequest, "id" | "status" | "holderMemberId">>,
+  currentMemberId: string,
+  dismissedRequestIds: ReadonlySet<string>,
+): string | undefined {
+  if (activeModal) return undefined;
+  return requests.find((request) =>
+    request.status === "pending"
+    && request.holderMemberId === currentMemberId
+    && !dismissedRequestIds.has(request.id)
+  )?.id;
+}
 
 const ACTIVE_STATUSES = new Set(["active", "pending", "working"]);
+
+const RISK_CATEGORY_LABELS: Record<string, string> = {
+  repository_scope: "整个仓库",
+  normal_source: "普通源码",
+  unity_scene_prefab: "Unity 场景与 Prefab",
+  unity_serialized: "Unity 序列化资源",
+  project_settings: "项目设置",
+  git_ci: "Git 与 CI",
+  structured_config: "结构化配置",
+  luban: "Luban 表与生成内容",
+  other: "其他文件",
+};
 
 function splitLines(value: string): string[] {
   return value
@@ -276,12 +318,13 @@ function Field({
   );
 }
 
-function EntryScreen({ onConnected }: { onConnected: (session: Session) => void }) {
+export function EntryScreen({ onConnected }: { onConnected: (session: Session) => void }) {
   const desktop = isDesktopApp();
   const [mode, setMode] = useState<"create" | "join">("create");
   const [busy, setBusy] = useState(false);
   const [repoBusy, setRepoBusy] = useState(false);
   const [error, setError] = useState("");
+  const [updateNotice, setUpdateNotice] = useState<Notice | null>(null);
   const [repositoryPath, setRepositoryPath] = useState("");
   const [savedConnections, setSavedConnections] = useState<SavedRoomConnection[]>([]);
   const [createValues, setCreateValues] = useState({
@@ -303,6 +346,12 @@ function EntryScreen({ onConnected }: { onConnected: (session: Session) => void 
       .then(setSavedConnections)
       .catch((caught) => setError(caught instanceof Error ? caught.message : "无法读取已保存的房间。"));
   }, [desktop]);
+
+  useEffect(() => {
+    if (!updateNotice) return;
+    const timeout = window.setTimeout(() => setUpdateNotice(null), 3500);
+    return () => window.clearTimeout(timeout);
+  }, [updateNotice]);
 
   const selectRepository = async () => {
     setRepoBusy(true);
@@ -408,6 +457,11 @@ function EntryScreen({ onConnected }: { onConnected: (session: Session) => void 
 
       <section className="entry-panel">
         <div className="entry-panel-inner">
+          {desktop && (
+            <section className="entry-update-control" aria-label="软件更新">
+              <DesktopUpdateControl onNotice={(message, tone = "success") => setUpdateNotice({ message, tone })} />
+            </section>
+          )}
           {desktop && savedConnections.length > 0 && (
             <section className="saved-connections" aria-labelledby="saved-title">
               <div><span className="section-kicker">快速返回</span><h2 id="saved-title">已保存的房间</h2></div>
@@ -455,6 +509,7 @@ function EntryScreen({ onConnected }: { onConnected: (session: Session) => void 
           )}
         </div>
       </section>
+      {updateNotice && <div className={`toast ${updateNotice.tone}`} role="status">{updateNotice.tone === "success" ? <CheckCircle2 aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}<span>{updateNotice.message}</span><IconButton label="关闭提示" onClick={() => setUpdateNotice(null)}><X aria-hidden="true" /></IconButton></div>}
     </main>
   );
 }
@@ -500,29 +555,307 @@ function AppNav({ view, onChange, open, onClose }: { view: View; onChange: (view
 }
 
 function ManagementView({ dashboard, session, onRefresh, onNotice }: { dashboard: Dashboard; session: Session; onRefresh: () => Promise<void>; onNotice: (message: string, tone?: Notice["tone"]) => void }) {
-  const canManage = dashboard.currentMember.role === "host" || dashboard.currentMember.isAdmin;
+  const canManageMembers = dashboard.currentMember.role === "host" || dashboard.currentMember.isAdmin;
   const isOwner = dashboard.currentMember.role === "host";
   const [busy, setBusy] = useState(false);
-  const [updateStatus, setUpdateStatus] = useState<Record<string, unknown> | null>(null);
-  if (!canManage) return <EmptyState icon={<Settings aria-hidden="true" />} title="没有房间管理权限" detail="只有房主和管理员可以查看这里。" />;
-  const run = async (operation: () => Promise<void>, success: string) => { setBusy(true); try { await operation(); onNotice(success); await onRefresh(); } catch (error) { onNotice(error instanceof Error ? error.message : "操作失败。", "danger"); } finally { setBusy(false); } };
-  const download = async () => { const payload = await exportRoomContext(session); const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = `${dashboard.room.name}-context.json`; anchor.click(); URL.revokeObjectURL(url); onNotice("房间上下文已导出。"); };
-  const checkUpdate = () => void run(async () => { setUpdateStatus(await checkForUpdate(session)); }, "更新检查完成。");
-  const stageUpdatePackage = () => void run(async () => { setUpdateStatus(await stageUpdate(session)); }, "更新包已校验并准备就绪。");
-  const applyUpdate = () => void run(async () => { await applyRoomServerUpdate(); setUpdateStatus({ state: "restarted" }); }, "房间服务已重启，连接将自动恢复。");
-  return <div className="content-grid wide-main"><section className="section-block" aria-labelledby="management-title"><div className="section-heading"><div><span className="section-kicker">房间管理</span><h2 id="management-title">成员与房间设置</h2></div></div><div className="management-settings"><label className="toggle-row"><span><strong>自动领取后强制锁定范围</strong><small>开启后，自动领取的重叠范围会直接阻止写入。</small></span><input type="checkbox" checked={dashboard.room.autoLockAfterAutoClaim !== false} disabled={busy} onChange={(event) => void run(() => updateRoomSettings(session, event.target.checked), "房间设置已更新。")} /></label></div><div className="management-actions"><button type="button" className="secondary-button" onClick={() => void download()}><Download aria-hidden="true" />导出上下文</button><label className="secondary-button"><Upload aria-hidden="true" />导入上下文<input type="file" accept="application/json" hidden onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; void file.text().then((text) => { try { return run(() => importRoomContext(session, JSON.parse(text)).then(() => undefined), "上下文已追加导入。"); } catch (error) { onNotice(error instanceof Error ? error.message : "导入文件格式不正确。", "danger"); } }); }} /></label>{isOwner && <><button type="button" className="secondary-button" disabled={busy} onClick={checkUpdate}><RefreshCw aria-hidden="true" />检查更新</button>{updateStatus?.state === "available" && <button type="button" className="secondary-button" disabled={busy} onClick={stageUpdatePackage}><Download aria-hidden="true" />准备更新</button>}</>}</div>{updateStatus && <div className="update-status" role="status">更新状态：{String(updateStatus.state)}{updateStatus.availableVersion ? ` · ${String(updateStatus.availableVersion)}` : ""}{updateStatus.error ? ` · ${String(updateStatus.error)}` : ""}</div>}<div className="member-management-list">{dashboard.members.map((member) => <div className="member-management-row" key={member.id}><div><strong>{member.name}</strong><small>{member.role === "host" ? "房主" : member.isAdmin ? "管理员" : "成员"}</small></div>{member.id !== dashboard.currentMember.id && member.role !== "host" && <div className="member-management-actions">{isOwner && <button type="button" className="text-button" disabled={busy} onClick={() => void run(() => manageMember(session, member.id, "admin", !member.isAdmin), member.isAdmin ? "管理员权限已撤销。" : "管理员权限已授予。")}>{member.isAdmin ? "撤销管理员" : "设为管理员"}</button>}{(isOwner || (!member.isAdmin && dashboard.currentMember.isAdmin)) && <button type="button" className="text-button danger" disabled={busy} onClick={() => void run(() => manageMember(session, member.id, "remove"), "成员已移出房间。")}>踢出</button>}{isOwner && <button type="button" className="text-button" disabled={busy} onClick={() => void run(() => transferOwnership(session, member.id), "房主已交接。")}>交接房主</button>}</div>}</div>)}</div><div className="member-management-list">{dashboard.sessions.filter((item) => item.status === "frozen").map((item) => <div className="member-management-row" key={item.id}><div><strong>会话已冻结</strong><small>{item.branch || "新分支"} · {item.baseCommit || "未记录基线"}</small></div><button type="button" className="text-button" disabled={busy} onClick={() => void run(() => rebaselineSession(session, item.id, item.branch || dashboard.room.defaultBranch, item.baseCommit || "0000000"), "会话已重新建立基线。")}>重新建立基线</button></div>)}</div>{isOwner && <button type="button" className="danger-button" disabled={busy} onClick={() => { if (window.confirm("确定解散房间吗？")) void run(() => dissolveRoom(session), "房间已解散。"); }}><XCircle aria-hidden="true" />解散房间</button>}</section></div>;
+  const [settings, setSettings] = useState<RoomSettings>(dashboard.settings);
+  useEffect(() => setSettings(dashboard.settings), [dashboard.settings.updatedAt, dashboard.settings.riskPolicyVersion]);
+
+  const run = async (operation: () => Promise<void>, success: string) => {
+    setBusy(true);
+    try {
+      await operation();
+      onNotice(success);
+      await onRefresh();
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "操作失败。", "danger");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const download = async () => {
+    const payload = await exportRoomContext(session);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${dashboard.room.name}-context.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    onNotice("房间上下文已导出。");
+  };
+  const updateRule = (index: number, next: Partial<RiskRule>) => {
+    setSettings((current) => ({
+      ...current,
+      riskRules: current.riskRules.map((rule, ruleIndex) => ruleIndex === index ? { ...rule, ...next } : rule),
+    }));
+  };
+  const categoryRules = settings.riskRules
+    .map((rule, index) => ({ rule, index }))
+    .filter(({ rule }) => rule.kind === "category");
+  const customRules = settings.riskRules
+    .map((rule, index) => ({ rule, index }))
+    .filter(({ rule }) => rule.kind !== "category");
+  const saveSettings = () => run(
+    () => updateRoomSettings(session, {
+      blockingProtectionEnabled: settings.blockingProtectionEnabled,
+      automaticLeaseTtlMinutes: settings.automaticLeaseTtlMinutes,
+      maximumExclusiveLeaseMinutes: settings.maximumExclusiveLeaseMinutes,
+      riskRules: settings.riskRules,
+    }).then(() => undefined),
+    "房间保护策略已保存。",
+  );
+
+  return (
+    <div className="content-grid wide-main">
+      <section className="section-block" aria-labelledby="management-title">
+        <div className="section-heading">
+          <div><span className="section-kicker">房间设置</span><h2 id="management-title">保护策略与租期</h2></div>
+          <span className="quiet-count">策略 v{settings.riskPolicyVersion}</span>
+        </div>
+        <div className="management-settings">
+          <label className="toggle-row">
+            <span><strong>关键范围阻塞保护</strong><small>关闭后，普通范围重叠都降为黄色警告；手动独占范围仍会阻止写入。</small></span>
+            <input type="checkbox" checked={settings.blockingProtectionEnabled} disabled={!isOwner || busy} onChange={(event) => setSettings({ ...settings, blockingProtectionEnabled: event.target.checked, autoLockAfterAutoClaim: event.target.checked })} />
+          </label>
+          <div className="setting-row">
+            <span><strong>自动与普通租期</strong><small>Agent 持续工作时会按心跳续期，停止后按这里的时间释放。</small></span>
+            <div className="segmented-control compact">
+              {([5, 10, 15, 30, 60] as const).map((minutes) => (
+                <button type="button" key={minutes} disabled={!isOwner || busy} className={settings.automaticLeaseTtlMinutes === minutes ? "active" : ""} onClick={() => setSettings({ ...settings, automaticLeaseTtlMinutes: minutes })}>{minutes} 分钟</button>
+              ))}
+            </div>
+          </div>
+          <label className="setting-row">
+            <span><strong>手动独占最大租期</strong><small>成员仍可选择更短时长，独占租期不会随 Agent 心跳自动延长。</small></span>
+            <span className="number-setting"><input type="number" min={5} max={10080} step={5} value={settings.maximumExclusiveLeaseMinutes} disabled={!isOwner || busy} onChange={(event) => setSettings({ ...settings, maximumExclusiveLeaseMinutes: Math.max(5, Number(event.target.value) || 5) })} />分钟</span>
+          </label>
+        </div>
+
+        <div className="subsection-heading"><div><strong>文件重叠规则</strong><small>黄色只提醒，红色会在 Agent 写入前阻止并发出释放申请。</small></div></div>
+        <div className="risk-rule-list">
+          {categoryRules.map(({ rule, index }) => (
+            <div className="risk-rule-row" key={rule.selector}>
+              <span><strong>{RISK_CATEGORY_LABELS[rule.selector] ?? rule.selector}</strong><small>预设分类</small></span>
+              <div className="segmented-control compact">
+                <button type="button" disabled={!isOwner || busy} className={rule.level === "warning" ? "active warning" : ""} onClick={() => updateRule(index, { level: "warning" })}>黄色警告</button>
+                <button type="button" disabled={!isOwner || busy} className={rule.level === "blocking" ? "active danger" : ""} onClick={() => updateRule(index, { level: "blocking" })}>红色阻塞</button>
+              </div>
+            </div>
+          ))}
+          {customRules.map(({ rule, index }) => (
+            <div className="risk-rule-row custom" key={`${rule.kind}-${index}`}>
+              <select aria-label="规则类型" value={rule.kind} disabled={!isOwner || busy} onChange={(event) => updateRule(index, { kind: event.target.value as RiskRule["kind"] })}>
+                <option value="extension">扩展名</option><option value="file">具体文件</option><option value="directory">目录</option>
+              </select>
+              <input aria-label="匹配内容" value={rule.selector} disabled={!isOwner || busy} placeholder={rule.kind === "extension" ? ".cs" : "Assets/Vanguard/Inventory"} onChange={(event) => updateRule(index, { selector: event.target.value })} />
+              <select aria-label="处理方式" value={rule.level} disabled={!isOwner || busy} onChange={(event) => updateRule(index, { level: event.target.value as RiskRule["level"] })}>
+                <option value="warning">黄色警告</option><option value="blocking">红色阻塞</option>
+              </select>
+              {isOwner && <IconButton label="删除这条规则" disabled={busy} onClick={() => setSettings((current) => ({ ...current, riskRules: current.riskRules.filter((_, ruleIndex) => ruleIndex !== index) }))}><X aria-hidden="true" /></IconButton>}
+            </div>
+          ))}
+        </div>
+        {isOwner && (
+          <div className="management-actions">
+            <button type="button" className="secondary-button" disabled={busy} onClick={() => setSettings((current) => ({ ...current, riskRules: [...current.riskRules, { kind: "extension", selector: ".cs", level: "warning" }] }))}><Plus aria-hidden="true" />添加自定义规则</button>
+            <button type="button" className="text-button" disabled={busy} onClick={() => void run(() => updateRoomSettings(session, { resetRiskPolicy: true }).then(() => undefined), "默认文件规则已恢复。")}>恢复默认规则</button>
+            <button type="button" className="primary-button" disabled={busy} onClick={() => void saveSettings()}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}保存保护策略</button>
+          </div>
+        )}
+        {!isOwner && <p className="automation-caption"><CircleHelp aria-hidden="true" />当前规则由房主维护，你可以查看但不能修改。</p>}
+
+        <div className="subsection-heading"><div><strong>共享上下文</strong><small>用于迁移或备份房间记录，不会导出成员私密聊天。</small></div></div>
+        <div className="management-actions">
+          <button type="button" className="secondary-button" onClick={() => void download()}><Download aria-hidden="true" />导出上下文</button>
+          <label className="secondary-button">
+            <Upload aria-hidden="true" />导入上下文
+            <input type="file" accept="application/json" hidden onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (!file) return;
+              void file.text().then((text) => {
+                try {
+                  return run(() => importRoomContext(session, JSON.parse(text)).then(() => undefined), "上下文已追加导入。");
+                } catch (error) {
+                  onNotice(error instanceof Error ? error.message : "导入文件格式不正确。", "danger");
+                }
+              });
+            }} />
+          </label>
+        </div>
+
+        {canManageMembers && <div className="subsection-heading"><div><strong>成员管理</strong><small>成员版本不兼容时应先完成客户端更新。</small></div></div>}
+        {canManageMembers && <div className="member-management-list">
+          {dashboard.members.map((member) => (
+            <div className="member-management-row" key={member.id}>
+              <div><strong>{member.name}</strong><small>{member.role === "host" ? "房主" : member.isAdmin ? "管理员" : "成员"} · {member.clientVersion ? `v${member.clientVersion}` : "未上报版本"} · {compatibilityLabel(member.compatibility)}</small></div>
+              {member.id !== dashboard.currentMember.id && member.role !== "host" && (
+                <div className="member-management-actions">
+                  {isOwner && <button type="button" className="text-button" disabled={busy} onClick={() => void run(() => manageMember(session, member.id, "admin", !member.isAdmin), member.isAdmin ? "管理员权限已撤销。" : "管理员权限已授予。")}>{member.isAdmin ? "撤销管理员" : "设为管理员"}</button>}
+                  {(isOwner || (!member.isAdmin && dashboard.currentMember.isAdmin)) && <button type="button" className="text-button danger" disabled={busy} onClick={() => void run(() => manageMember(session, member.id, "remove"), "成员已移出房间。")}>踢出</button>}
+                  {isOwner && <button type="button" className="text-button" disabled={busy} onClick={() => void run(() => transferOwnership(session, member.id), "房主已交接。")}>交接房主</button>}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>}
+        {canManageMembers && <div className="member-management-list">
+          {dashboard.sessions.filter((item) => item.status === "frozen" && isVisibleAgentSession(item)).map((item) => (
+            <div className="member-management-row" key={item.id}>
+              <div><strong>会话已冻结</strong><small>{item.branch || "新分支"} · {item.baseCommit || "未记录基线"}</small></div>
+              <button type="button" className="text-button" disabled={busy} onClick={() => void run(() => rebaselineSession(session, item.id, item.branch || dashboard.room.defaultBranch, item.baseCommit || "0000000"), "会话已重新建立基线。")}>重新建立基线</button>
+            </div>
+          ))}
+        </div>}
+        {isOwner && <button type="button" className="danger-button" disabled={busy} onClick={() => { if (window.confirm("确定解散房间吗？")) void run(() => dissolveRoom(session), "房间已解散。"); }}><XCircle aria-hidden="true" />解散房间</button>}
+      </section>
+    </div>
+  );
 }
 
-function UpdateControl({ session, onNotice }: { session: Session; onNotice: (message: string, tone?: Notice["tone"]) => void }) {
-  const [status, setStatus] = useState<Record<string, unknown> | null>(null);
+function compatibilityLabel(value: Dashboard["members"][number]["compatibility"]): string {
+  if (value === "compatible") return "版本兼容";
+  if (value === "incompatible") return "需要更新";
+  return "版本未知";
+}
+
+function isVisibleAgentSession(session: Dashboard["sessions"][number]): boolean {
+  return session.agentName?.trim().toLocaleLowerCase("en-US") !== "background repository scanner";
+}
+
+function formatBytes(value?: number): string | undefined {
+  if (value === undefined || !Number.isFinite(value) || value < 0) return undefined;
+  if (value < 1024) return `${Math.round(value)} B`;
+  const units = ["KB", "MB", "GB"];
+  let amount = value / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && amount >= 1024; index += 1) {
+    amount /= 1024;
+    unit = units[index];
+  }
+  return `${amount >= 10 ? amount.toFixed(0) : amount.toFixed(1)} ${unit}`;
+}
+
+function DesktopUpdateControl({ onNotice }: { onNotice: (message: string, tone?: Notice["tone"]) => void }) {
+  const [status, setStatus] = useState<DesktopUpdateStatus | null>(null);
   const [busy, setBusy] = useState(false);
-  const run = async (operation: () => Promise<Record<string, unknown> | void>, success: string) => {
+  const [dismissedVersion, setDismissedVersion] = useState<string>();
+
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    let active = true;
+    void getDesktopUpdateStatus()
+      .then((nextStatus) => { if (active) setStatus(nextStatus); })
+      .catch(() => undefined);
+    const unsubscribe = subscribeDesktopUpdateStatus((nextStatus) => {
+      if (active) setStatus(nextStatus);
+    });
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
+
+  if (!status || status.phase === "disabled") return null;
+
+  const check = async () => {
     setBusy(true);
-    try { setStatus((await operation()) as Record<string, unknown> | undefined ?? status); onNotice(success); }
-    catch (error) { onNotice(error instanceof Error ? error.message : "更新操作失败。", "danger"); }
-    finally { setBusy(false); }
+    try {
+      const nextStatus = await checkDesktopUpdate();
+      setStatus(nextStatus);
+      if (nextStatus.phase === "up-to-date") onNotice(`当前已是最新版 v${nextStatus.currentVersion}。`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "更新检查失败。", "danger");
+    } finally {
+      setBusy(false);
+    }
   };
-  return <div className="update-control"><button type="button" className="secondary-button" disabled={busy} onClick={() => void run(() => checkForUpdate(session), "更新检查完成。")}><RefreshCw aria-hidden="true" />检查更新</button>{status?.state === "available" && <button type="button" className="secondary-button" disabled={busy} onClick={() => void run(() => stageUpdate(session), "更新包已准备。")}><Download aria-hidden="true" />准备更新</button>}{status?.state === "staged" && isDesktopApp() && <button type="button" className="secondary-button" disabled={busy} onClick={() => void run(async () => { await applyRoomServerUpdate(); return { state: "restarted" }; }, "房间服务已重启，连接将自动恢复。")}><RefreshCw aria-hidden="true" />应用更新</button>}{status && <small>更新状态：{String(status.state)}{status.availableVersion ? ` · ${String(status.availableVersion)}` : ""}</small>}</div>;
+
+  const updateNow = async () => {
+    setBusy(true);
+    try {
+      let nextStatus = status;
+      if (nextStatus.phase === "available") nextStatus = await downloadDesktopUpdate();
+      if (nextStatus.phase === "ready") await installDesktopUpdate();
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "更新失败，当前版本未被替换。", "danger");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const availableVersion = status.availableVersion;
+  const isAvailable = status.phase === "available" || status.phase === "downloading" || status.phase === "ready";
+  if (isAvailable && dismissedVersion === availableVersion) {
+    return (
+      <div className="update-reminder" role="status">
+        <Download aria-hidden="true" />
+        <span>Agent Hub v{availableVersion} 可以更新</span>
+        <button type="button" className="text-button" onClick={() => setDismissedVersion(undefined)}>查看</button>
+      </div>
+    );
+  }
+
+  if (isAvailable || status.phase === "installing" || status.phase === "failed") {
+    const progress = Math.round(status.progressPercent ?? 0);
+    return (
+      <section className={`desktop-update-banner ${status.phase === "failed" ? "failed" : ""}`} aria-live="polite">
+        <div className="desktop-update-icon">
+          {status.phase === "downloading" || status.phase === "installing"
+            ? <LoaderCircle className="spin" aria-hidden="true" />
+            : status.phase === "failed"
+              ? <AlertTriangle aria-hidden="true" />
+              : <Download aria-hidden="true" />}
+        </div>
+        <div className="desktop-update-copy">
+          <strong>
+            {status.phase === "failed"
+              ? "软件更新未完成"
+              : status.phase === "downloading"
+                ? `正在下载 v${availableVersion}`
+                : status.phase === "ready"
+                  ? `v${availableVersion} 已通过校验`
+                  : status.phase === "installing"
+                    ? "正在安装并重新启动"
+                    : `Agent Hub v${availableVersion} 可用`}
+          </strong>
+          <span>
+            {status.phase === "failed"
+              ? status.error ?? "当前版本保持不变，可以重新检查后再试。"
+              : status.phase === "downloading"
+                ? `${progress}%${formatBytes(status.sizeBytes) ? ` · 共 ${formatBytes(status.sizeBytes)}` : ""}`
+                : status.phase === "ready"
+                  ? "点击后会保存房间数据、安装完整版本并自动重新打开。"
+                  : status.phase === "installing"
+                    ? "房主服务会短暂断开，房间记录和连接信息会保留。"
+                    : `当前 v${status.currentVersion}${formatBytes(status.sizeBytes) ? ` · 下载 ${formatBytes(status.sizeBytes)}` : ""}`}
+          </span>
+          {status.notes && status.phase === "available" && <p>{status.notes}</p>}
+          {status.phase === "downloading" && <div className="update-progress" aria-label={`下载进度 ${progress}%`}><span style={{ width: `${progress}%` }} /></div>}
+        </div>
+        <div className="desktop-update-actions">
+          {(status.phase === "available" || status.phase === "ready") && (
+            <button type="button" className="primary-button" disabled={busy} onClick={() => void updateNow()}>
+              {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <Download aria-hidden="true" />}
+              立即更新
+            </button>
+          )}
+          {status.phase === "failed" && <button type="button" className="secondary-button" disabled={busy} onClick={() => void check()}><RefreshCw aria-hidden="true" />重新检查</button>}
+          {isAvailable && status.phase !== "downloading" && <button type="button" className="text-button" disabled={busy} onClick={() => setDismissedVersion(availableVersion)}>稍后</button>}
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <div className="desktop-update-status" role="status">
+      <span>Agent Hub v{status.currentVersion}</span>
+      <small>{status.phase === "checking" ? "正在检查更新" : status.phase === "up-to-date" ? "已是最新版" : "自动更新已开启"}</small>
+      <button type="button" className="text-button" disabled={busy || status.phase === "checking"} onClick={() => void check()}>
+        <RefreshCw className={status.phase === "checking" ? "spin" : ""} aria-hidden="true" />检查更新
+      </button>
+    </div>
+  );
 }
 
 function StatusSummary({ dashboard, online, conflicts }: { dashboard: Dashboard; online: boolean; conflicts?: Conflict[] }) {
@@ -565,12 +898,12 @@ function MemberStrip({ dashboard }: { dashboard: Dashboard }) {
       </div>
       <div className="member-list">
         {dashboard.members.map((member) => (
-          <div className="member-chip" key={member.id} title={`${member.name} · ${member.agent ?? "Agent 未上报"}`}>
+          <div className={`member-chip ${member.compatibility === "incompatible" ? "incompatible" : ""}`} key={member.id} title={`${member.name} · ${member.agent ?? "Agent 未上报"} · ${compatibilityLabel(member.compatibility)}`}>
             <span className={`presence ${member.status}`} />
             <span className="member-avatar">{member.name.slice(0, 1).toUpperCase()}</span>
             <span className="member-copy">
               <strong>{member.name}{member.id === dashboard.currentMember.id ? "（你）" : ""}</strong>
-              <small>{member.role === "host" ? "房主" : member.agent ?? "成员"}</small>
+              <small>{member.role === "host" ? "房主" : member.agent ?? "成员"} · {member.clientVersion ? `v${member.clientVersion}` : compatibilityLabel(member.compatibility)}</small>
             </span>
           </div>
         ))}
@@ -598,7 +931,7 @@ function WorkItem({
       <div className="work-main">
         <div className="work-title-row">
           <div>
-            <div className="work-owner"><span>{lease.memberName}</span>{own && <em>你的工作</em>}</div>
+            <div className="work-owner"><span>{lease.memberName}</span>{own && <em>你的工作</em>}<em className={lease.kind === "exclusive" ? "exclusive" : ""}>{lease.kind === "exclusive" ? "手动独占" : lease.kind === "automatic" ? "自动领取" : "普通范围"}</em></div>
             <h3>{lease.title}</h3>
           </div>
           <span className="lease-time"><Clock3 aria-hidden="true" />{timeUntil(lease.expiresAt)}</span>
@@ -772,7 +1105,7 @@ function WorkView({
   const leases = dashboard.leases.filter((lease) => ACTIVE_STATUSES.has(lease.status));
   const ownLeases = leases.filter((lease) => lease.memberId === dashboard.currentMember.id || lease.memberName === dashboard.currentMember.name);
   const otherLeases = leases.filter((lease) => !ownLeases.includes(lease));
-  const activeSessions = dashboard.sessions.filter((session) => session.status === "active");
+  const activeSessions = dashboard.sessions.filter((session) => session.status === "active" && isVisibleAgentSession(session));
   const conflicts = [...transientConflicts, ...dashboard.conflicts];
   return (
     <>
@@ -785,7 +1118,7 @@ function WorkView({
               <h2 id="work-title">团队当前正在做什么</h2>
             </div>
             <button type="button" className="secondary-button" onClick={onClaim}>
-              <Plus aria-hidden="true" />诊断领取
+              <Plus aria-hidden="true" />手动领取
             </button>
           </div>
           {leases.length || activeSessions.length ? (
@@ -816,7 +1149,7 @@ function WorkView({
           ) : (
             <EmptyState icon={<Bot aria-hidden="true" />} title="团队还没有开始登记工作" detail="本地组件连接后，Agent 的任务会自动出现在这里。" />
           )}
-          <p className="automation-caption"><Bot aria-hidden="true" />正常情况下由本地组件自动领取、续期和释放。手动入口只用于诊断或离线补登记。</p>
+          <p className="automation-caption"><Bot aria-hidden="true" />日常范围由本地组件自动维护；需要提前声明工作范围或创建独占保护时，可使用“手动领取”。</p>
         </section>
         <aside className="right-column">
           <SystemImpact dashboard={dashboard} />
@@ -928,7 +1261,7 @@ function CopyValue({ label, value, secret = false }: { label: string; value: str
 }
 
 function ConnectionView({ dashboard, session, online }: { dashboard: Dashboard; session: Session; online: boolean }) {
-  const currentSessions = dashboard.sessions.filter((item) => item.memberId === dashboard.currentMember.id && item.status === "active");
+  const currentSessions = dashboard.sessions.filter((item) => item.memberId === dashboard.currentMember.id && item.status === "active" && isVisibleAgentSession(item));
   const latestScan = dashboard.localScans
     .filter((item) => item.memberId === dashboard.currentMember.id)
     .sort((left, right) => (right.scannedAt ?? "").localeCompare(left.scannedAt ?? ""))[0];
@@ -1028,13 +1361,23 @@ function ConnectionView({ dashboard, session, online }: { dashboard: Dashboard; 
 }
 
 function ClaimLeaseModal({
+  settings,
   onClose,
   onSubmit,
 }: {
+  settings: RoomSettings;
   onClose: () => void;
-  onSubmit: (input: { title: string; objective: string; branch: string; baseCommit: string; paths: string[]; ttlMinutes: number }) => Promise<void>;
+  onSubmit: (input: CreateLeaseInput) => Promise<void>;
 }) {
-  const [values, setValues] = useState({ title: "", objective: "", branch: "", baseCommit: "", paths: "", ttlMinutes: 120 });
+  const [values, setValues] = useState({
+    title: "",
+    objective: "",
+    branch: "",
+    baseCommit: "",
+    paths: "",
+    ttlMinutes: Math.min(60, settings.maximumExclusiveLeaseMinutes),
+    kind: "standard" as "standard" | "exclusive",
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const submit = async (event: FormEvent) => {
@@ -1053,8 +1396,12 @@ function ClaimLeaseModal({
     }
   };
   return (
-    <Modal title="手动领取工作范围" detail="用于本地组件尚未连接时的诊断与兜底。" onClose={onClose}>
+    <Modal title="手动领取工作范围" detail="普通范围跟随房间策略；独占范围始终需要租客批准后才能交接。" onClose={onClose}>
       <form className="modal-form" onSubmit={submit}>
+        <fieldset className="choice-field"><legend>领取模式</legend><div className="segmented-control">
+          <button type="button" className={values.kind === "standard" ? "active" : ""} onClick={() => setValues({ ...values, kind: "standard" })}>普通工作范围</button>
+          <button type="button" className={values.kind === "exclusive" ? "active" : ""} onClick={() => setValues({ ...values, kind: "exclusive" })}><KeyRound aria-hidden="true" />独占保护范围</button>
+        </div></fieldset>
         <Field label="工作名称"><input required maxLength={120} placeholder="例如：调整背包与装备切换" value={values.title} onChange={(event) => setValues({ ...values, title: event.target.value })} /></Field>
         <Field label="目标"><textarea rows={3} maxLength={1000} placeholder="简要说明准备完成什么" value={values.objective} onChange={(event) => setValues({ ...values, objective: event.target.value })} /></Field>
         <div className="field-grid two-columns">
@@ -1062,10 +1409,54 @@ function ClaimLeaseModal({
           <Field label="基准提交"><input placeholder="提交哈希，可留空" value={values.baseCommit} onChange={(event) => setValues({ ...values, baseCommit: event.target.value })} /></Field>
         </div>
         <Field label="预计修改范围" hint="每行一个相对项目根目录的文件或目录。"><textarea className="path-input" required rows={5} placeholder={"Assets/Vanguard/Inventory\nAssets/Vanguard/Equipment/Weapon.cs"} value={values.paths} onChange={(event) => setValues({ ...values, paths: event.target.value })} /></Field>
-        <fieldset className="choice-field"><legend>保护时长</legend><div className="segmented-control compact">{[60, 120, 240].map((minutes) => <button type="button" key={minutes} className={values.ttlMinutes === minutes ? "active" : ""} onClick={() => setValues({ ...values, ttlMinutes: minutes })}>{minutes / 60} 小时</button>)}</div></fieldset>
+        {values.kind === "exclusive" ? (
+          <Field label="固定保护时长" hint={`5 至 ${settings.maximumExclusiveLeaseMinutes} 分钟；不会随 Agent 心跳自动延长。`}><span className="number-setting"><input type="number" min={5} max={settings.maximumExclusiveLeaseMinutes} step={5} required value={values.ttlMinutes} onChange={(event) => setValues({ ...values, ttlMinutes: Number(event.target.value) })} />分钟</span></Field>
+        ) : (
+          <div className="inline-note"><Clock3 aria-hidden="true" /><span>普通工作范围使用房间设定的 {settings.automaticLeaseTtlMinutes} 分钟租期，Agent 持续工作时自动续期。</span></div>
+        )}
         {error && <div className="form-error"><AlertTriangle aria-hidden="true" />{error}</div>}
-        <div className="modal-actions"><button type="button" className="text-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}检查并领取</button></div>
+        <div className="modal-actions"><button type="button" className="text-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : values.kind === "exclusive" ? <KeyRound aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}{values.kind === "exclusive" ? "申请独占" : "检查并领取"}</button></div>
       </form>
+    </Modal>
+  );
+}
+
+function ReleaseRequestModal({
+  request,
+  onClose,
+  onResolve,
+}: {
+  request: ReleaseRequest;
+  onClose: () => void;
+  onResolve: (decision: "approve" | "reject", reason?: string) => Promise<void>;
+}) {
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const decide = async (decision: "approve" | "reject") => {
+    setBusy(true);
+    setError("");
+    try {
+      await onResolve(decision, reason || undefined);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "申请处理失败，请重试。");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const approvalEffect = request.conflictingLeaseKind === "exclusive"
+    ? "批准后，你的整份手动独占租约会结束，申请人的实际请求范围将立即交给对方。"
+    : "批准后，只会把发生冲突的路径交给申请人；你租约中的其他路径继续保留。";
+  return (
+    <Modal title="有人申请交接保护范围" detail={`${request.requesterName} 需要修改你正在保护的范围。`} onClose={onClose}>
+      <div className="modal-form release-request-form">
+        <div className="release-request-summary"><Bell aria-hidden="true" /><div><strong>{request.requestTitle}</strong><p>{request.requestObjective || request.reason}</p></div></div>
+        <div><span className="field-label">申请修改</span><div className="scope-list">{request.requestedPaths.map((path) => <span key={path}>{path}</span>)}</div></div>
+        <div className="inline-note"><ShieldCheck aria-hidden="true" /><span>{approvalEffect}</span></div>
+        <Field label="给申请人的说明" hint="拒绝时建议说明原因；批准时可留空。"><textarea rows={3} maxLength={2000} value={reason} onChange={(event) => setReason(event.target.value)} /></Field>
+        {error && <div className="form-error"><AlertTriangle aria-hidden="true" />{error}</div>}
+        <div className="modal-actions"><button type="button" className="secondary-button" disabled={busy} onClick={() => void decide("reject")}><X aria-hidden="true" />拒绝</button><button type="button" className="primary-button" disabled={busy} onClick={() => void decide("approve")}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <Handshake aria-hidden="true" />}批准并交接</button></div>
+      </div>
     </Modal>
   );
 }
@@ -1179,11 +1570,16 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
   const [online, setOnline] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [claimOpen, setClaimOpen] = useState(false);
-  const [closingLease, setClosingLease] = useState<Lease | null>(null);
-  const [recordKind, setRecordKind] = useState<Exclude<RecordKind, "context"> | null>(null);
+  const [activeModal, setActiveModal] = useState<DashboardModal | null>(null);
   const [busyLeaseId, setBusyLeaseId] = useState<string>();
   const [transientConflicts, setTransientConflicts] = useState<Conflict[]>([]);
+  const [dismissedReleaseRequestIds, setDismissedReleaseRequestIds] = useState<Set<string>>(() => new Set());
+  const closingLease = activeModal?.type === "close" ? activeModal.lease : null;
+  const releaseRequestId = activeModal?.type === "release" ? activeModal.requestId : undefined;
+
+  const openModal = (modal: DashboardModal) => {
+    setActiveModal((current) => current ?? modal);
+  };
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setRefreshing(true);
@@ -1226,11 +1622,30 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
     return () => window.clearTimeout(timeout);
   }, [notice]);
 
-  const handleClaim = async (input: { title: string; objective: string; branch: string; baseCommit: string; paths: string[]; ttlMinutes: number }) => {
+  useEffect(() => {
+    if (!dashboard) return;
+    const requestId = nextPendingReleaseRequestId(
+      activeModal,
+      dashboard.releaseRequests,
+      dashboard.currentMember.id,
+      dismissedReleaseRequestIds,
+    );
+    if (requestId) setActiveModal((current) => current ?? { type: "release", requestId });
+  }, [activeModal, dashboard, dismissedReleaseRequestIds]);
+
+  useEffect(() => {
+    if (!dashboard || activeModal?.type !== "release") return;
+    const stillPending = dashboard.releaseRequests.some((request) =>
+      request.id === activeModal.requestId && request.status === "pending"
+    );
+    if (!stillPending) setActiveModal(null);
+  }, [activeModal, dashboard]);
+
+  const handleClaim = async (input: CreateLeaseInput) => {
     const result = await createLease(session, input);
     setTransientConflicts(result.conflicts);
     if (!result.acquired || result.decision === "deny") {
-      setNotice({ tone: "danger", message: "范围已被占用，工作没有被登记。冲突详情已显示在当前页面。" });
+      setNotice({ tone: "danger", message: result.releaseRequests.length ? "范围已被占用，释放申请已经发送给当前持有人。" : "范围已被占用，工作没有被登记。冲突详情已显示在当前页面。" });
     } else {
       setNotice({ tone: result.decision === "warn" ? "warning" : "success", message: result.decision === "warn" ? "范围已登记，同时发现需要关注的重叠。" : "工作范围已登记并开始保护。" });
     }
@@ -1256,7 +1671,7 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
     try {
       await closeLease(session, closingLease.id, input);
       setNotice({ tone: "success", message: "工作已完成，保护范围已释放。" });
-      setClosingLease(null);
+      setActiveModal(null);
       await refresh(true);
     } finally {
       setBusyLeaseId(undefined);
@@ -1269,6 +1684,16 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
     await refresh(true);
   };
 
+  const handleReleaseRequest = async (requestId: string, decision: "approve" | "reject", reason?: string) => {
+    await resolveReleaseRequest(session, requestId, decision, reason);
+    setActiveModal(null);
+    setNotice({
+      tone: decision === "approve" ? "success" : "warning",
+      message: decision === "approve" ? "保护范围已安全交接给申请人。" : "申请已拒绝，原保护范围继续有效。",
+    });
+    await refresh(true);
+  };
+
   if (loading && !dashboard) {
     return <main className="loading-screen"><div className="brand-mark large"><Network /></div><LoaderCircle className="spin" /><strong>正在同步团队现场</strong><span>正在获取工作范围、决定与验证状态</span></main>;
   }
@@ -1276,6 +1701,13 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
   if (!dashboard) {
     return <main className="fatal-screen"><AlertTriangle aria-hidden="true" /><h1>暂时无法进入房间</h1><p>{error || "房主服务可能尚未启动。"}</p><div><button type="button" className="primary-button" onClick={() => void refresh()}><RefreshCw aria-hidden="true" />重新连接</button><button type="button" className="secondary-button" onClick={onLeave}><LogOut aria-hidden="true" />返回登录</button></div></main>;
   }
+
+  const ownedReleaseRequests = dashboard.releaseRequests.filter((request) => request.status === "pending" && request.holderMemberId === dashboard.currentMember.id);
+  const activeReleaseRequest = dashboard.releaseRequests.find((request) => request.id === releaseRequestId && request.status === "pending");
+  const dismissReleaseRequest = () => {
+    if (releaseRequestId) setDismissedReleaseRequestIds((current) => new Set(current).add(releaseRequestId));
+    setActiveModal(null);
+  };
 
   return (
     <div className="app-shell">
@@ -1299,17 +1731,20 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
       <div className="app-body">
         <AppNav view={view} onChange={setView} open={navOpen} onClose={() => setNavOpen(false)} />
         <main className="workspace">
+          {ownedReleaseRequests.length > 0 && <div className="release-request-banner" role="status"><Bell aria-hidden="true" /><div><strong>{ownedReleaseRequests.length} 个范围交接申请等待你处理</strong><span>{ownedReleaseRequests[0].requesterName} 需要修改你正在保护的路径。</span></div><button type="button" className="primary-button" onClick={() => openModal({ type: "release", requestId: ownedReleaseRequests[0].id })}>查看申请</button></div>}
           <StatusSummary dashboard={dashboard} online={online} conflicts={[...transientConflicts, ...dashboard.conflicts]} />
+          <DesktopUpdateControl onNotice={(message, tone = "success") => setNotice({ message, tone })} />
           {error && <div className="inline-alert"><AlertTriangle aria-hidden="true" />{error}</div>}
-          {view === "work" && <WorkView dashboard={dashboard} busyLeaseId={busyLeaseId} transientConflicts={transientConflicts} onClaim={() => setClaimOpen(true)} onRenew={handleRenew} onClose={setClosingLease} />}
-          {view === "records" && <RecordsView dashboard={dashboard} onAdd={setRecordKind} />}
-          {view === "management" && <><ManagementView dashboard={dashboard} session={session} onRefresh={() => refresh(true)} onNotice={(message, tone = "success") => setNotice({ message, tone })} />{dashboard.currentMember.role === "host" && <UpdateControl session={session} onNotice={(message, tone = "success") => setNotice({ message, tone })} />}</>}
+          {view === "work" && <WorkView dashboard={dashboard} busyLeaseId={busyLeaseId} transientConflicts={transientConflicts} onClaim={() => openModal({ type: "claim" })} onRenew={handleRenew} onClose={(lease) => openModal({ type: "close", lease })} />}
+          {view === "records" && <RecordsView dashboard={dashboard} onAdd={(recordKind) => openModal({ type: "record", recordKind })} />}
+          {view === "management" && <ManagementView dashboard={dashboard} session={session} onRefresh={() => refresh(true)} onNotice={(message, tone = "success") => setNotice({ message, tone })} />}
           {view === "connection" && <ConnectionView dashboard={dashboard} session={session} online={online} />}
         </main>
       </div>
-      {claimOpen && <ClaimLeaseModal onClose={() => setClaimOpen(false)} onSubmit={handleClaim} />}
-      {closingLease && <CloseLeaseModal lease={closingLease} onClose={() => setClosingLease(null)} onSubmit={handleClose} />}
-      {recordKind && <RecordModal kind={recordKind} leases={dashboard.leases} members={dashboard.members} onClose={() => setRecordKind(null)} onSubmit={handleRecord} />}
+      {activeModal?.type === "claim" && <ClaimLeaseModal settings={dashboard.settings} onClose={() => setActiveModal(null)} onSubmit={handleClaim} />}
+      {activeModal?.type === "release" && activeReleaseRequest && <ReleaseRequestModal request={activeReleaseRequest} onClose={dismissReleaseRequest} onResolve={(decision, reason) => handleReleaseRequest(activeReleaseRequest.id, decision, reason)} />}
+      {activeModal?.type === "close" && <CloseLeaseModal lease={activeModal.lease} onClose={() => setActiveModal(null)} onSubmit={handleClose} />}
+      {activeModal?.type === "record" && <RecordModal kind={activeModal.recordKind} leases={dashboard.leases} members={dashboard.members} onClose={() => setActiveModal(null)} onSubmit={handleRecord} />}
       {notice && <div className={`toast ${notice.tone}`} role="status">{notice.tone === "success" ? <CheckCircle2 aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}<span>{notice.message}</span><IconButton label="关闭提示" onClick={() => setNotice(null)}><X aria-hidden="true" /></IconButton></div>}
     </div>
   );

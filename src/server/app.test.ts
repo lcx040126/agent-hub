@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +19,21 @@ afterEach(() => {
 });
 
 describe("Agent Hub REST API", () => {
+  it("reports matching service compatibility only after the migrated database is readable", async () => {
+    const { app } = testApp();
+    const health = await request(app).get("/api/health");
+
+    expect(health.status).toBe(200);
+    expect(health.body).toMatchObject({
+      status: "ok",
+      service: "agent-hub",
+      version: "0.2.0",
+      protocolVersion: 1,
+      schemaVersion: 3,
+      database: { status: "ok", schemaVersion: 3 },
+    });
+  });
+
   it("supports owner transfer, administrator management, room settings, and removal", async () => {
     const { app } = testApp();
     const owner = await createRoom(app);
@@ -25,7 +41,9 @@ describe("Agent Hub REST API", () => {
     const carol = await joinRoom(app, owner.body.inviteCode, "Carol");
     const granted = await auth(request(app).post(`/api/room/members/${bob.body.member.id}/role`).send({ isAdmin: true }), owner.body.token);
     expect(granted.status).toBe(200);
-    const settings = await auth(request(app).post("/api/room/settings").send({ autoLockAfterAutoClaim: false }), bob.body.token);
+    const forbiddenSettings = await auth(request(app).post("/api/room/settings").send({ blockingProtectionEnabled: false }), bob.body.token);
+    expect(forbiddenSettings.status).toBe(403);
+    const settings = await auth(request(app).post("/api/room/settings").send({ blockingProtectionEnabled: false }), owner.body.token);
     expect(settings.status).toBe(200);
     const transferred = await auth(request(app).post("/api/room/transfer").send({ targetMemberId: bob.body.member.id }), owner.body.token);
     expect(transferred.status).toBe(200);
@@ -37,16 +55,17 @@ describe("Agent Hub REST API", () => {
     expect(kicked.status).toBe(401);
   });
 
-  it("locks automatic overlapping ranges when the room setting is enabled", async () => {
+  it("downgrades critical automatic overlap when blocking protection is disabled", async () => {
     const { app } = testApp();
     const owner = await createRoom(app);
     const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
-    await createLease(app, owner.body.token, { title: "Source work", paths: ["src/shared.ts"] });
-    const denied = await auth(request(app).post("/api/leases").send({ title: "Automatic work", paths: ["src/shared.ts"], mode: "write", branch: "main", autoClaim: true }), bob.body.token);
+    await createLease(app, owner.body.token, { title: "Scene work", paths: ["Assets/Scenes/Raid.unity"] });
+    const denied = await auth(request(app).post("/api/leases").send({ title: "Automatic work", paths: ["Assets/Scenes/Raid.unity"], mode: "write", branch: "main", autoClaim: true }), bob.body.token);
     expect(denied.body).toMatchObject({ acquired: false, decision: "deny" });
-    await auth(request(app).post("/api/room/settings").send({ autoLockAfterAutoClaim: false }), owner.body.token);
-    const warning = await auth(request(app).post("/api/leases").send({ title: "Automatic work", paths: ["src/shared.ts"], mode: "write", branch: "main", autoClaim: true }), bob.body.token);
-    expect(warning.body).toMatchObject({ acquired: false, decision: "warn" });
+    expect(denied.body.releaseRequests).toHaveLength(1);
+    await auth(request(app).post("/api/room/settings").send({ blockingProtectionEnabled: false }), owner.body.token);
+    const warning = await auth(request(app).post("/api/leases").send({ title: "Automatic work", paths: ["Assets/Scenes/Raid.unity"], mode: "write", branch: "main", autoClaim: true }), bob.body.token);
+    expect(warning.body).toMatchObject({ acquired: true, decision: "warn", lease: { kind: "automatic" } });
   });
 
   it("freezes a session and cancels its leases when the branch changes", async () => {
@@ -96,7 +115,7 @@ describe("Agent Hub REST API", () => {
     expect(dashboard.body.server.mcpUrl).toMatch(/\/mcp$/);
   });
 
-  it("requires an override for ordinary source overlap and denies exclusive project resources", async () => {
+  it("acquires ordinary and Luban warning overlaps while denying critical project resources", async () => {
     const { app } = testApp();
     const owner = await createRoom(app);
     const joined = await joinRoom(app, owner.body.inviteCode, "Bob");
@@ -112,21 +131,13 @@ describe("Agent Hub REST API", () => {
       title: "Equipment integration",
       paths: ["Assets/Vanguard/Inventory"],
     });
-    expect(warning.status).toBe(200);
-    expect(warning.body).toMatchObject({ acquired: false, decision: "warn" });
+    expect(warning.status).toBe(201);
+    expect(warning.body).toMatchObject({ acquired: true, decision: "warn" });
     expect(warning.body.conflicts[0]).toMatchObject({
       severity: "warning",
       requestedPath: "Assets/Vanguard/Inventory",
       memberName: "Alice",
     });
-
-    const overridden = await createLease(app, joined.body.token, {
-      title: "Equipment integration",
-      paths: ["Assets/Vanguard/Inventory"],
-      overrideReason: "The changes are limited to a new adapter and both agents will run integration tests.",
-    });
-    expect(overridden.status).toBe(201);
-    expect(overridden.body).toMatchObject({ acquired: true, decision: "warn" });
 
     const sceneLease = await createLease(app, owner.body.token, {
       title: "Raid scene setup",
@@ -153,13 +164,14 @@ describe("Agent Hub REST API", () => {
       paths: ["Config/Luban"],
       overrideReason: "Coordinate after editing",
     });
-    expect(deniedConfig.body.decision).toBe("deny");
+    expect(deniedConfig.body).toMatchObject({ acquired: true, decision: "warn" });
   });
 
   it("renews and expires leases, then records validation, risks, and handoff on close", async () => {
     let currentTime = Date.parse("2026-08-25T10:00:00.000Z");
     const { app } = testApp(() => new Date(currentTime));
     const owner = await createRoom(app);
+    await auth(request(app).post("/api/room/settings").send({ automaticLeaseTtlMinutes: 5 }), owner.body.token);
     const lease = await createLease(app, owner.body.token, {
       title: "Weapon durability",
       paths: ["Assets/Vanguard/Combat/WeaponDurability.cs"],
@@ -210,10 +222,394 @@ describe("Agent Hub REST API", () => {
       ttlMinutes: 1,
     });
     expect(expiring.body.acquired).toBe(true);
-    currentTime += 61_000;
+    currentTime += 301_000;
     dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
     expect(dashboard.body.leases).toHaveLength(0);
     expect(dashboard.body.activity.some((item: { type: string }) => item.type === "lease.expired")).toBe(true);
+  });
+
+  it("refreshes the real expiry when a non-exclusive lease is reused", async () => {
+    let currentTime = Date.parse("2026-08-25T10:00:00.000Z");
+    const { app } = testApp(() => new Date(currentTime));
+    const owner = await createRoom(app);
+    await auth(request(app).post("/api/room/settings").send({ automaticLeaseTtlMinutes: 5 }), owner.body.token);
+    const session = await auth(request(app).post("/api/sessions").send({ task: "Reuse lease" }), owner.body.token);
+    const claim = () => auth(request(app).post("/api/leases").send({
+      sessionId: session.body.session.id,
+      title: "Reusable automatic scope",
+      autoClaim: true,
+      paths: ["src/reused.ts"],
+    }), owner.body.token);
+    const first = await claim();
+    expect(first.body.lease.expiresAt).toBe("2026-08-25T10:05:00.000Z");
+
+    currentTime += 4 * 60_000;
+    const reused = await claim();
+    expect(reused.body).toMatchObject({ acquired: true, lease: { id: first.body.lease.id } });
+    expect(reused.body.lease.expiresAt).toBe("2026-08-25T10:09:00.000Z");
+
+    currentTime += 2 * 60_000;
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).toContain(first.body.lease.id);
+  });
+
+  it("deduplicates release requests and atomically transfers only conflicting standard paths", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    await auth(request(app).post("/api/room/settings").send({
+      riskRules: [{ kind: "extension", selector: ".cs", level: "blocking" }],
+    }), owner.body.token);
+    const holder = await auth(request(app).post("/api/leases").send({
+      title: "Two independent paths",
+      kind: "standard",
+      paths: ["src/critical.cs", "src/unrelated.cs"],
+    }), owner.body.token);
+
+    const firstBlocked = await auth(request(app).post("/api/leases").send({
+      title: "Critical change",
+      autoClaim: true,
+      paths: ["src/critical.cs"],
+    }), bob.body.token);
+    const repeated = await auth(request(app).post("/api/leases").send({
+      title: "Critical change",
+      autoClaim: true,
+      paths: ["src/critical.cs"],
+    }), bob.body.token);
+    expect(firstBlocked.body).toMatchObject({ acquired: false, decision: "deny" });
+    expect(repeated.body.releaseRequests[0].id).toBe(firstBlocked.body.releaseRequests[0].id);
+    expect(repeated.body.releaseRequests[0].occurrenceCount).toBe(2);
+
+    const forbidden = await auth(request(app)
+      .post(`/api/release-requests/${firstBlocked.body.releaseRequests[0].id}/resolve`)
+      .send({ decision: "approve" }), bob.body.token);
+    expect(forbidden.status).toBe(403);
+    const approved = await auth(request(app)
+      .post(`/api/release-requests/${firstBlocked.body.releaseRequests[0].id}/resolve`)
+      .send({ decision: "approve" }), owner.body.token);
+    expect(approved.body.releaseRequest).toMatchObject({
+      status: "approved",
+      transferredLeaseId: expect.any(String),
+    });
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    const original = dashboard.body.leases.find((lease: { id: string }) => lease.id === holder.body.lease.id);
+    expect(original.paths).toEqual(["src/unrelated.cs"]);
+    const transferred = dashboard.body.leases.find(
+      (lease: { id: string }) => lease.id === approved.body.releaseRequest.transferredLeaseId,
+    );
+    expect(transferred).toMatchObject({ memberName: "Bob", kind: "automatic", paths: ["src/critical.cs"] });
+    const retried = await auth(request(app).post("/api/leases").send({
+      title: "Critical change",
+      autoClaim: true,
+      paths: ["src/critical.cs"],
+    }), bob.body.token);
+    expect(retried.body).toMatchObject({
+      acquired: true,
+      lease: { id: approved.body.releaseRequest.transferredLeaseId },
+    });
+  });
+
+  it("keeps a broad holder scope while carving out an approved child path for the requester", async () => {
+    const { app, database } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    const carol = await joinRoom(app, owner.body.inviteCode, "Carol");
+    await auth(request(app).post("/api/room/settings").send({
+      riskRules: [{ kind: "extension", selector: ".ts", level: "blocking" }],
+    }), owner.body.token);
+    const bobSession = await auth(request(app).post("/api/sessions").send({ task: "Edit child path" }), bob.body.token);
+    const ownerSession = await auth(request(app).post("/api/sessions").send({ task: "Continue broad work" }), owner.body.token);
+    const holder = await auth(request(app).post("/api/leases").send({
+      title: "Broad source work",
+      kind: "standard",
+      paths: ["src"],
+    }), owner.body.token);
+    const blocked = await auth(request(app).post("/api/leases").send({
+      sessionId: bobSession.body.session.id,
+      title: "Precise source change",
+      autoClaim: true,
+      paths: ["src/a.ts"],
+    }), bob.body.token);
+    expect(blocked.body).toMatchObject({ acquired: false, decision: "deny" });
+    const carolPending = await auth(request(app).post("/api/leases").send({
+      title: "Concurrent precise source change",
+      autoClaim: true,
+      paths: ["src/a.ts"],
+    }), carol.body.token);
+    expect(carolPending.body).toMatchObject({ acquired: false, decision: "deny" });
+
+    const approved = await auth(request(app)
+      .post(`/api/release-requests/${blocked.body.releaseRequests[0].id}/resolve`)
+      .send({ decision: "approve" }), owner.body.token);
+    const transferredLeaseId = approved.body.releaseRequest.transferredLeaseId as string;
+    const afterTransfer = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(afterTransfer.body.leases.find(
+      (lease: { id: string }) => lease.id === holder.body.lease.id,
+    )).toMatchObject({ paths: ["src"] });
+    expect(afterTransfer.body.leases.find(
+      (lease: { id: string }) => lease.id === transferredLeaseId,
+    )).toMatchObject({ memberName: "Bob", paths: ["src/a.ts"] });
+    const resolvedConflicts = database.connection.prepare(`
+      SELECT COUNT(*) AS count FROM conflicts
+      WHERE requester_member_id = ? AND existing_lease_id = ?
+        AND requested_path = ? AND existing_path = ?
+    `).get(bob.body.member.id, holder.body.lease.id, "src/a.ts", "src") as { count: number };
+    expect(resolvedConflicts.count).toBe(0);
+
+    const requesterRetry = await auth(request(app).post("/api/leases").send({
+      sessionId: bobSession.body.session.id,
+      title: "Precise source change",
+      autoClaim: true,
+      paths: ["src/a.ts"],
+    }), bob.body.token);
+    expect(requesterRetry.body).toMatchObject({ acquired: true, lease: { id: transferredLeaseId } });
+    const staleApproval = await auth(request(app)
+      .post(`/api/release-requests/${carolPending.body.releaseRequests[0].id}/resolve`)
+      .send({ decision: "approve" }), owner.body.token);
+    expect(staleApproval.status).toBe(409);
+    expect(staleApproval.body.error).toBe("release_request_conflict_changed");
+    const pendingAfterRace = await auth(request(app).get("/api/release-requests"), owner.body.token);
+    expect(pendingAfterRace.body.releaseRequests).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: carolPending.body.releaseRequests[0].id, status: "pending" }),
+    ]));
+    const siblingRetry = await auth(request(app).post("/api/leases").send({
+      sessionId: bobSession.body.session.id,
+      title: "Attempt sibling source path",
+      autoClaim: true,
+      paths: ["src/b.ts"],
+    }), bob.body.token);
+    expect(siblingRetry.body).toMatchObject({ acquired: false, decision: "deny" });
+
+    const formerHolder = await auth(request(app).post("/api/leases").send({
+      sessionId: ownerSession.body.session.id,
+      title: "Attempt transferred child",
+      autoClaim: true,
+      paths: ["src/a.ts"],
+    }), owner.body.token);
+    const thirdParty = await auth(request(app).post("/api/leases").send({
+      title: "Third-party child edit",
+      autoClaim: true,
+      paths: ["src/a.ts"],
+    }), carol.body.token);
+    expect(formerHolder.body).toMatchObject({ acquired: false, decision: "deny" });
+    expect(thirdParty.body).toMatchObject({ acquired: false, decision: "deny" });
+    expect(formerHolder.body.conflicts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ leaseId: transferredLeaseId, decision: "deny" }),
+    ]));
+  });
+
+  it("shares and heartbeat-renews a member's sessionless manual standard lease", async () => {
+    let currentTime = Date.parse("2026-08-25T10:00:00.000Z");
+    const { app } = testApp(() => new Date(currentTime));
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    await auth(request(app).post("/api/room/settings").send({ automaticLeaseTtlMinutes: 5 }), owner.body.token);
+    const manual = await auth(request(app).post("/api/leases").send({
+      title: "Shared manual scene range",
+      kind: "standard",
+      paths: ["Assets/Scenes/Main.unity"],
+    }), owner.body.token);
+    const session = await auth(request(app).post("/api/sessions").send({ task: "Scene Agent work" }), owner.body.token);
+    const agentLease = await auth(request(app).post("/api/leases").send({
+      sessionId: session.body.session.id,
+      title: "Agent scene work",
+      autoClaim: true,
+      paths: ["Assets/Scenes/Main.unity"],
+    }), owner.body.token);
+    expect(agentLease.body).toMatchObject({ acquired: true, decision: "warn" });
+
+    const otherMember = await auth(request(app).post("/api/leases").send({
+      title: "Other member scene work",
+      autoClaim: true,
+      paths: ["Assets/Scenes/Main.unity"],
+    }), bob.body.token);
+    expect(otherMember.body).toMatchObject({ acquired: false, decision: "deny" });
+
+    currentTime += 4 * 60_000;
+    const heartbeat = await auth(request(app)
+      .post(`/api/sessions/${session.body.session.id}/heartbeat`)
+      .send({}), owner.body.token);
+    const renewedIds = heartbeat.body.renewedLeases.map((lease: { id: string }) => lease.id);
+    expect(renewedIds).toContain(manual.body.lease.id);
+    expect(renewedIds).toContain(agentLease.body.lease.id);
+    currentTime += 2 * 60_000;
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).toEqual(
+      expect.arrayContaining([manual.body.lease.id, agentLease.body.lease.id]),
+    );
+  });
+
+  it("transactionally cancels a removed member's leases and pending release requests", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    const carol = await joinRoom(app, owner.body.inviteCode, "Carol");
+    await auth(request(app).post("/api/room/settings").send({
+      riskRules: [{ kind: "extension", selector: ".ts", level: "blocking" }],
+    }), owner.body.token);
+    const ownerLease = await auth(request(app).post("/api/leases").send({
+      title: "Owner scope",
+      kind: "standard",
+      paths: ["src/owner.ts"],
+    }), owner.body.token);
+    const bobLease = await auth(request(app).post("/api/leases").send({
+      title: "Bob scope",
+      kind: "standard",
+      paths: ["src/bob.ts"],
+    }), bob.body.token);
+    const bobAsRequester = await auth(request(app).post("/api/leases").send({
+      title: "Bob requests owner scope",
+      autoClaim: true,
+      paths: ["src/owner.ts"],
+    }), bob.body.token);
+    const bobAsHolder = await auth(request(app).post("/api/leases").send({
+      title: "Carol requests Bob scope",
+      autoClaim: true,
+      paths: ["src/bob.ts"],
+    }), carol.body.token);
+    const pendingIds = [
+      bobAsRequester.body.releaseRequests[0].id,
+      bobAsHolder.body.releaseRequests[0].id,
+    ];
+
+    const removed = await auth(request(app)
+      .post(`/api/room/members/${bob.body.member.id}/remove`)
+      .send({}), owner.body.token);
+    expect(removed.status).toBe(204);
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).toContain(ownerLease.body.lease.id);
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).not.toContain(bobLease.body.lease.id);
+    const requests = await auth(request(app).get("/api/release-requests?status=all"), owner.body.token);
+    expect(requests.body.releaseRequests.filter(
+      (releaseRequest: { id: string }) => pendingIds.includes(releaseRequest.id),
+    )).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: pendingIds[0], status: "cancelled" }),
+      expect.objectContaining({ id: pendingIds[1], status: "cancelled" }),
+    ]));
+    expect(dashboard.body.activity).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "member.removed",
+        metadata: expect.objectContaining({
+          cancelledLeaseCount: 1,
+          cancelledReleaseRequestCount: 2,
+        }),
+      }),
+    ]));
+  });
+
+  it("includes current room settings and pending release requests in the room snapshot", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    await auth(request(app).post("/api/room/settings").send({
+      automaticLeaseTtlMinutes: 15,
+      riskRules: [{ kind: "extension", selector: ".ts", level: "blocking" }],
+    }), owner.body.token);
+    await auth(request(app).post("/api/leases").send({
+      title: "Snapshot holder",
+      kind: "standard",
+      paths: ["src/snapshot.ts"],
+    }), owner.body.token);
+    const blocked = await auth(request(app).post("/api/leases").send({
+      title: "Snapshot requester",
+      autoClaim: true,
+      paths: ["src/snapshot.ts"],
+    }), bob.body.token);
+
+    const snapshot = await auth(request(app).get("/api/snapshot"), owner.body.token);
+    expect(snapshot.status).toBe(200);
+    expect(snapshot.body.settings).toMatchObject({
+      automaticLeaseTtlMinutes: 15,
+      blockingProtectionEnabled: true,
+      riskPolicyVersion: 2,
+    });
+    expect(snapshot.body.settings.riskRules).toEqual([
+      expect.objectContaining({ kind: "extension", selector: ".ts", level: "blocking" }),
+    ]);
+    expect(snapshot.body.releaseRequests).toEqual([
+      expect.objectContaining({ id: blocked.body.releaseRequests[0].id, status: "pending" }),
+    ]);
+  });
+
+  it("keeps exclusive leases blocking when protection is off and never heartbeat-renews them", async () => {
+    let currentTime = Date.parse("2026-08-25T10:00:00.000Z");
+    const { app } = testApp(() => new Date(currentTime));
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    await auth(request(app).post("/api/room/settings").send({
+      blockingProtectionEnabled: false,
+      automaticLeaseTtlMinutes: 5,
+      maximumExclusiveLeaseMinutes: 60,
+    }), owner.body.token);
+    const session = await auth(request(app).post("/api/sessions").send({
+      clientVersion: "0.2.0",
+      protocolVersion: 1,
+      schemaVersion: 3,
+    }), owner.body.token);
+    const automatic = await auth(request(app).post("/api/leases").send({
+      sessionId: session.body.session.id,
+      title: "Automatic source work",
+      autoClaim: true,
+      paths: ["src/automatic.ts"],
+    }), owner.body.token);
+    const exclusive = await auth(request(app).post("/api/leases").send({
+      sessionId: session.body.session.id,
+      title: "Manual exclusive data",
+      kind: "exclusive",
+      ttlMinutes: 5,
+      paths: ["Config/Luban"],
+    }), owner.body.token);
+    const blocked = await auth(request(app).post("/api/leases").send({
+      title: "Luban edit",
+      autoClaim: true,
+      paths: ["Config/Luban/Weapon.xlsx"],
+    }), bob.body.token);
+    expect(blocked.body).toMatchObject({ acquired: false, decision: "deny" });
+    expect(blocked.body.conflicts[0].existingLeaseKind).toBe("exclusive");
+
+    currentTime += 4 * 60_000;
+    const heartbeat = await auth(request(app)
+      .post(`/api/sessions/${session.body.session.id}/heartbeat`)
+      .send({ clientVersion: "0.2.0", protocolVersion: 1, schemaVersion: 3 }), owner.body.token);
+    expect(heartbeat.body.renewedLeases.map((lease: { id: string }) => lease.id)).toContain(automatic.body.lease.id);
+    expect(heartbeat.body.renewedLeases.map((lease: { id: string }) => lease.id)).not.toContain(exclusive.body.lease.id);
+    currentTime += 2 * 60_000;
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).toContain(automatic.body.lease.id);
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).not.toContain(exclusive.body.lease.id);
+  });
+
+  it("ends an entire exclusive lease when its holder approves one precise path", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    await auth(request(app).post("/api/room/settings").send({ blockingProtectionEnabled: false }), owner.body.token);
+    const exclusive = await auth(request(app).post("/api/leases").send({
+      title: "Exclusive systems",
+      kind: "exclusive",
+      ttlMinutes: 60,
+      paths: ["Assets/SystemA", "Assets/SystemB"],
+    }), owner.body.token);
+    const blocked = await auth(request(app).post("/api/leases").send({
+      title: "System A edit",
+      autoClaim: true,
+      paths: ["Assets/SystemA/Feature.cs"],
+    }), bob.body.token);
+    const approved = await auth(request(app)
+      .post(`/api/release-requests/${blocked.body.releaseRequests[0].id}/resolve`)
+      .send({ decision: "approve" }), owner.body.token);
+    expect(approved.body.releaseRequest).toMatchObject({
+      status: "approved",
+      conflictingLeaseKind: "exclusive",
+      requestedPaths: ["Assets/SystemA/Feature.cs"],
+      transferredLeaseId: expect.any(String),
+    });
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).not.toContain(exclusive.body.lease.id);
+    expect(dashboard.body.leases.find(
+      (lease: { id: string }) => lease.id === approved.body.releaseRequest.transferredLeaseId,
+    )).toMatchObject({ memberName: "Bob", paths: ["Assets/SystemA/Feature.cs"] });
   });
 
   it("stores structured context, decisions, verification, handoffs, sessions, and local scan metadata", async () => {
@@ -307,6 +703,294 @@ describe("Agent Hub REST API", () => {
       token,
     );
     expect(closed.body.session.status).toBe("closed");
+  });
+
+  it("exposes feature revision history and requires explicit confirmation for exact historical impacts", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const token = owner.body.token;
+    const session = await auth(
+      request(app).post("/api/sessions").send({
+        clientName: "Codex",
+        branch: "develop",
+        baseCommit: "aaaa1111",
+        task: "Maintain inventory apply behavior",
+      }),
+      token,
+    );
+    const sessionId = session.body.session.id as string;
+    const lease = await auth(
+      request(app).post("/api/leases").send({
+        sessionId,
+        title: "Inventory apply",
+        paths: ["Assets/Inventory/Feature.cs"],
+        mode: "write",
+      }),
+      token,
+    );
+    expect(lease.body.acquired).toBe(true);
+
+    const featureVerification = await auth(
+      request(app).post("/api/verifications").send({
+        sessionId,
+        leaseId: lease.body.lease.id,
+        kind: "automated_test",
+        result: "passed",
+        summary: "Inventory regression tests passed.",
+      }),
+      token,
+    );
+    expect(featureVerification.status).toBe(201);
+
+    const submitted = await auth(
+      request(app).post("/api/features/revisions").send({
+        sessionId,
+        featureKey: "inventory.apply",
+        name: "Inventory apply",
+        systemId: "inventory",
+        objective: "Apply compatible items without changing unrelated slots.",
+        changeSummary: "Established the verified inventory apply contract.",
+        contractChanges: [{
+          operation: "add",
+          key: "inventory.apply.compatible",
+          behavior: "Applying a compatible item preserves every unrelated slot.",
+        }],
+        targets: [{
+          kind: "symbol",
+          role: "contract",
+          path: "Assets/Inventory/Feature.cs",
+          symbol: "InventoryFeature.Apply",
+        }],
+        finalCommit: "bbbb2222",
+        completed: true,
+        verifications: [{
+          testKey: "inventory-regression",
+          result: "passed",
+          summary: "Inventory regression tests passed.",
+        }],
+      }),
+      token,
+    );
+    expect(submitted.status).toBe(201);
+    expect(submitted.body.revision).toMatchObject({ revisionNumber: 1, status: "candidate" });
+    const revision = submitted.body.revision as { id: string; featureId: string };
+
+    const unrelatedEvidenceScan = await auth(
+      request(app).post(`/api/sessions/${sessionId}/scan`).send({
+        branch: "develop",
+        baseCommit: "aaaa1111",
+        changedPaths: ["Assets/Unrelated/Other.cs"],
+        metadata: {
+          source: "codex-hook",
+          event: "SessionEnd",
+          featureEvidence: {
+            version: 1,
+            branch: "develop",
+            baseCommit: "aaaa1111",
+            finalCommit: "bbbb2222",
+            committed: true,
+            committedPaths: ["Assets/Unrelated/Other.cs"],
+            uncommittedPaths: [],
+            changedPaths: ["Assets/Unrelated/Other.cs"],
+            commitHashes: ["bbbb2222"],
+            diffSha256: "0".repeat(64),
+          },
+        },
+      }),
+      token,
+    );
+    expect(unrelatedEvidenceScan.status).toBe(201);
+    const stillCandidate = await auth(
+      request(app).get(`/api/features/${revision.featureId}/history`),
+      token,
+    );
+    expect(stillCandidate.body.revisions[0]).toMatchObject({ id: revision.id, status: "candidate" });
+
+    const finalEvidenceScan = await auth(
+      request(app).post(`/api/sessions/${sessionId}/scan`).send({
+        branch: "develop",
+        baseCommit: "aaaa1111",
+        changedPaths: ["Assets/Inventory/Feature.cs"],
+        metadata: {
+          source: "codex-hook",
+          event: "SessionEnd",
+          featureEvidence: {
+            version: 2,
+            branch: "develop",
+            baseCommit: "aaaa1111",
+            finalCommit: "bbbb2222",
+            committed: true,
+            committedPathCount: 1,
+            uncommittedPathCount: 0,
+            changedPathCount: 1,
+            changedPathsSha256: createHash("sha256")
+              .update(JSON.stringify(["assets/inventory/feature.cs"]), "utf8")
+              .digest("hex"),
+            commitHashCount: 1,
+            commitHashesSha256: createHash("sha256")
+              .update(JSON.stringify(["bbbb2222"]), "utf8")
+              .digest("hex"),
+            finalCommitIncluded: true,
+            diffSha256: "a".repeat(64),
+          },
+        },
+      }),
+      token,
+    );
+    expect(finalEvidenceScan.status).toBe(201);
+
+    const promotedHistory = await auth(
+      request(app).get(`/api/features/${revision.featureId}/history`),
+      token,
+    );
+    expect(promotedHistory.body.revisions[0]).toMatchObject({ id: revision.id, status: "current" });
+
+    const partiallyAttested = await auth(
+      request(app).post("/api/features/revisions").send({
+        sessionId,
+        featureKey: "inventory.partial-evidence",
+        name: "Inventory partial evidence",
+        systemId: "inventory",
+        objective: "Do not promote a feature whose declared paths exceed its final Hook evidence.",
+        changeSummary: "Claims one attested and one unattested implementation path.",
+        contractChanges: [{
+          operation: "add",
+          key: "inventory.partial-evidence.coverage",
+          behavior: "Every declared implementation path must be covered by final evidence.",
+        }],
+        targets: [
+          { kind: "path", path: "Assets/Inventory/Feature.cs" },
+          { kind: "path", path: "Assets/Inventory/Unattested.cs" },
+        ],
+        finalCommit: "bbbb2222",
+        completed: true,
+        verifications: [{
+          testKey: "inventory-regression",
+          result: "passed",
+          summary: "Inventory regression tests passed.",
+        }],
+      }),
+      token,
+    );
+    expect(partiallyAttested.status).toBe(201);
+    expect(partiallyAttested.body.revision).toMatchObject({ status: "candidate" });
+
+    const queried = await auth(
+      request(app).post("/api/features/query").send({
+        sessionId,
+        symbols: ["InventoryFeature.Apply"],
+      }),
+      token,
+    );
+    expect(queried.body.cards).toEqual([
+      expect.objectContaining({ featureId: revision.featureId, revisionId: revision.id }),
+    ]);
+
+    const proposal = {
+      sessionId,
+      leaseId: lease.body.lease.id,
+      paths: ["Assets/Inventory/Feature.cs"],
+      proposedEdits: [{
+        path: "Assets/Inventory/Feature.cs",
+        precision: "symbol",
+        symbols: ["InventoryFeature.Apply"],
+        operation: "update",
+      }],
+    };
+    const blocked = await auth(request(app).post("/api/edits/check").send(proposal), token);
+    expect(blocked.body).toMatchObject({
+      allowed: false,
+      historicalImpacts: [expect.objectContaining({ confidence: "exact" })],
+      featureConfirmation: expect.objectContaining({ status: "pending" }),
+    });
+
+    const missingDecision = await auth(
+      request(app)
+        .post(`/api/feature-confirmations/${blocked.body.featureConfirmation.id}/resolve`)
+        .send({ sessionId }),
+      token,
+    );
+    expect(missingDecision.status).toBe(400);
+    expect(missingDecision.body.error).toBe("invalid_feature_confirmation_decision");
+
+    const approved = await auth(
+      request(app)
+        .post(`/api/feature-confirmations/${blocked.body.featureConfirmation.id}/resolve`)
+        .send({
+          sessionId,
+          decision: "approved",
+          reason: "This is an intentional behavior update with regression coverage.",
+        }),
+      token,
+    );
+    expect(approved.body.confirmation.status).toBe("approved");
+    const allowed = await auth(request(app).post("/api/edits/check").send(proposal), token);
+    expect(allowed.body).toMatchObject({
+      allowed: true,
+      featureConfirmation: expect.objectContaining({ status: "approved" }),
+    });
+
+    const rollbackVerification = await auth(
+      request(app).post("/api/verifications").send({
+        sessionId,
+        leaseId: lease.body.lease.id,
+        kind: "automated_test",
+        result: "passed",
+        summary: "Rollback regression tests passed.",
+      }),
+      token,
+    );
+    expect(rollbackVerification.status).toBe(201);
+    const rollbackEvidenceScan = await auth(
+      request(app).post(`/api/sessions/${sessionId}/scan`).send({
+        branch: "develop",
+        baseCommit: "aaaa1111",
+        changedPaths: ["Assets/Inventory/Feature.cs"],
+        metadata: {
+          source: "codex-hook",
+          event: "SessionEnd",
+          featureEvidence: {
+            version: 1,
+            branch: "develop",
+            baseCommit: "aaaa1111",
+            finalCommit: "cccc3333",
+            committed: true,
+            committedPaths: ["Assets/Inventory/Feature.cs"],
+            uncommittedPaths: [],
+            changedPaths: ["Assets/Inventory/Feature.cs"],
+            commitHashes: ["cccc3333"],
+            diffSha256: "b".repeat(64),
+          },
+        },
+      }),
+      token,
+    );
+    expect(rollbackEvidenceScan.status).toBe(201);
+
+    const rollback = await auth(
+      request(app).post(`/api/features/${revision.featureId}/rollback`).send({
+        sessionId,
+        targetRevisionId: revision.id,
+        changeSummary: "Restore the last verified behavior after an incompatible experiment.",
+        finalCommit: "cccc3333",
+        completed: true,
+        verifications: [{
+          testKey: "inventory-regression",
+          result: "passed",
+          summary: "Rollback regression tests passed.",
+        }],
+      }),
+      token,
+    );
+    expect(rollback.status).toBe(201);
+    expect(rollback.body.revision).toMatchObject({ revisionNumber: 2, status: "current" });
+
+    const history = await auth(
+      request(app).get(`/api/features/${revision.featureId}/history`),
+      token,
+    );
+    expect(history.body.revisions).toHaveLength(2);
+    expect(history.body.revisions.map((item: { revisionNumber: number }) => item.revisionNumber)).toEqual([2, 1]);
   });
 
   it("reopens the SQLite database without losing rooms, membership, or records", async () => {

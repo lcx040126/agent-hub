@@ -4,6 +4,35 @@ export interface DesktopServerInfo {
   localServerUrl: string;
   lanUrls: string[];
   port: number;
+  appVersion: string;
+  protocolVersion: number;
+  schemaVersion: number;
+}
+
+export type DesktopUpdatePhase =
+  | "disabled"
+  | "idle"
+  | "checking"
+  | "up-to-date"
+  | "available"
+  | "downloading"
+  | "ready"
+  | "installing"
+  | "failed";
+
+export interface DesktopUpdateStatus {
+  phase: DesktopUpdatePhase;
+  currentVersion: string;
+  availableVersion?: string;
+  publishedAt?: string;
+  notes?: string;
+  sizeBytes?: number;
+  progressPercent?: number;
+  transferredBytes?: number;
+  bytesPerSecond?: number;
+  checkedAt?: string;
+  error?: string;
+  canRetry: boolean;
 }
 
 export interface SaveRoomConnectionInput {
@@ -75,6 +104,12 @@ export interface AgentHubDesktopApi {
   listRoomConnections(): Promise<SavedRoomConnection[]>;
   requestRoomServer(input: RoomServerRequestInput): Promise<RoomServerResponse>;
   installCodexIntegration(connectionId: string): Promise<CodexInstallResult>;
+  getDesktopUpdateStatus(): Promise<DesktopUpdateStatus>;
+  checkDesktopUpdate(): Promise<DesktopUpdateStatus>;
+  downloadDesktopUpdate(): Promise<DesktopUpdateStatus>;
+  installDesktopUpdate(): Promise<DesktopUpdateStatus>;
+  onDesktopUpdateStatus(listener: (status: DesktopUpdateStatus) => void): () => void;
+  /** @deprecated Room-service-only script updates were retired in 0.2.0. */
   applyRoomServerUpdate(): Promise<{ restarted: true; port: number }>;
 }
 
@@ -86,5 +121,10 @@ export const DESKTOP_IPC = {
   listRoomConnections: "agent-hub:list-room-connections",
   requestRoomServer: "agent-hub:request-room-server",
   installCodexIntegration: "agent-hub:install-codex-integration",
+  getDesktopUpdateStatus: "agent-hub:get-desktop-update-status",
+  checkDesktopUpdate: "agent-hub:check-desktop-update",
+  downloadDesktopUpdate: "agent-hub:download-desktop-update",
+  installDesktopUpdate: "agent-hub:install-desktop-update",
+  desktopUpdateStatus: "agent-hub:desktop-update-status",
   applyRoomServerUpdate: "agent-hub:apply-room-server-update",
 } as const;

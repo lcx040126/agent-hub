@@ -113,7 +113,7 @@ async function openScanSession(client: AgentHubClient, snapshot: RepositorySnaps
     branch: snapshot.repository.branch,
     worktree: snapshot.repository.root,
     baseCommit: snapshot.repository.headCommit,
-    task: "Continuously synchronize local project structure and change metadata.",
+    task: "Synchronize project structure and rules; external file changes stay local.",
     metadata: {
       source: "desktop-companion",
       repositoryFingerprint: snapshot.repository.fingerprint,
@@ -127,19 +127,23 @@ async function uploadSnapshot(
   sessionId: string,
   snapshot: RepositorySnapshot,
 ): Promise<void> {
-  await client.post(`/api/sessions/${encodeURIComponent(sessionId)}/scan`, {
+  await client.post(`/api/sessions/${encodeURIComponent(sessionId)}/scan`, createBackgroundScanPayload(snapshot));
+}
+
+export function createBackgroundScanPayload(snapshot: RepositorySnapshot): Record<string, unknown> {
+  return {
     repository: snapshot.repository.remote ?? snapshot.repository.name,
     branch: snapshot.repository.branch,
     worktree: snapshot.repository.root,
     baseCommit: snapshot.repository.headCommit,
-    changedPaths: snapshot.changedPaths.slice(0, 100),
+    // Desktop/Unity/IDE changes are not attributable to an Agent tool call and never leave this machine.
+    changedPaths: [],
     ruleFiles: snapshot.ruleFiles.map((rule) => rule.path).slice(0, 100),
     systems: snapshot.systems.map((system) => system.id).slice(0, 200),
     metadata: {
       source: "desktop-companion",
       generatedAt: snapshot.generatedAt,
       repositoryFingerprint: snapshot.repository.fingerprint,
-      impactedSystemIds: snapshot.impactedSystemIds.slice(0, 200),
       analysis: snapshot.analysis,
       ruleHashes: snapshot.ruleFiles.slice(0, 100).map((rule) => ({
         path: rule.path,
@@ -148,13 +152,12 @@ async function uploadSnapshot(
       dependencies: snapshot.dependencies.slice(0, 500),
       dependencyCount: snapshot.dependencies.length,
       systemCount: snapshot.systems.length,
-      changedPathCount: snapshot.changedPaths.length,
+      externalChangesExcluded: true,
       metadataTruncated:
         snapshot.dependencies.length > 500
-        || snapshot.systems.length > 200
-        || snapshot.changedPaths.length > 100,
+        || snapshot.systems.length > 200,
     },
-  });
+  };
 }
 
 function asError(error: unknown): Error {

@@ -35,6 +35,11 @@ function createService() {
     leaseAcquire: vi.fn((_context, input) => record("lease_acquire", input)),
     leaseRenew: vi.fn((_context, input) => record("lease_renew", input)),
     editCheck: vi.fn((_context, input) => record("edit_check", input)),
+    featureContextQuery: vi.fn((_context, input) => record("feature_context_query", input)),
+    featureHistory: vi.fn((_context, input) => record("feature_history", input)),
+    featureRevisionSubmit: vi.fn((_context, input) => record("feature_revision_submit", input)),
+    featureRollback: vi.fn((_context, input) => record("feature_revision_rollback", input)),
+    featureChangeConfirm: vi.fn((_context, input) => record("feature_change_confirm", input)),
     eventAppend: vi.fn((_context, input) => record("event_append", input)),
     sessionClose: vi.fn((_context, input) => record("session_close", input)),
   };
@@ -119,9 +124,10 @@ describe("Agent Hub Streamable HTTP MCP", () => {
 
     expect(client.getServerVersion()).toMatchObject({
       name: "agent-hub",
-      version: "0.1.0",
+      version: "0.2.0",
     });
-    expect(client.getInstructions()).toContain("Call session_open before planning or editing");
+    expect(client.getInstructions()).toContain("reuse that exact Hook session");
+    expect(client.getInstructions()).toContain("do not call session_open");
 
     const listed = await client.listTools();
     expect(listed.tools.map((tool) => tool.name)).toEqual([
@@ -130,6 +136,11 @@ describe("Agent Hub Streamable HTTP MCP", () => {
       "lease_acquire",
       "lease_renew",
       "edit_check",
+      "feature_context_query",
+      "feature_history",
+      "feature_revision_submit",
+      "feature_revision_rollback",
+      "feature_change_confirm",
       "event_append",
       "session_close",
     ]);
@@ -145,7 +156,17 @@ describe("Agent Hub Streamable HTTP MCP", () => {
       readOnlyHint: false,
       destructiveHint: false,
     });
-    for (const name of ["lease_acquire", "lease_renew", "edit_check", "event_append"] as const) {
+    for (const name of [
+      "lease_acquire",
+      "lease_renew",
+      "edit_check",
+      "feature_context_query",
+      "feature_history",
+      "feature_revision_submit",
+      "feature_revision_rollback",
+      "feature_change_confirm",
+      "event_append",
+    ] as const) {
       expect(tools[name].inputSchema).toMatchObject({
         required: expect.arrayContaining(["sessionId"]),
       });
@@ -213,6 +234,88 @@ describe("Agent Hub Streamable HTTP MCP", () => {
           sessionId: "session-1",
           leaseId: "lease-1",
           paths: ["Assets/Inventory/Feature.cs"],
+          proposedEdits: [{
+            path: "Assets/Inventory/Feature.cs",
+            precision: "symbol",
+            symbols: ["InventoryFeature.Apply"],
+            operation: "update",
+          }],
+        },
+      }),
+    );
+    results.push(
+      await client.callTool({
+        name: "feature_context_query",
+        arguments: {
+          sessionId: "session-1",
+          paths: ["Assets/Inventory/Feature.cs"],
+          level: "cards",
+        },
+      }),
+    );
+    results.push(
+      await client.callTool({
+        name: "feature_history",
+        arguments: { sessionId: "session-1", featureId: "feature-1" },
+      }),
+    );
+    results.push(
+      await client.callTool({
+        name: "feature_revision_submit",
+        arguments: {
+          sessionId: "session-1",
+          featureKey: "inventory.apply",
+          name: "Inventory apply",
+          systemId: "inventory",
+          objective: "Apply an item without breaking existing inventory contracts.",
+          changeSummary: "Added the compatible apply path.",
+          contractChanges: [{
+            operation: "add",
+            key: "inventory.apply.compatible",
+            behavior: "Applies compatible items and preserves unrelated slots.",
+          }],
+          targets: [{
+            kind: "symbol",
+            role: "implementation",
+            path: "Assets/Inventory/Feature.cs",
+            symbol: "InventoryFeature.Apply",
+          }],
+          finalCommit: "abcd1234",
+          completed: true,
+          verifications: [{
+            testKey: "inventory-regression",
+            result: "passed",
+            summary: "Inventory regression tests passed.",
+          }],
+        },
+      }),
+    );
+    results.push(
+      await client.callTool({
+        name: "feature_revision_rollback",
+        arguments: {
+          sessionId: "session-1",
+          featureId: "feature-1",
+          targetRevisionId: "revision-1",
+          changeSummary: "Restore the last verified behavior.",
+          finalCommit: "dcba4321",
+          completed: true,
+          verifications: [{
+            testKey: "inventory-regression",
+            result: "passed",
+            summary: "Rollback regression tests passed.",
+          }],
+        },
+      }),
+    );
+    results.push(
+      await client.callTool({
+        name: "feature_change_confirm",
+        arguments: {
+          sessionId: "session-1",
+          confirmationId: "confirmation-1",
+          decision: "approved",
+          reason: "The behavior change is intentional and regression coverage is ready.",
         },
       }),
     );
@@ -254,6 +357,11 @@ describe("Agent Hub Streamable HTTP MCP", () => {
       "lease_acquire",
       "lease_renew",
       "edit_check",
+      "feature_context_query",
+      "feature_history",
+      "feature_revision_submit",
+      "feature_revision_rollback",
+      "feature_change_confirm",
       "event_append",
       "session_close",
     ]);
@@ -264,6 +372,12 @@ describe("Agent Hub Streamable HTTP MCP", () => {
         sessionId: "session-1",
         leaseId: "lease-1",
         paths: ["Assets/Inventory/Feature.cs"],
+        proposedEdits: [{
+          path: "Assets/Inventory/Feature.cs",
+          precision: "symbol",
+          symbols: ["InventoryFeature.Apply"],
+          operation: "update",
+        }],
       },
     );
     expect(service.eventAppend).toHaveBeenCalledWith(

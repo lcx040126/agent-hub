@@ -29,7 +29,21 @@ describe("CodexHookStateStore", () => {
       initialChangedFingerprints: { "src/existing.ts": "initial-fingerprint" },
       observedChangedPaths: ["src/existing.ts"],
       observedChangedFingerprints: { "src/existing.ts": "observed-fingerprint" },
+      attributedChangedPaths: ["src/new.ts"],
+      attributedPathsTruncated: true,
       leases: [{ id: "lease-1", paths: ["src/new.ts"], expiresAt: now }],
+      pendingWrite: {
+        proposalHash: "a".repeat(64),
+        toolName: "apply_patch",
+        proposedEdits: [{ path: "src/new.ts", precision: "symbol", symbols: ["createItem"], operation: "update" }],
+        attributedSideEffects: false,
+        baselineChangedPaths: ["src/existing.ts"],
+        baselineChangedFingerprints: { "src/existing.ts": "observed-fingerprint" },
+        recordedAt: now,
+      },
+      externalChangeDiagnostics: [{ paths: ["Assets/Scene.unity"], detectedAt: now }],
+      loadedFeatureVersions: { "inventory-move": "revision-2" },
+      lastHeartbeatAt: now,
       quarantine: {
         reason: "A generated file was outside the lease.",
         paths: ["src/generated.ts"],
@@ -43,6 +57,11 @@ describe("CodexHookStateStore", () => {
     await expect(store.load(state.codexSessionId)).resolves.toMatchObject({
       connectionId: "connection-1",
       leases: [{ id: "lease-1", paths: ["src/new.ts"] }],
+      attributedChangedPaths: ["src/new.ts"],
+      attributedPathsTruncated: true,
+      pendingWrite: { proposedEdits: [{ symbols: ["createItem"] }] },
+      externalChangeDiagnostics: [{ paths: ["Assets/Scene.unity"] }],
+      loadedFeatureVersions: { "inventory-move": "revision-2" },
       quarantine: { paths: ["src/generated.ts"] },
     });
     const files = await import("node:fs/promises").then((fs) => fs.readdir(store.directory));

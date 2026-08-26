@@ -26,6 +26,12 @@ describe("parseHeadlessInvocation", () => {
     }
   });
 
+  it("parses the isolated local integration health probe", () => {
+    expect(parseHeadlessInvocation(["AgentHub.exe", "--health-probe"])).toEqual({
+      mode: "health-probe",
+    });
+  });
+
   it("rejects incomplete, unknown, or conflicting modes", () => {
     expect(() => parseHeadlessInvocation(["AgentHub.exe", "--mcp-bridge"])).toThrow(
       /connection-id/i,
@@ -39,6 +45,14 @@ describe("parseHeadlessInvocation", () => {
         "--mcp-bridge",
         "--connection-id",
         "one",
+        "--codex-hook",
+        "SessionStart",
+      ]),
+    ).toThrow(/same process/i);
+    expect(() =>
+      parseHeadlessInvocation([
+        "AgentHub.exe",
+        "--health-probe",
         "--codex-hook",
         "SessionStart",
       ]),

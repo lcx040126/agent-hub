@@ -24,13 +24,17 @@ import {
   type Lease,
   type LeaseClaimResult,
   type LeaseConflict,
+  type LeaseKind,
   type LeaseMode,
+  type ListReleaseRequestsInput,
   type ListActivityInput,
   type LocalScan,
   type Member,
   type ProjectRecord,
   type RecordKind,
   type ReleaseLeaseInput,
+  type ReleaseRequest,
+  type ResolveReleaseRequestInput,
   type RenewLeaseInput,
   type Room,
   type RoomSnapshot,
@@ -39,15 +43,69 @@ import {
   type ClaimLeaseInput,
   type ContextExport,
   type RoomSettings,
+  type FeatureMemoryQueryInput,
+  type FeatureMemoryQueryResult,
+  type FeatureRevision,
+  type FeatureVerificationEvidence,
+  type ResolveFeatureConfirmationInput,
+  type RollbackFeatureRevisionInput,
+  type SubmitFeatureRevisionInput,
 } from "./domain.js";
 import { AgentHubDatabase } from "./db.js";
+import {
+  evaluateRealtimeOverlaps,
+  resolveLeaseDurationMinutes,
+  shouldHeartbeatRenew,
+} from "./lease-policy.js";
+import {
+  createDefaultRiskPolicy,
+  normalizeRiskPolicyRules,
+  type RiskPolicy,
+  type RiskPolicyRule,
+} from "./risk-policy.js";
+import {
+  AGENT_HUB_PROTOCOL_VERSION,
+  AGENT_HUB_SCHEMA_VERSION,
+} from "../shared/version.js";
+import {
+  FeatureMemoryError,
+  FeatureMemoryStore,
+  type FeatureMemoryActor,
+  type FeatureMemorySession,
+} from "./feature-memory.js";
 
-const DEFAULT_TTL_MS = 30 * 60 * 1000;
-const MIN_TTL_MS = 60 * 1000;
-const MAX_TTL_MS = 24 * 60 * 60 * 1000;
+const AUTOMATIC_TTL_OPTIONS = [5, 10, 15, 30, 60] as const;
+const DEFAULT_AUTOMATIC_TTL_MINUTES = 10;
+const DEFAULT_MAXIMUM_EXCLUSIVE_LEASE_MINUTES = 24 * 60;
+const RELEASE_REQUEST_COOLDOWN_MS = 2 * 60 * 1000;
 const MAX_ACTIVITY_LIMIT = 200;
+const FEATURE_SUBMITTED_TARGET_PATHS_KEY = "agentHubSubmittedTargetPaths";
 
 type Row = Record<string, unknown>;
+
+interface FeaturePromotionClaims {
+  branch: string | null;
+  finalCommit?: string;
+  gitEvidence?: Record<string, unknown>;
+  verifications: FeatureVerificationEvidence[];
+  paths: string[];
+}
+
+interface FeatureEvidenceAttestation {
+  version: 1 | 2;
+  branch: string;
+  baseCommit: string;
+  finalCommit: string;
+  committed: boolean;
+  committedPathCount: number;
+  uncommittedPathCount: number;
+  changedPathCount: number;
+  changedPathsSha256: string;
+  commitHashCount: number;
+  commitHashesSha256: string;
+  finalCommitIncluded: boolean;
+  diffSha256: string;
+}
 
 export interface AuthenticatedMember {
   room: Room;
@@ -75,6 +133,9 @@ export interface OpenSessionInput {
   baseCommit?: string;
   task?: string;
   metadata?: Record<string, unknown>;
+  clientVersion?: string;
+  protocolVersion?: number;
+  schemaVersion?: number;
 }
 
 export interface RecordLocalScanInput {
@@ -129,11 +190,26 @@ export interface DashboardData {
   activity: Activity[];
   sessions: WorkSession[];
   localScans: LocalScan[];
+  settings: RoomSettings;
+  releaseRequests: ReleaseRequest[];
 }
 
 export interface UpdateRoomSettingsInput {
   memberToken: string;
-  autoLockAfterAutoClaim: boolean;
+  autoLockAfterAutoClaim?: boolean;
+  blockingProtectionEnabled?: boolean;
+  automaticLeaseTtlMinutes?: number;
+  maximumExclusiveLeaseMinutes?: number;
+  riskRules?: RiskPolicyRule[];
+  resetRiskPolicy?: boolean;
+}
+
+export interface HeartbeatSessionInput {
+  memberToken: string;
+  sessionId: string;
+  clientVersion?: string;
+  protocolVersion?: number;
+  schemaVersion?: number;
 }
 
 export interface ChangeMemberRoleInput {
@@ -186,12 +262,14 @@ export class AgentHubError extends Error {
 
 export class AgentHubService {
   private readonly now: () => Date;
+  private readonly featureMemory: FeatureMemoryStore;
 
   constructor(
     readonly database: AgentHubDatabase,
     options: AgentHubServiceOptions = {},
   ) {
     this.now = options.now ?? (() => new Date());
+    this.featureMemory = new FeatureMemoryStore(database, this.now);
   }
 
   createRoom(input: CreateRoomInput): CreateRoomResult {
@@ -201,6 +279,10 @@ export class AgentHubService {
     const defaultBranch = optionalString(input.defaultBranch, "Default branch", 255) ?? "main";
     const hostName = requiredString(input.hostName, "Owner name", 120);
     const hostAgent = optionalString(input.hostAgent, "Client name", 160);
+    const clientVersion = optionalString(input.clientVersion, "Client version", 80);
+    const protocolVersion = optionalVersionNumber(input.protocolVersion, "Protocol version");
+    const schemaVersion = optionalVersionNumber(input.schemaVersion, "Schema version");
+    const defaultRiskPolicy = createDefaultRiskPolicy();
     const createdAt = this.timestamp();
     const roomId = randomUUID();
     const memberId = randomUUID();
@@ -210,15 +292,31 @@ export class AgentHubService {
     this.database.transaction(() => {
       this.database.connection
         .prepare(`
-          INSERT INTO rooms (id, code, name, project_name, repository, default_branch, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO rooms (
+            id, code, name, project_name, repository, default_branch, created_at,
+            blocking_protection_enabled, automatic_lease_ttl_minutes,
+            maximum_exclusive_lease_minutes, risk_policy_version, risk_policy_rules_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
         `)
-        .run(roomId, code, name, projectName, repository, defaultBranch, createdAt);
+        .run(
+          roomId,
+          code,
+          name,
+          projectName,
+          repository,
+          defaultBranch,
+          createdAt,
+          DEFAULT_AUTOMATIC_TTL_MINUTES,
+          DEFAULT_MAXIMUM_EXCLUSIVE_LEASE_MINUTES,
+          defaultRiskPolicy.version,
+          json(defaultRiskPolicy.rules),
+        );
       this.database.connection
         .prepare(`
           INSERT INTO members
-            (id, room_id, name, role, client_name, token_hash, created_at, last_seen_at)
-          VALUES (?, ?, ?, 'host', ?, ?, ?, ?)
+            (id, room_id, name, role, client_name, token_hash, created_at, last_seen_at,
+             client_version, protocol_version, schema_version)
+          VALUES (?, ?, ?, 'host', ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           memberId,
@@ -228,7 +326,15 @@ export class AgentHubService {
           hashToken(memberToken),
           createdAt,
           createdAt,
+          clientVersion,
+          protocolVersion,
+          schemaVersion,
         );
+      this.database.connection.prepare(`
+        INSERT OR REPLACE INTO risk_policy_versions
+          (room_id, version, rules_json, author_member_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(roomId, defaultRiskPolicy.version, json(defaultRiskPolicy.rules), memberId, createdAt);
       this.insertActivity({
         roomId,
         actorMemberId: memberId,
@@ -254,6 +360,9 @@ export class AgentHubService {
     const code = normalizeInviteCode(input.roomToken);
     const displayName = requiredString(input.displayName, "Member name", 120);
     const agent = optionalString(input.agent, "Client name", 160);
+    const clientVersion = optionalString(input.clientVersion, "Client version", 80);
+    const protocolVersion = optionalVersionNumber(input.protocolVersion, "Protocol version");
+    const schemaVersion = optionalVersionNumber(input.schemaVersion, "Schema version");
     const row = this.database.connection
       .prepare("SELECT id FROM rooms WHERE code = ? COLLATE NOCASE")
       .get(code) as Row | undefined;
@@ -269,10 +378,22 @@ export class AgentHubService {
       this.database.connection
         .prepare(`
           INSERT INTO members
-            (id, room_id, name, role, client_name, token_hash, created_at, last_seen_at)
-          VALUES (?, ?, ?, 'member', ?, ?, ?, ?)
+            (id, room_id, name, role, client_name, token_hash, created_at, last_seen_at,
+             client_version, protocol_version, schema_version)
+          VALUES (?, ?, ?, 'member', ?, ?, ?, ?, ?, ?, ?)
         `)
-        .run(memberId, roomId, displayName, agent, hashToken(token), createdAt, createdAt);
+        .run(
+          memberId,
+          roomId,
+          displayName,
+          agent,
+          hashToken(token),
+          createdAt,
+          createdAt,
+          clientVersion,
+          protocolVersion,
+          schemaVersion,
+        );
       this.insertActivity({
         roomId,
         actorMemberId: memberId,
@@ -300,6 +421,7 @@ export class AgentHubService {
         SELECT
           m.id AS member_id, m.room_id, m.name AS member_name, m.role, m.client_name,
           m.created_at AS member_created_at, m.last_seen_at, m.is_admin, m.removed_at,
+          m.client_version, m.protocol_version, m.schema_version,
           r.code, r.name AS room_name, r.project_name, r.repository,
           r.default_branch, r.created_at AS room_created_at, r.status AS room_status,
           r.auto_lock_after_auto_claim, r.settings_updated_at, r.settings_updated_by
@@ -328,8 +450,10 @@ export class AgentHubService {
   getSnapshot(memberToken: string): RoomSnapshot {
     const auth = this.authenticateMemberToken(memberToken);
     this.expireLeases(auth.room.id);
+    this.reconcileReleaseRequests(auth.room.id);
     return {
       room: auth.room,
+      settings: this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName),
       members: this.listMembers(auth.room.id),
       activeLeases: this.listLeases(auth.room.id, true),
       contextEntries: this.listContextEntries(auth.room.id),
@@ -340,6 +464,7 @@ export class AgentHubService {
       sessions: this.listSessions(auth.room.id),
       localScans: this.listLocalScans(auth.room.id),
       activities: this.listActivitiesByRoom(auth.room.id, 100),
+      releaseRequests: this.listReleaseRequestsByRoom(auth.room.id, "pending"),
       generatedAt: this.timestamp(),
     };
   }
@@ -347,6 +472,7 @@ export class AgentHubService {
   getDashboard(memberToken: string): DashboardData {
     const auth = this.authenticateMemberToken(memberToken);
     this.expireLeases(auth.room.id);
+    this.reconcileReleaseRequests(auth.room.id);
     return {
       room: auth.room,
       currentMember: auth.member,
@@ -357,28 +483,117 @@ export class AgentHubService {
       activity: this.listActivitiesByRoom(auth.room.id, 100),
       sessions: this.listSessions(auth.room.id),
       localScans: this.listLocalScans(auth.room.id),
+      settings: this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName),
+      releaseRequests: this.listReleaseRequestsByRoom(auth.room.id, "pending"),
     };
   }
 
   getRoomSettings(memberToken: string): RoomSettings {
     const auth = this.authenticateMemberToken(memberToken);
-    return {
-      autoLockAfterAutoClaim: auth.room.autoLockAfterAutoClaim,
-      updatedAt: (this.database.connection.prepare("SELECT settings_updated_at FROM rooms WHERE id = ?").get(auth.room.id) as Row | undefined)?.settings_updated_at as string ?? auth.room.createdAt,
-      updatedBy: (this.database.connection.prepare("SELECT settings_updated_by FROM rooms WHERE id = ?").get(auth.room.id) as Row | undefined)?.settings_updated_by as string ?? auth.member.displayName,
-    };
+    return this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
   }
 
   updateRoomSettings(input: UpdateRoomSettingsInput): RoomSettings {
     const auth = this.authenticateMemberToken(input.memberToken);
-    this.requireAdmin(auth);
-    if (typeof input.autoLockAfterAutoClaim !== "boolean") throw new AgentHubError("invalid_setting", "autoLockAfterAutoClaim must be boolean.");
+    this.requireOwner(auth);
+    const previous = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    if (input.riskRules !== undefined && input.resetRiskPolicy) {
+      throw new AgentHubError("invalid_setting", "riskRules and resetRiskPolicy cannot be used together.");
+    }
+    const hasSetting = input.autoLockAfterAutoClaim !== undefined
+      || input.blockingProtectionEnabled !== undefined
+      || input.automaticLeaseTtlMinutes !== undefined
+      || input.maximumExclusiveLeaseMinutes !== undefined
+      || input.riskRules !== undefined
+      || input.resetRiskPolicy === true;
+    if (!hasSetting) throw new AgentHubError("invalid_setting", "At least one room setting is required.");
+
+    const blockingProtectionEnabled = input.blockingProtectionEnabled
+      ?? input.autoLockAfterAutoClaim
+      ?? previous.blockingProtectionEnabled;
+    if (typeof blockingProtectionEnabled !== "boolean") {
+      throw new AgentHubError("invalid_setting", "blockingProtectionEnabled must be boolean.");
+    }
+    const automaticLeaseTtlMinutes = input.automaticLeaseTtlMinutes === undefined
+      ? previous.automaticLeaseTtlMinutes
+      : normalizeAutomaticTtlMinutes(input.automaticLeaseTtlMinutes);
+    const maximumExclusiveLeaseMinutes = input.maximumExclusiveLeaseMinutes === undefined
+      ? previous.maximumExclusiveLeaseMinutes
+      : normalizeMaximumExclusiveLeaseMinutes(input.maximumExclusiveLeaseMinutes);
+    let riskRules = previous.riskRules;
+    let riskPolicyVersion = previous.riskPolicyVersion;
+    if (input.resetRiskPolicy || input.riskRules !== undefined) {
+      try {
+        riskRules = input.resetRiskPolicy
+          ? createDefaultRiskPolicy().rules
+          : normalizeRiskPolicyRules(input.riskRules ?? []);
+      } catch (error) {
+        throw new AgentHubError(
+          "invalid_risk_policy",
+          error instanceof Error ? error.message : "The risk policy is invalid.",
+        );
+      }
+      riskPolicyVersion += 1;
+    }
     const now = this.timestamp();
     this.database.transaction(() => {
-      this.database.connection.prepare("UPDATE rooms SET auto_lock_after_auto_claim = ?, settings_updated_at = ?, settings_updated_by = ? WHERE id = ?").run(input.autoLockAfterAutoClaim ? 1 : 0, now, auth.member.id, auth.room.id);
-      this.auditRecord(auth, "room.settings.updated", "room", auth.room.id, `${auth.member.displayName} updated room settings.`, { autoLockAfterAutoClaim: input.autoLockAfterAutoClaim });
+      this.database.connection.prepare(`
+        UPDATE rooms SET
+          auto_lock_after_auto_claim = ?, blocking_protection_enabled = ?,
+          automatic_lease_ttl_minutes = ?, maximum_exclusive_lease_minutes = ?,
+          risk_policy_version = ?, risk_policy_rules_json = ?,
+          settings_updated_at = ?, settings_updated_by = ?
+        WHERE id = ?
+      `).run(
+        blockingProtectionEnabled ? 1 : 0,
+        blockingProtectionEnabled ? 1 : 0,
+        automaticLeaseTtlMinutes,
+        maximumExclusiveLeaseMinutes,
+        riskPolicyVersion,
+        json(riskRules),
+        now,
+        auth.member.id,
+        auth.room.id,
+      );
+      if (riskPolicyVersion !== previous.riskPolicyVersion) {
+        this.database.connection.prepare(`
+          INSERT INTO risk_policy_versions
+            (room_id, version, rules_json, author_member_id, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(auth.room.id, riskPolicyVersion, json(riskRules), auth.member.id, now);
+      }
+      this.auditRecord(
+        auth,
+        "room.settings.updated",
+        "room",
+        auth.room.id,
+        `${auth.member.displayName} updated room coordination settings.`,
+        {
+          previous: {
+            blockingProtectionEnabled: previous.blockingProtectionEnabled,
+            automaticLeaseTtlMinutes: previous.automaticLeaseTtlMinutes,
+            maximumExclusiveLeaseMinutes: previous.maximumExclusiveLeaseMinutes,
+            riskPolicyVersion: previous.riskPolicyVersion,
+          },
+          current: {
+            blockingProtectionEnabled,
+            automaticLeaseTtlMinutes,
+            maximumExclusiveLeaseMinutes,
+            riskPolicyVersion,
+          },
+        },
+      );
     });
-    return { autoLockAfterAutoClaim: input.autoLockAfterAutoClaim, updatedAt: now, updatedBy: auth.member.displayName };
+    return {
+      autoLockAfterAutoClaim: blockingProtectionEnabled,
+      blockingProtectionEnabled,
+      automaticLeaseTtlMinutes,
+      maximumExclusiveLeaseMinutes,
+      riskPolicyVersion,
+      riskRules,
+      updatedAt: now,
+      updatedBy: auth.member.displayName,
+    };
   }
 
   changeMemberRole(input: ChangeMemberRoleInput): Member {
@@ -401,8 +616,50 @@ export class AgentHubService {
     if (!this.isOwner(auth) && (!auth.member.isAdmin || target.isAdmin)) throw new AgentHubError("member_remove_forbidden", "Only the owner can remove administrators.", 403);
     const now = this.timestamp();
     this.database.transaction(() => {
+      const activeLeases = this.database.connection.prepare(`
+        SELECT id FROM leases
+        WHERE room_id = ? AND member_id = ? AND status = 'active'
+      `).all(auth.room.id, target.id) as Row[];
+      const pendingReleaseRequests = this.database.connection.prepare(`
+        SELECT DISTINCT rr.id
+        FROM release_requests rr
+        JOIN leases holder_lease ON holder_lease.id = rr.conflicting_lease_id
+        WHERE rr.room_id = ? AND rr.status = 'pending'
+          AND (rr.requester_member_id = ? OR holder_lease.member_id = ?)
+      `).all(auth.room.id, target.id, target.id) as Row[];
+      const cancelledLeaseIds = activeLeases.map((row) => asString(row.id));
+      const cancelledReleaseRequestIds = pendingReleaseRequests.map((row) => asString(row.id));
+      const cancellationSummary = `Cancelled because ${target.displayName} was removed from the room.`;
+      const cancelLease = this.database.connection.prepare(`
+        UPDATE leases SET status = 'cancelled', completed_at = ?, updated_at = ?,
+          completion_summary = ?
+        WHERE id = ? AND status = 'active'
+      `);
+      for (const leaseId of cancelledLeaseIds) {
+        cancelLease.run(now, now, cancellationSummary, leaseId);
+      }
+      const cancelReleaseRequest = this.database.connection.prepare(`
+        UPDATE release_requests
+        SET status = 'cancelled', decision_member_id = ?, resolved_at = ?
+        WHERE id = ? AND status = 'pending'
+      `);
+      for (const requestId of cancelledReleaseRequestIds) {
+        cancelReleaseRequest.run(auth.member.id, now, requestId);
+      }
       this.database.connection.prepare("UPDATE members SET removed_at = ?, token_hash = ? WHERE id = ? AND room_id = ?").run(now, `revoked_${randomUUID()}`, target.id, auth.room.id);
-      this.auditRecord(auth, "member.removed", "member", target.id, `${auth.member.displayName} removed ${target.displayName} from the room.`, {});
+      this.auditRecord(
+        auth,
+        "member.removed",
+        "member",
+        target.id,
+        `${auth.member.displayName} removed ${target.displayName} from the room.`,
+        {
+          cancelledLeaseCount: cancelledLeaseIds.length,
+          cancelledLeaseIds,
+          cancelledReleaseRequestCount: cancelledReleaseRequestIds.length,
+          cancelledReleaseRequestIds,
+        },
+      );
     });
   }
 
@@ -516,39 +773,65 @@ export class AgentHubService {
     const branch = optionalString(input.branch, "Branch", 255);
     const baseCommit = optionalString(input.baseCommit, "Base commit", 255);
     const mode = normalizeLeaseMode(input.mode);
+    const kind = normalizeLeaseKind(input.kind, input.autoClaim);
+    if (kind === "exclusive" && mode !== "write") {
+      throw new AgentHubError("invalid_lease_kind", "A manual exclusive lease must use write mode.");
+    }
     const overrideReason = optionalString(input.overrideReason, "Override reason", 1000);
     const paths = normalizePathList(input.paths);
-    const ttlMs = normalizeTtl(input.ttlMs);
+    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    const requestedMinutes = input.ttlMinutes
+      ?? (input.ttlMs === undefined ? undefined : input.ttlMs / 60_000);
+    let durationMinutes: number;
+    try {
+      durationMinutes = resolveLeaseDurationMinutes(kind, requestedMinutes, settings);
+    } catch (error) {
+      throw new AgentHubError(
+        "invalid_ttl",
+        error instanceof Error ? error.message : "The lease duration is invalid.",
+      );
+    }
     const createdAt = this.timestamp();
-    const expiresAt = new Date(this.now().getTime() + ttlMs).toISOString();
+    const expiresAt = new Date(this.now().getTime() + durationMinutes * 60_000).toISOString();
 
     return this.database.transaction(() => {
       this.expireLeases(auth.room.id, false);
+      const reusableLease = this.listLeases(auth.room.id, true).find((lease) =>
+        lease.memberId === auth.member.id
+        && lease.sessionId === sessionId
+        && lease.mode === mode
+        && lease.kind === kind
+        && paths.every((requestedPath) => lease.paths.some(
+          (scope) => pathScopeCovers(scope.path, requestedPath.path),
+        )),
+      );
       const conflicts = mode === "write"
-        ? this.findLeaseConflicts(auth.room.id, auth.member.id, sessionId, paths)
+        ? this.findLeaseConflicts(
+            auth.room.id,
+            auth.member.id,
+            sessionId,
+            kind,
+            paths,
+            settings,
+            reusableLease ? [reusableLease.id] : [],
+          )
         : [];
-      if (input.autoClaim && auth.room.autoLockAfterAutoClaim) {
-        for (const conflict of conflicts) {
-          if (conflict.severity === "warning") {
-            conflict.severity = "blocking";
-            conflict.decision = "deny";
-            conflict.reason = "Automatic range locking is enabled for this room; overlapping automatic work is denied.";
-          }
-        }
-      }
       const hasBlocking = conflicts.some((conflict) => conflict.severity === "blocking");
       const hasWarning = conflicts.some((conflict) => conflict.severity === "warning");
       const decision = hasBlocking ? "deny" : hasWarning ? "warn" : "allow";
-      const canAcquire = !hasBlocking && (!hasWarning || Boolean(overrideReason));
-      const leaseId = canAcquire ? randomUUID() : null;
+      const canAcquire = !hasBlocking;
+      const leaseId = canAcquire ? reusableLease?.id ?? randomUUID() : null;
+      const effectiveExpiresAt = reusableLease && !shouldHeartbeatRenew(reusableLease.kind)
+        ? reusableLease.expiresAt
+        : expiresAt;
 
-      if (leaseId) {
+      if (leaseId && !reusableLease) {
         this.database.connection
           .prepare(`
             INSERT INTO leases (
-              id, room_id, member_id, session_id, title, intent, branch, base_commit, mode, status,
+              id, room_id, member_id, session_id, title, intent, branch, base_commit, mode, kind, status,
               decision, override_reason, expires_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
           `)
           .run(
             leaseId,
@@ -560,6 +843,7 @@ export class AgentHubService {
             branch,
             baseCommit,
             mode,
+            kind,
             decision,
             overrideReason,
             expiresAt,
@@ -573,6 +857,10 @@ export class AgentHubService {
         for (const path of paths) {
           insertPath.run(leaseId, path.path, pathComparisonKey(path.path), path.risk, path.riskReason);
         }
+      } else if (leaseId && reusableLease && shouldHeartbeatRenew(reusableLease.kind)) {
+        this.database.connection.prepare(`
+          UPDATE leases SET expires_at = ?, updated_at = ?, decision = ? WHERE id = ?
+        `).run(effectiveExpiresAt, createdAt, decision, leaseId);
       }
 
       for (const conflict of conflicts) {
@@ -598,6 +886,23 @@ export class AgentHubService {
           );
       }
 
+      const releaseRequests = hasBlocking
+        ? this.ensureReleaseRequests(auth, {
+            sessionId,
+            requesterLeaseId: null,
+            title,
+            objective,
+            branch,
+            baseCommit,
+            kind,
+            mode,
+            requestedTtlMinutes: kind === "exclusive" ? durationMinutes : null,
+            paths: paths.map((path) => path.path),
+            conflicts,
+            createdAt,
+          })
+        : [];
+
       if (!canAcquire || !leaseId) {
         this.insertActivity({
           roomId: auth.room.id,
@@ -608,26 +913,35 @@ export class AgentHubService {
           entityId: null,
           summary:
             decision === "deny"
-              ? `${auth.member.displayName}'s lease was denied by an exclusive overlap.`
-              : `${auth.member.displayName}'s lease needs an override reason.`,
-          metadata: { title, decision, paths: paths.map((path) => path.path) },
+              ? `${auth.member.displayName}'s lease was denied by a blocking overlap.`
+              : `${auth.member.displayName}'s lease could not be acquired.`,
+          metadata: {
+            title,
+            kind,
+            decision,
+            paths: paths.map((path) => path.path),
+            releaseRequestIds: releaseRequests.map((request) => request.id),
+          },
           createdAt,
         });
-        return { acquired: false, decision, conflicts } as LeaseClaimResult;
+        return { acquired: false, decision, conflicts, releaseRequests } as LeaseClaimResult;
       }
 
       this.insertActivity({
         roomId: auth.room.id,
         actorMemberId: auth.member.id,
         actorName: auth.member.displayName,
-        type: "lease.acquired",
+          type: reusableLease ? "lease.reused" : "lease.acquired",
         entityType: "lease",
         entityId: leaseId,
-        summary: `${auth.member.displayName} registered ${mode} work: ${title}.`,
+        summary: reusableLease
+          ? `${auth.member.displayName} reused an existing ${kind} lease for ${title}.`
+          : `${auth.member.displayName} registered ${mode} work: ${title}.`,
         metadata: {
           paths: paths.map((path) => path.path),
           decision,
-          expiresAt,
+          kind,
+          expiresAt: effectiveExpiresAt,
           hasOverride: Boolean(overrideReason),
         },
         createdAt,
@@ -637,6 +951,7 @@ export class AgentHubService {
         decision,
         lease: this.requireLeaseById(leaseId),
         conflicts,
+        releaseRequests,
       } as LeaseClaimResult;
     });
   }
@@ -644,9 +959,7 @@ export class AgentHubService {
   renewLease(input: RenewLeaseInput): Lease {
     const auth = this.authenticateMemberToken(input.memberToken);
     const sessionId = this.activeOwnedSessionId(input.sessionId, auth);
-    const ttlMs = normalizeTtl(input.ttlMs);
     const updatedAt = this.timestamp();
-    const expiresAt = new Date(this.now().getTime() + ttlMs).toISOString();
     return this.database.transaction(() => {
       this.expireLeases(auth.room.id, false);
       const lease = this.requireOwnedLease(input.leaseId, auth);
@@ -654,6 +967,19 @@ export class AgentHubService {
       if (lease.status !== "active") {
         throw new AgentHubError("lease_not_active", "Only an active lease can be renewed.", 409);
       }
+      const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+      const requestedMinutes = input.ttlMinutes
+        ?? (input.ttlMs === undefined ? undefined : input.ttlMs / 60_000);
+      let durationMinutes: number;
+      try {
+        durationMinutes = resolveLeaseDurationMinutes(lease.kind, requestedMinutes, settings);
+      } catch (error) {
+        throw new AgentHubError(
+          "invalid_ttl",
+          error instanceof Error ? error.message : "The lease duration is invalid.",
+        );
+      }
+      const expiresAt = new Date(this.now().getTime() + durationMinutes * 60_000).toISOString();
       this.database.connection
         .prepare("UPDATE leases SET expires_at = ?, updated_at = ? WHERE id = ?")
         .run(expiresAt, updatedAt, lease.id);
@@ -665,7 +991,7 @@ export class AgentHubService {
         entityType: "lease",
         entityId: lease.id,
         summary: `${auth.member.displayName} renewed ${lease.title}.`,
-        metadata: { expiresAt },
+        metadata: { expiresAt, kind: lease.kind, durationMinutes, source: "explicit" },
         createdAt: updatedAt,
       });
       return this.requireLeaseById(lease.id);
@@ -674,6 +1000,182 @@ export class AgentHubService {
 
   releaseLease(input: ReleaseLeaseInput): Lease {
     return this.closeLease(input).lease;
+  }
+
+  listReleaseRequests(input: ListReleaseRequestsInput): ReleaseRequest[] {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    this.expireLeases(auth.room.id);
+    this.reconcileReleaseRequests(auth.room.id);
+    const status = input.status ?? "pending";
+    if (status !== "all" && !["pending", "approved", "rejected", "cancelled"].includes(status)) {
+      throw new AgentHubError("invalid_release_request_status", "The release request status is invalid.");
+    }
+    return this.listReleaseRequestsByRoom(auth.room.id, status);
+  }
+
+  resolveReleaseRequest(input: ResolveReleaseRequestInput): ReleaseRequest {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    if (input.decision !== "approve" && input.decision !== "reject") {
+      throw new AgentHubError(
+        "invalid_release_request_decision",
+        "Release request decision must be approve or reject.",
+      );
+    }
+    const reason = optionalString(input.reason, "Release request decision reason", 2000);
+    const resolvedAt = this.timestamp();
+    return this.database.transaction(() => {
+      this.expireLeases(auth.room.id, false);
+      const row = this.requireReleaseRequestRow(input.requestId, auth.room.id);
+      if (asString(row.holder_member_id) !== auth.member.id) {
+        throw new AgentHubError(
+          "release_request_forbidden",
+          "Only the holder of the conflicting lease can process this request.",
+          403,
+        );
+      }
+      if (asString(row.status) !== "pending") {
+        throw new AgentHubError(
+          "release_request_not_pending",
+          "Only a pending release request can be processed.",
+          409,
+        );
+      }
+      const conflictingLease = this.requireRoomLease(asString(row.conflicting_lease_id), auth.room.id);
+      if (conflictingLease.status !== "active") {
+        this.database.connection.prepare(`
+          UPDATE release_requests
+          SET status = 'cancelled', decision_member_id = ?, resolved_at = ?
+          WHERE id = ?
+        `).run(auth.member.id, resolvedAt, asString(row.id));
+        return this.mapReleaseRequest(this.requireReleaseRequestRow(asString(row.id), auth.room.id));
+      }
+
+      if (input.decision === "reject") {
+        this.database.connection.prepare(`
+          UPDATE release_requests
+          SET status = 'rejected', rejection_reason = ?, decision_member_id = ?, resolved_at = ?
+          WHERE id = ?
+        `).run(reason, auth.member.id, resolvedAt, asString(row.id));
+        this.auditRecord(
+          auth,
+          "release_request.rejected",
+          "release_request",
+          asString(row.id),
+          `${auth.member.displayName} declined a lease release request.`,
+          { conflictingLeaseId: conflictingLease.id, reason },
+        );
+        return this.mapReleaseRequest(this.requireReleaseRequestRow(asString(row.id), auth.room.id));
+      }
+
+      const requesterSessionId = nullableString(row.requester_session_id);
+      if (requesterSessionId) {
+        const requesterSession = this.database.connection.prepare(`
+          SELECT status FROM work_sessions WHERE id = ? AND member_id = ?
+        `).get(requesterSessionId, asString(row.requester_member_id)) as Row | undefined;
+        if (!requesterSession || asString(requesterSession.status) !== "active") {
+          this.database.connection.prepare(`
+            UPDATE release_requests
+            SET status = 'cancelled', decision_member_id = ?, resolved_at = ?
+            WHERE id = ?
+          `).run(auth.member.id, resolvedAt, asString(row.id));
+          return this.mapReleaseRequest(this.requireReleaseRequestRow(asString(row.id), auth.room.id));
+        }
+      }
+
+      const approvedRequestedPaths = parseStringArray(row.requested_paths_json);
+      const relatedBlockerRows = this.database.connection.prepare(`
+        SELECT DISTINCT conflicting_lease_id
+        FROM release_requests
+        WHERE transfer_key = ? AND status IN ('pending', 'approved')
+      `).all(asString(row.transfer_key)) as Row[];
+      const currentConflicts = this.findLeaseConflicts(
+        auth.room.id,
+        asString(row.requester_member_id),
+        requesterSessionId,
+        asString(row.requested_kind) as LeaseKind,
+        normalizePathList(approvedRequestedPaths),
+        this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName),
+        relatedBlockerRows.map((blocker) => asString(blocker.conflicting_lease_id)),
+      );
+      const newBlockingConflicts = currentConflicts.filter((conflict) => conflict.decision === "deny");
+      if (newBlockingConflicts.length > 0) {
+        throw new AgentHubError(
+          "release_request_conflict_changed",
+          "A new blocking lease now overlaps this request. The requester must retry so the new holder can approve the handover.",
+          409,
+          { conflicts: newBlockingConflicts },
+        );
+      }
+
+      const overlapPaths = parseOverlapPaths(row.overlap_paths_json);
+      if (conflictingLease.kind === "exclusive") {
+        this.endLeaseForTransfer(conflictingLease, resolvedAt, "Approved a release request for the manual exclusive lease.");
+        this.database.connection.prepare(`
+          UPDATE release_requests
+          SET status = 'cancelled', decision_member_id = ?, resolved_at = ?
+          WHERE conflicting_lease_id = ? AND status = 'pending' AND id <> ?
+        `).run(auth.member.id, resolvedAt, conflictingLease.id, asString(row.id));
+      } else {
+        const removePath = this.database.connection.prepare(
+          "DELETE FROM lease_paths WHERE lease_id = ? AND path_key = ?",
+        );
+        for (const existingPath of uniqueStrings(overlapPaths.map((path) => path.existingPath))) {
+          if (approvedRequestedPaths.some((requestedPath) => pathScopeCovers(requestedPath, existingPath))) {
+            removePath.run(conflictingLease.id, pathComparisonKey(existingPath));
+          }
+        }
+        const remaining = this.database.connection.prepare(
+          "SELECT COUNT(*) AS count FROM lease_paths WHERE lease_id = ?",
+        ).get(conflictingLease.id) as Row;
+        if (Number(remaining.count) === 0) {
+          this.endLeaseForTransfer(conflictingLease, resolvedAt, "All paths were handed over through an approved release request.");
+        } else {
+          this.database.connection.prepare("UPDATE leases SET updated_at = ? WHERE id = ?")
+            .run(resolvedAt, conflictingLease.id);
+        }
+      }
+
+      this.database.connection.prepare(`
+        UPDATE release_requests
+        SET status = 'approved', decision_member_id = ?, resolved_at = ?
+        WHERE id = ?
+      `).run(auth.member.id, resolvedAt, asString(row.id));
+      const deleteResolvedConflict = this.database.connection.prepare(`
+        DELETE FROM conflicts
+        WHERE room_id = ? AND requester_member_id = ? AND existing_lease_id = ?
+          AND requested_path = ? COLLATE NOCASE AND existing_path = ? COLLATE NOCASE
+      `);
+      for (const overlap of overlapPaths) {
+        deleteResolvedConflict.run(
+          auth.room.id,
+          asString(row.requester_member_id),
+          conflictingLease.id,
+          overlap.requestedPath,
+          overlap.existingPath,
+        );
+      }
+      const transferredLeaseId = this.transferApprovedRequest(row, resolvedAt);
+      if (transferredLeaseId) {
+        this.database.connection.prepare(`
+          UPDATE release_requests SET transferred_lease_id = ?
+          WHERE transfer_key = ? AND status = 'approved' AND transferred_lease_id IS NULL
+        `).run(transferredLeaseId, asString(row.transfer_key));
+      }
+      this.auditRecord(
+        auth,
+        "release_request.approved",
+        "release_request",
+        asString(row.id),
+        `${auth.member.displayName} approved a lease range handover.`,
+        {
+          conflictingLeaseId: conflictingLease.id,
+          conflictingLeaseKind: conflictingLease.kind,
+          transferredLeaseId,
+          requestedPaths: parseStringArray(row.requested_paths_json),
+        },
+      );
+      return this.mapReleaseRequest(this.requireReleaseRequestRow(asString(row.id), auth.room.id));
+    });
   }
 
   closeLease(input: CloseLeaseReportInput): { lease: Lease; records: ProjectRecord[] } {
@@ -799,6 +1301,8 @@ export class AgentHubService {
     const warnings: EditCheckResult["warnings"] = [];
     const coveredPaths: string[] = [];
     const uncoveredPaths: string[] = [];
+    const blockingConflicts: LeaseConflict[] = [];
+    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
     for (const candidate of paths) {
       const covered = ownedLeases.some((lease) =>
         lease.paths.some((scope) => pathScopeCovers(scope.path, candidate.path)),
@@ -818,7 +1322,10 @@ export class AgentHubService {
         auth.room.id,
         auth.member.id,
         sessionId,
+        "automatic",
         [candidate],
+        settings,
+        ownedLeases.map((lease) => lease.id),
       );
       for (const conflict of conflicts) {
         const issue = {
@@ -827,8 +1334,54 @@ export class AgentHubService {
           message: conflict.reason,
           conflict,
         };
-        if (conflict.severity === "blocking") blockers.push(issue);
+        if (conflict.severity === "blocking") {
+          blockers.push(issue);
+          blockingConflicts.push(conflict);
+        }
         else warnings.push(issue);
+      }
+    }
+    const requestLease = ownedLeases[0];
+    const releaseRequests = blockingConflicts.length > 0
+      ? this.database.transaction(() => this.ensureReleaseRequests(auth, {
+          sessionId,
+          requesterLeaseId: requestLease?.id ?? null,
+          title: requestLease?.title ?? "Agent write request",
+          objective: requestLease?.objective ?? "Write paths checked by the Agent Hub pre-write gate.",
+          branch: requestLease?.branch ?? null,
+          baseCommit: requestLease?.baseCommit ?? null,
+          kind: requestLease?.kind === "exclusive" ? "automatic" : requestLease?.kind ?? "automatic",
+          mode: "write",
+          requestedTtlMinutes: null,
+          paths: blockingConflicts.map((conflict) => conflict.requestedPath),
+          conflicts: blockingConflicts,
+          createdAt: this.timestamp(),
+        }))
+      : [];
+    let historicalImpacts: EditCheckResult["historicalImpacts"] = [];
+    let featureConfirmation: EditCheckResult["featureConfirmation"];
+    if (sessionId) {
+      const session = this.requireOwnedSession(sessionId, auth);
+      const historical = this.featureMemoryCall(() => this.featureMemory.checkHistoricalImpacts({
+        actor: this.featureActor(auth),
+        session: this.featureSession(session),
+        paths: paths.map((path) => path.path),
+        proposedEdits: input.proposedEdits,
+      }));
+      historicalImpacts = historical.impacts;
+      featureConfirmation = historical.confirmation;
+      if (!historical.authorized && historical.confirmation) {
+        for (const impact of historical.impacts) {
+          blockers.push({
+            code: "feature_confirmation_required",
+            path: impact.path,
+            message:
+              `Changing ${impact.featureName} may alter an established behavior contract. `
+              + "The current member must explicitly confirm this exact proposal before writing.",
+            featureImpact: impact,
+            confirmationId: historical.confirmation.id,
+          });
+        }
       }
     }
     return {
@@ -837,7 +1390,111 @@ export class AgentHubService {
       warnings,
       coveredPaths,
       uncoveredPaths,
+      historicalImpacts,
+      featureConfirmation,
+      releaseRequests,
     };
+  }
+
+  queryFeatureMemories(input: FeatureMemoryQueryInput): FeatureMemoryQueryResult {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    if (input.sessionId) {
+      const sessionId = this.activeOwnedSessionId(input.sessionId, auth);
+      if (!sessionId) throw new AgentHubError("feature_session_required", "An active session is required.", 409);
+    }
+    return this.featureMemoryCall(() => this.featureMemory.query(this.featureActor(auth), input));
+  }
+
+  getFeatureHistory(memberToken: string, featureId: string) {
+    const auth = this.authenticateMemberToken(memberToken);
+    return this.featureMemoryCall(() => this.featureMemory.history(this.featureActor(auth), featureId));
+  }
+
+  submitFeatureRevision(input: SubmitFeatureRevisionInput): FeatureRevision {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const session = this.requireOwnedSession(input.sessionId, auth);
+    const submittedTargetPaths = uniqueStrings(
+      input.targets.map((target) => target.path).filter((path): path is string => Boolean(path)),
+    );
+    const promotionEvidenceVerified = this.featurePromotionEvidenceVerified(session, {
+      branch: session.branch,
+      finalCommit: input.finalCommit,
+      gitEvidence: input.gitEvidence,
+      verifications: input.verifications ?? [],
+      paths: submittedTargetPaths,
+    });
+    const revision = this.featureMemoryCall(() => this.featureMemory.submitRevision(
+      this.featureActor(auth),
+      this.featureSession(session, promotionEvidenceVerified),
+      {
+        ...input,
+        gitEvidence: {
+          ...(input.gitEvidence ?? {}),
+          [FEATURE_SUBMITTED_TARGET_PATHS_KEY]: submittedTargetPaths,
+        },
+      },
+    ));
+    this.auditRecord(
+      auth,
+      "feature.revision.submitted",
+      "feature_revision",
+      revision.id,
+      `Submitted feature revision ${revision.revisionNumber} with status ${revision.status}.`,
+      { featureId: revision.featureId, relation: revision.relation, status: revision.status },
+    );
+    return revision;
+  }
+
+  rollbackFeatureRevision(input: RollbackFeatureRevisionInput): FeatureRevision {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const session = this.requireOwnedSession(input.sessionId, auth);
+    const submittedTargetPaths = this.featureRevisionTargetPaths(auth.room.id, input.targetRevisionId);
+    const promotionEvidenceVerified = this.featurePromotionEvidenceVerified(session, {
+      branch: session.branch,
+      finalCommit: input.finalCommit,
+      gitEvidence: input.gitEvidence,
+      verifications: input.verifications ?? [],
+      paths: submittedTargetPaths,
+    });
+    const revision = this.featureMemoryCall(() => this.featureMemory.rollbackRevision(
+      this.featureActor(auth),
+      this.featureSession(session, promotionEvidenceVerified),
+      {
+        ...input,
+        gitEvidence: {
+          ...(input.gitEvidence ?? {}),
+          [FEATURE_SUBMITTED_TARGET_PATHS_KEY]: submittedTargetPaths,
+        },
+      },
+    ));
+    this.auditRecord(
+      auth,
+      "feature.revision.rolled_back",
+      "feature_revision",
+      revision.id,
+      `Created rollback revision ${revision.revisionNumber}.`,
+      { featureId: revision.featureId, targetRevisionId: input.targetRevisionId, status: revision.status },
+    );
+    return revision;
+  }
+
+  resolveFeatureConfirmation(input: ResolveFeatureConfirmationInput) {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const session = this.requireOwnedSession(input.sessionId, auth);
+    const confirmation = this.featureMemoryCall(() => this.featureMemory.resolveConfirmation(
+      this.featureActor(auth),
+      this.featureSession(session),
+      input,
+    ));
+    this.auditRecord(
+      auth,
+      `feature.confirmation.${input.decision}`,
+      "feature_confirmation",
+      confirmation.id,
+      `${auth.member.displayName} ${input.decision} a historical feature change proposal.`,
+      { sessionId: session.id, proposalHash: confirmation.proposalHash },
+    );
+    return confirmation;
   }
 
   addContextEntry(input: AddContextEntryInput): ContextEntry {
@@ -1119,6 +1776,20 @@ export class AgentHubService {
 
   openSession(input: OpenSessionInput): WorkSession {
     const auth = this.authenticateMemberToken(input.memberToken);
+    const metadata = objectValue(input.metadata, "Session metadata");
+    const clientVersion = optionalString(
+      input.clientVersion ?? metadata.clientVersion,
+      "Client version",
+      80,
+    );
+    const protocolVersion = optionalVersionNumber(
+      input.protocolVersion ?? metadata.protocolVersion,
+      "Protocol version",
+    );
+    const schemaVersion = optionalVersionNumber(
+      input.schemaVersion ?? metadata.schemaVersion,
+      "Schema version",
+    );
     const session: WorkSession = {
       id: randomUUID(),
       roomId: auth.room.id,
@@ -1133,18 +1804,22 @@ export class AgentHubService {
       status: "active",
       branchEpoch: 1,
       frozenReason: null,
-      metadata: objectValue(input.metadata, "Session metadata"),
+      metadata,
       openedAt: this.timestamp(),
       lastSeenAt: this.timestamp(),
       closedAt: null,
+      clientVersion,
+      protocolVersion,
+      schemaVersion,
     };
     this.database.transaction(() => {
       this.database.connection
         .prepare(`
           INSERT INTO work_sessions (
             id, room_id, member_id, client_name, agent_name, repository, branch, worktree,
-            base_commit, task, status, metadata_json, opened_at, last_seen_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+            base_commit, task, status, metadata_json, opened_at, last_seen_at,
+            client_version, protocol_version, schema_version
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
         `)
         .run(
           session.id,
@@ -1160,7 +1835,18 @@ export class AgentHubService {
           json(session.metadata),
           session.openedAt,
           session.lastSeenAt,
+          session.clientVersion,
+          session.protocolVersion,
+          session.schemaVersion,
         );
+      this.database.connection.prepare(`
+        UPDATE members SET
+          client_version = COALESCE(?, client_version),
+          protocol_version = COALESCE(?, protocol_version),
+          schema_version = COALESCE(?, schema_version),
+          last_seen_at = ?
+        WHERE id = ?
+      `).run(clientVersion, protocolVersion, schemaVersion, session.lastSeenAt, auth.member.id);
       this.auditRecord(auth, "session.opened", "session", session.id, "Opened a local Agent session.", {
         clientName: session.clientName,
         agentName: session.agentName,
@@ -1169,6 +1855,63 @@ export class AgentHubService {
       });
     });
     return session;
+  }
+
+  heartbeatSession(input: HeartbeatSessionInput): {
+    session: WorkSession;
+    renewedLeases: Lease[];
+  } {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const session = this.requireOwnedSession(input.sessionId, auth);
+    if (session.status !== "active") {
+      throw new AgentHubError("session_not_active", "The work session is not active.", 409);
+    }
+    const clientVersion = optionalString(input.clientVersion, "Client version", 80);
+    const protocolVersion = optionalVersionNumber(input.protocolVersion, "Protocol version");
+    const schemaVersion = optionalVersionNumber(input.schemaVersion, "Schema version");
+    const heartbeatAt = this.timestamp();
+    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    const expiresAt = new Date(
+      this.now().getTime() + settings.automaticLeaseTtlMinutes * 60_000,
+    ).toISOString();
+    const renewedLeaseIds: string[] = [];
+    this.database.transaction(() => {
+      this.expireLeases(auth.room.id, false);
+      this.database.connection.prepare(`
+        UPDATE work_sessions SET
+          last_seen_at = ?,
+          client_version = COALESCE(?, client_version),
+          protocol_version = COALESCE(?, protocol_version),
+          schema_version = COALESCE(?, schema_version)
+        WHERE id = ?
+      `).run(heartbeatAt, clientVersion, protocolVersion, schemaVersion, session.id);
+      this.database.connection.prepare(`
+        UPDATE members SET
+          last_seen_at = ?,
+          client_version = COALESCE(?, client_version),
+          protocol_version = COALESCE(?, protocol_version),
+          schema_version = COALESCE(?, schema_version)
+        WHERE id = ?
+      `).run(heartbeatAt, clientVersion, protocolVersion, schemaVersion, auth.member.id);
+      const leases = this.database.connection.prepare(`
+        SELECT id, kind FROM leases
+        WHERE member_id = ? AND status = 'active'
+          AND (session_id = ? OR (session_id IS NULL AND kind = 'standard'))
+      `).all(auth.member.id, session.id) as Row[];
+      const renew = this.database.connection.prepare(
+        "UPDATE leases SET expires_at = ?, updated_at = ? WHERE id = ?",
+      );
+      for (const lease of leases) {
+        const kind = asString(lease.kind) as LeaseKind;
+        if (!shouldHeartbeatRenew(kind)) continue;
+        renew.run(expiresAt, heartbeatAt, asString(lease.id));
+        renewedLeaseIds.push(asString(lease.id));
+      }
+    });
+    return {
+      session: this.requireSessionById(session.id),
+      renewedLeases: renewedLeaseIds.map((id) => this.requireLeaseById(id)),
+    };
   }
 
   syncSessionBranch(input: SyncSessionBranchInput): WorkSession {
@@ -1186,10 +1929,14 @@ export class AgentHubService {
     const reason = `Branch changed from ${session.branch ?? "(unknown)"} to ${branch ?? "(detached)"}; re-baselining is required.`;
     this.database.transaction(() => {
       this.database.connection.prepare("UPDATE work_sessions SET branch = ?, base_commit = ?, frozen_reason = ?, last_seen_at = ? WHERE id = ?").run(branch, baseCommit, reason, now, session.id);
-      const leases = this.database.connection.prepare("SELECT id, title FROM leases WHERE session_id = ? AND status = 'active'").all(session.id) as Row[];
+      const leases = this.database.connection.prepare("SELECT id, title FROM leases WHERE session_id = ? AND status = 'active' AND kind <> 'exclusive'").all(session.id) as Row[];
       for (const lease of leases) {
         this.database.connection.prepare("UPDATE leases SET status = 'cancelled', completed_at = ?, updated_at = ?, completion_summary = ? WHERE id = ?").run(now, now, reason, asString(lease.id));
       }
+      this.database.connection.prepare(`
+        UPDATE release_requests SET status = 'cancelled', resolved_at = ?
+        WHERE requester_session_id = ? AND status = 'pending'
+      `).run(now, session.id);
       this.auditRecord(auth, "session.branch_changed", "session", session.id, reason, { previousBranch: session.branch, branch, previousBaseCommit: session.baseCommit, baseCommit, cancelledLeaseCount: leases.length });
     });
     throw new AgentHubError("branch_changed", reason, 409, { branch, baseCommit, sessionId: session.id });
@@ -1273,6 +2020,7 @@ export class AgentHubService {
         systems: scan.systems,
       });
     });
+    this.promoteRecordedSessionCandidates(auth, this.requireSessionById(session.id), scan);
     return scan;
   }
 
@@ -1283,11 +2031,12 @@ export class AgentHubService {
     const summary = optionalString(input.summary, "Session summary", 4000);
     this.database.transaction(() => {
       this.expireLeases(auth.room.id, false);
+      this.featureMemory.expireSessionConfirmations(session.id, closedAt);
       const activeLeases = this.database.connection
         .prepare(`
           SELECT id, title
           FROM leases
-          WHERE session_id = ? AND status = 'active'
+          WHERE session_id = ? AND status = 'active' AND kind <> 'exclusive'
         `)
         .all(session.id) as Row[];
       const cancellationSummary = summary
@@ -1333,58 +2082,518 @@ export class AgentHubService {
     };
   }
 
+  private readRoomSettings(
+    roomId: string,
+    fallbackUpdatedAt: string,
+    fallbackUpdatedBy: string,
+  ): RoomSettings {
+    const row = this.database.connection.prepare(`
+      SELECT r.blocking_protection_enabled, r.automatic_lease_ttl_minutes,
+        r.maximum_exclusive_lease_minutes, r.risk_policy_version,
+        r.risk_policy_rules_json, r.settings_updated_at,
+        updater.name AS settings_updated_by_name
+      FROM rooms r
+      LEFT JOIN members updater ON updater.id = r.settings_updated_by
+      WHERE r.id = ?
+    `).get(roomId) as Row | undefined;
+    if (!row) throw new AgentHubError("room_not_found", "Room not found.", 404);
+    let riskRules = createDefaultRiskPolicy().rules;
+    try {
+      const parsed: unknown = JSON.parse(asString(row.risk_policy_rules_json));
+      if (Array.isArray(parsed)) riskRules = normalizeRiskPolicyRules(parsed as RiskPolicyRule[]);
+    } catch {
+      riskRules = createDefaultRiskPolicy().rules;
+    }
+    const storedTtl = Number(row.automatic_lease_ttl_minutes ?? DEFAULT_AUTOMATIC_TTL_MINUTES);
+    const automaticLeaseTtlMinutes = AUTOMATIC_TTL_OPTIONS.includes(
+      storedTtl as (typeof AUTOMATIC_TTL_OPTIONS)[number],
+    )
+      ? storedTtl as RoomSettings["automaticLeaseTtlMinutes"]
+      : DEFAULT_AUTOMATIC_TTL_MINUTES;
+    const storedMaximum = Number(
+      row.maximum_exclusive_lease_minutes ?? DEFAULT_MAXIMUM_EXCLUSIVE_LEASE_MINUTES,
+    );
+    const maximumExclusiveLeaseMinutes = Number.isInteger(storedMaximum) && storedMaximum >= 5
+      ? Math.min(7 * 24 * 60, storedMaximum)
+      : DEFAULT_MAXIMUM_EXCLUSIVE_LEASE_MINUTES;
+    const blockingProtectionEnabled = Number(row.blocking_protection_enabled ?? 1) !== 0;
+    return {
+      autoLockAfterAutoClaim: blockingProtectionEnabled,
+      blockingProtectionEnabled,
+      automaticLeaseTtlMinutes,
+      maximumExclusiveLeaseMinutes,
+      riskPolicyVersion: Math.max(1, Math.trunc(Number(row.risk_policy_version ?? 1))),
+      riskRules,
+      updatedAt: nullableString(row.settings_updated_at) ?? fallbackUpdatedAt,
+      updatedBy: nullableString(row.settings_updated_by_name) ?? fallbackUpdatedBy,
+    };
+  }
+
+  private ensureReleaseRequests(
+    auth: AuthenticatedMember,
+    input: {
+      sessionId: string | null;
+      requesterLeaseId: string | null;
+      title: string;
+      objective: string | null;
+      branch: string | null;
+      baseCommit: string | null;
+      kind: LeaseKind;
+      mode: LeaseMode;
+      requestedTtlMinutes: number | null;
+      paths: string[];
+      conflicts: LeaseConflict[];
+      createdAt: string;
+    },
+  ): ReleaseRequest[] {
+    const blocking = input.conflicts.filter(
+      (conflict) => conflict.decision === "deny" && conflict.memberId !== auth.member.id,
+    );
+    const grouped = new Map<string, LeaseConflict[]>();
+    for (const conflict of blocking) {
+      grouped.set(conflict.leaseId, [...(grouped.get(conflict.leaseId) ?? []), conflict]);
+    }
+    const normalizedPaths = uniqueStrings(input.paths.map((path) => normalizePathList([path])[0].path));
+    const transferKey = createHash("sha256").update(json({
+      roomId: auth.room.id,
+      requesterMemberId: auth.member.id,
+      requesterSessionId: input.sessionId,
+      title: input.title,
+      kind: input.kind,
+      mode: input.mode,
+      branch: input.branch,
+      baseCommit: input.baseCommit,
+      paths: normalizedPaths.map(pathComparisonKey).sort(),
+    })).digest("hex");
+    const requests: ReleaseRequest[] = [];
+    for (const [leaseId, conflicts] of grouped) {
+      const overlapPaths = conflicts.map((conflict) => ({
+        requestedPath: conflict.requestedPath,
+        existingPath: conflict.existingPath,
+      }));
+      const requestedPaths = uniqueStrings(conflicts.map((conflict) => conflict.requestedPath));
+      const reason = uniqueStrings(conflicts.map((conflict) => conflict.reason)).join("\n");
+      const dedupeKey = createHash("sha256").update(json({
+        transferKey,
+        leaseId,
+        overlapPaths: overlapPaths
+          .map((path) => [pathComparisonKey(path.requestedPath), pathComparisonKey(path.existingPath)])
+          .sort(),
+      })).digest("hex");
+      const pending = this.database.connection.prepare(`
+        SELECT id FROM release_requests WHERE dedupe_key = ? AND status = 'pending'
+      `).get(dedupeKey) as Row | undefined;
+      if (pending) {
+        this.database.connection.prepare(`
+          UPDATE release_requests SET
+            last_requested_at = ?, occurrence_count = occurrence_count + 1,
+            reason = ?, requested_paths_json = ?, overlap_paths_json = ?
+          WHERE id = ?
+        `).run(
+          input.createdAt,
+          reason,
+          json(requestedPaths),
+          json(overlapPaths),
+          asString(pending.id),
+        );
+        requests.push(this.mapReleaseRequest(
+          this.requireReleaseRequestRow(asString(pending.id), auth.room.id),
+        ));
+        continue;
+      }
+      const recent = this.database.connection.prepare(`
+        SELECT id, last_requested_at FROM release_requests
+        WHERE dedupe_key = ? ORDER BY last_requested_at DESC LIMIT 1
+      `).get(dedupeKey) as Row | undefined;
+      if (
+        recent
+        && Date.parse(asString(recent.last_requested_at))
+          > this.now().getTime() - RELEASE_REQUEST_COOLDOWN_MS
+      ) {
+        requests.push(this.mapReleaseRequest(
+          this.requireReleaseRequestRow(asString(recent.id), auth.room.id),
+        ));
+        continue;
+      }
+      const id = randomUUID();
+      this.database.connection.prepare(`
+        INSERT INTO release_requests (
+          id, room_id, requester_member_id, requester_session_id, requester_lease_id,
+          conflicting_lease_id, request_title, request_objective, requested_kind,
+          requested_mode, requested_branch, requested_base_commit, requested_ttl_minutes,
+          requested_paths_json, overlap_paths_json, reason, transfer_key, dedupe_key,
+          status, requested_at, last_requested_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+      `).run(
+        id,
+        auth.room.id,
+        auth.member.id,
+        input.sessionId,
+        input.requesterLeaseId,
+        leaseId,
+        input.title,
+        input.objective,
+        input.kind,
+        input.mode,
+        input.branch,
+        input.baseCommit,
+        input.requestedTtlMinutes,
+        json(requestedPaths),
+        json(overlapPaths),
+        reason,
+        transferKey,
+        dedupeKey,
+        input.createdAt,
+        input.createdAt,
+      );
+      this.insertActivity({
+        roomId: auth.room.id,
+        actorMemberId: auth.member.id,
+        actorName: auth.member.displayName,
+        type: "release_request.created",
+        entityType: "release_request",
+        entityId: id,
+        summary: `${auth.member.displayName} requested a blocking lease range handover.`,
+        metadata: { conflictingLeaseId: leaseId, requestedPaths, requestedKind: input.kind },
+        createdAt: input.createdAt,
+      });
+      requests.push(this.mapReleaseRequest(this.requireReleaseRequestRow(id, auth.room.id)));
+    }
+    return requests;
+  }
+
+  private requireReleaseRequestRow(id: string, roomId: string): Row {
+    const row = this.database.connection.prepare(`
+      SELECT rr.*, requester.name AS requester_name,
+        holder.id AS holder_member_id, holder.name AS holder_name,
+        lease.title AS conflicting_lease_title, lease.kind AS conflicting_lease_kind,
+        lease.expires_at AS holder_lease_expires_at
+      FROM release_requests rr
+      JOIN members requester ON requester.id = rr.requester_member_id
+      JOIN leases lease ON lease.id = rr.conflicting_lease_id
+      JOIN members holder ON holder.id = lease.member_id
+      WHERE rr.id = ? AND rr.room_id = ?
+    `).get(requiredString(id, "Release request id", 100), roomId) as Row | undefined;
+    if (!row) throw new AgentHubError("release_request_not_found", "Release request not found.", 404);
+    return row;
+  }
+
+  private listReleaseRequestsByRoom(
+    roomId: string,
+    status: ListReleaseRequestsInput["status"] = "pending",
+  ): ReleaseRequest[] {
+    const rows = this.database.connection.prepare(`
+      SELECT rr.*, requester.name AS requester_name,
+        holder.id AS holder_member_id, holder.name AS holder_name,
+        lease.title AS conflicting_lease_title, lease.kind AS conflicting_lease_kind,
+        lease.expires_at AS holder_lease_expires_at
+      FROM release_requests rr
+      JOIN members requester ON requester.id = rr.requester_member_id
+      JOIN leases lease ON lease.id = rr.conflicting_lease_id
+      JOIN members holder ON holder.id = lease.member_id
+      WHERE rr.room_id = ? ${status === "all" ? "" : "AND rr.status = ?"}
+      ORDER BY rr.last_requested_at DESC, rr.id DESC
+      LIMIT 500
+    `).all(...(status === "all" ? [roomId] : [roomId, status ?? "pending"])) as Row[];
+    return rows.map((row) => this.mapReleaseRequest(row));
+  }
+
+  private mapReleaseRequest(row: Row): ReleaseRequest {
+    return {
+      id: asString(row.id),
+      roomId: asString(row.room_id),
+      requesterMemberId: asString(row.requester_member_id),
+      requesterName: asString(row.requester_name),
+      requesterSessionId: nullableString(row.requester_session_id),
+      requesterLeaseId: nullableString(row.requester_lease_id),
+      holderMemberId: asString(row.holder_member_id),
+      holderName: asString(row.holder_name),
+      conflictingLeaseId: asString(row.conflicting_lease_id),
+      conflictingLeaseTitle: asString(row.conflicting_lease_title),
+      conflictingLeaseKind: asString(row.conflicting_lease_kind) as LeaseKind,
+      requestTitle: asString(row.request_title),
+      requestObjective: nullableString(row.request_objective),
+      requestedKind: asString(row.requested_kind) as LeaseKind,
+      requestedMode: asString(row.requested_mode) as LeaseMode,
+      requestedPaths: parseStringArray(row.requested_paths_json),
+      overlapPaths: parseOverlapPaths(row.overlap_paths_json),
+      reason: asString(row.reason),
+      status: asString(row.status) as ReleaseRequest["status"],
+      rejectionReason: nullableString(row.rejection_reason),
+      transferredLeaseId: nullableString(row.transferred_lease_id),
+      occurrenceCount: Math.max(1, Math.trunc(Number(row.occurrence_count ?? 1))),
+      requestedAt: asString(row.requested_at),
+      lastRequestedAt: asString(row.last_requested_at),
+      resolvedAt: nullableString(row.resolved_at),
+      holderLeaseExpiresAt: asString(row.holder_lease_expires_at),
+    };
+  }
+
+  private reconcileReleaseRequests(roomId: string): void {
+    const rows = this.database.connection.prepare(`
+      SELECT rr.id, rr.overlap_paths_json, l.status AS lease_status, l.expires_at
+      FROM release_requests rr
+      JOIN leases l ON l.id = rr.conflicting_lease_id
+      WHERE rr.room_id = ? AND rr.status = 'pending'
+    `).all(roomId) as Row[];
+    const now = this.timestamp();
+    const cancel = this.database.connection.prepare(`
+      UPDATE release_requests SET status = 'cancelled', resolved_at = ? WHERE id = ?
+    `);
+    for (const row of rows) {
+      if (asString(row.lease_status) !== "active" || asString(row.expires_at) <= now) {
+        cancel.run(now, asString(row.id));
+        continue;
+      }
+      const currentPaths = new Set((this.database.connection.prepare(`
+        SELECT path_key FROM lease_paths
+        WHERE lease_id = (SELECT conflicting_lease_id FROM release_requests WHERE id = ?)
+      `).all(asString(row.id)) as Row[]).map((path) => asString(path.path_key)));
+      const stillOverlaps = parseOverlapPaths(row.overlap_paths_json)
+        .some((path) => currentPaths.has(pathComparisonKey(path.existingPath)));
+      if (!stillOverlaps) cancel.run(now, asString(row.id));
+    }
+  }
+
+  private endLeaseForTransfer(lease: Lease, completedAt: string, summary: string): void {
+    this.database.connection.prepare(`
+      UPDATE leases SET status = 'cancelled', completed_at = ?, updated_at = ?,
+        completion_summary = ? WHERE id = ?
+    `).run(completedAt, completedAt, summary, lease.id);
+  }
+
+  private transferApprovedRequest(row: Row, transferredAt: string): string | null {
+    const requestedKind = asString(row.requested_kind) as LeaseKind;
+    const transferKey = asString(row.transfer_key);
+    let requestedPaths = parseStringArray(row.requested_paths_json);
+    if (requestedKind === "exclusive") {
+      const pending = this.database.connection.prepare(`
+        SELECT 1 AS found FROM release_requests
+        WHERE transfer_key = ? AND status = 'pending' LIMIT 1
+      `).get(transferKey);
+      if (pending) return null;
+      const siblings = this.database.connection.prepare(`
+        SELECT requested_paths_json FROM release_requests
+        WHERE transfer_key = ? AND status = 'approved'
+      `).all(transferKey) as Row[];
+      requestedPaths = uniqueStrings(siblings.flatMap((sibling) => parseStringArray(sibling.requested_paths_json)));
+    }
+    const normalizedPaths = normalizePathList(requestedPaths);
+    const requesterMemberId = asString(row.requester_member_id);
+    const requesterSessionId = nullableString(row.requester_session_id);
+    if (requesterSessionId) {
+      const session = this.database.connection.prepare(`
+        SELECT status FROM work_sessions WHERE id = ? AND member_id = ?
+      `).get(requesterSessionId, requesterMemberId) as Row | undefined;
+      if (!session || asString(session.status) !== "active") return null;
+    }
+    const settings = this.readRoomSettings(
+      asString(row.room_id),
+      transferredAt,
+      asString(row.requester_name),
+    );
+    if (requestedKind === "exclusive") {
+      const conflicts = this.findLeaseConflicts(
+        asString(row.room_id),
+        requesterMemberId,
+        requesterSessionId,
+        requestedKind,
+        normalizedPaths,
+        settings,
+      );
+      if (conflicts.some((conflict) => conflict.decision === "deny")) return null;
+    }
+
+    const requesterLeaseId = nullableString(row.requester_lease_id);
+    let targetLease = requesterLeaseId
+      ? this.database.connection.prepare(`
+          SELECT id FROM leases
+          WHERE id = ? AND member_id = ? AND room_id = ? AND status = 'active'
+        `).get(requesterLeaseId, requesterMemberId, asString(row.room_id)) as Row | undefined
+      : undefined;
+    if (!targetLease) {
+      targetLease = this.database.connection.prepare(`
+        SELECT l.id FROM release_requests rr
+        JOIN leases l ON l.id = rr.transferred_lease_id
+        WHERE rr.transfer_key = ? AND l.status = 'active'
+        ORDER BY rr.resolved_at DESC LIMIT 1
+      `).get(transferKey) as Row | undefined;
+    }
+    let leaseId = targetLease ? asString(targetLease.id) : randomUUID();
+    let durationMinutes: number;
+    try {
+      durationMinutes = resolveLeaseDurationMinutes(
+        requestedKind,
+        nullableNumber(row.requested_ttl_minutes) ?? undefined,
+        settings,
+      );
+    } catch {
+      durationMinutes = requestedKind === "exclusive"
+        ? Math.min(60, settings.maximumExclusiveLeaseMinutes)
+        : settings.automaticLeaseTtlMinutes;
+    }
+    const expiresAt = new Date(this.now().getTime() + durationMinutes * 60_000).toISOString();
+    if (!targetLease) {
+      this.database.connection.prepare(`
+        INSERT INTO leases (
+          id, room_id, member_id, session_id, title, intent, branch, base_commit,
+          mode, kind, status, decision, override_reason, expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'allow', ?, ?, ?, ?)
+      `).run(
+        leaseId,
+        asString(row.room_id),
+        requesterMemberId,
+        requesterSessionId,
+        asString(row.request_title),
+        nullableString(row.request_objective) ?? "",
+        nullableString(row.requested_branch),
+        nullableString(row.requested_base_commit),
+        asString(row.requested_mode),
+        requestedKind,
+        `Transferred by approved release request ${asString(row.id)}.`,
+        expiresAt,
+        transferredAt,
+        transferredAt,
+      );
+    } else if (requestedKind !== "exclusive") {
+      this.database.connection.prepare(`
+        UPDATE leases SET expires_at = ?, updated_at = ? WHERE id = ?
+      `).run(expiresAt, transferredAt, leaseId);
+    }
+    const insertPath = this.database.connection.prepare(`
+      INSERT OR IGNORE INTO lease_paths (lease_id, path, path_key, risk, risk_reason)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    for (const path of normalizedPaths) {
+      insertPath.run(leaseId, path.path, pathComparisonKey(path.path), path.risk, path.riskReason);
+    }
+    this.insertActivity({
+      roomId: asString(row.room_id),
+      actorMemberId: null,
+      actorName: null,
+      type: "lease.transferred",
+      entityType: "lease",
+      entityId: leaseId,
+      summary: "Approved conflict paths were atomically registered for the requester.",
+      metadata: {
+        releaseRequestId: asString(row.id),
+        requesterMemberId,
+        requestedKind,
+        paths: normalizedPaths.map((path) => path.path),
+      },
+      createdAt: transferredAt,
+    });
+    return leaseId;
+  }
+
   private findLeaseConflicts(
     roomId: string,
     requesterMemberId: string,
     requesterSessionId: string | null,
+    requestedKind: LeaseKind,
     requestedPaths: ReturnType<typeof normalizePathList>,
+    settings: RoomSettings,
+    excludedLeaseIds: string[] = [],
   ): LeaseConflict[] {
     const rows = this.database.connection
       .prepare(`
         SELECT
-          l.id AS lease_id, l.member_id, l.expires_at,
-          m.name AS member_name, lp.path AS existing_path,
-          lp.risk AS existing_risk, lp.risk_reason
+          l.id AS lease_id, l.member_id, l.session_id, l.kind, l.expires_at,
+          m.name AS member_name, lp.path AS existing_path
         FROM leases l
         JOIN members m ON m.id = l.member_id
         JOIN lease_paths lp ON lp.lease_id = l.id
         WHERE l.room_id = ? AND l.status = 'active' AND l.expires_at > ?
           AND l.mode = 'write'
-          AND NOT (l.member_id = ? AND l.session_id IS ?)
       `)
-      .all(
-        roomId,
-        this.timestamp(),
-        requesterMemberId,
-        requesterSessionId,
-      ) as Row[];
-    const conflicts: LeaseConflict[] = [];
-    const seen = new Set<string>();
-    for (const requestedPath of requestedPaths) {
-      for (const row of rows) {
-        const existingPath = asString(row.existing_path);
-        if (!pathsOverlap(requestedPath.path, existingPath)) continue;
-        const key = `${asString(row.lease_id)}\0${pathComparisonKey(requestedPath.path)}\0${pathComparisonKey(existingPath)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const blocking = requestedPath.risk === "high" || asString(row.existing_risk) === "high";
-        conflicts.push({
-          id: randomUUID(),
-          leaseId: asString(row.lease_id),
-          memberId: asString(row.member_id),
-          memberName: asString(row.member_name),
-          requestedPath: requestedPath.path,
-          existingPath,
-          severity: blocking ? "blocking" : "warning",
-          decision: blocking ? "deny" : "warn",
-          reason: blocking
-            ? "The overlap includes a Unity, configuration, or Luban scope that requires exclusive access."
-            : "Ordinary source write scopes overlap; provide an explicit override reason to continue.",
-          expiresAt: asString(row.expires_at),
-        });
-      }
+      .all(roomId, this.timestamp()) as Row[];
+    const excluded = new Set(excludedLeaseIds);
+    const leases = new Map<string, {
+      leaseId: string;
+      memberId: string;
+      memberName: string;
+      sessionId: string | null;
+      kind: LeaseKind;
+      paths: string[];
+      expiresAt: string;
+    }>();
+    for (const row of rows) {
+      const leaseId = asString(row.lease_id);
+      if (excluded.has(leaseId)) continue;
+      const lease = leases.get(leaseId) ?? {
+        leaseId,
+        memberId: asString(row.member_id),
+        memberName: asString(row.member_name),
+        sessionId: nullableString(row.session_id),
+        kind: asString(row.kind) as LeaseKind,
+        paths: [],
+        expiresAt: asString(row.expires_at),
+      };
+      lease.paths.push(asString(row.existing_path));
+      leases.set(leaseId, lease);
     }
-    return conflicts;
+    const policy: RiskPolicy = {
+      version: settings.riskPolicyVersion,
+      rules: settings.riskRules,
+    };
+    const approvedCarveOutRows = this.database.connection.prepare(`
+      SELECT
+        rr.conflicting_lease_id, rr.requester_session_id, rr.requested_paths_json,
+        rr.transferred_lease_id, transferred.member_id AS transferred_member_id,
+        transferred.session_id AS transferred_session_id,
+        transferred.kind AS transferred_kind, transferred_path.path AS transferred_path
+      FROM release_requests rr
+      JOIN leases transferred ON transferred.id = rr.transferred_lease_id
+      JOIN lease_paths transferred_path ON transferred_path.lease_id = transferred.id
+      WHERE rr.room_id = ? AND rr.status = 'approved'
+        AND rr.requester_member_id = ?
+        AND transferred.room_id = rr.room_id
+        AND transferred.member_id = rr.requester_member_id
+        AND transferred.status = 'active' AND transferred.expires_at > ?
+    `).all(roomId, requesterMemberId, this.timestamp()) as Row[];
+    const approvedCarveOuts = approvedCarveOutRows.flatMap((row) => {
+      const approvedSessionId = nullableString(row.requester_session_id);
+      if (approvedSessionId !== null && approvedSessionId !== requesterSessionId) return [];
+      if (asString(row.transferred_member_id) !== requesterMemberId) return [];
+      const transferredSessionId = nullableString(row.transferred_session_id);
+      const transferredKind = asString(row.transferred_kind) as LeaseKind;
+      const sessionCompatible = transferredSessionId === requesterSessionId
+        || (transferredSessionId === null && transferredKind !== "automatic");
+      if (!sessionCompatible) return [];
+      return [{
+        conflictingLeaseId: asString(row.conflicting_lease_id),
+        requestedPaths: parseStringArray(row.requested_paths_json),
+        transferredPaths: [asString(row.transferred_path)],
+      }];
+    });
+    const conflicts = evaluateRealtimeOverlaps(
+      {
+        memberId: requesterMemberId,
+        sessionId: requesterSessionId,
+        kind: requestedKind,
+        paths: requestedPaths.map((path) => path.path),
+      },
+      [...leases.values()],
+      policy,
+      settings.blockingProtectionEnabled,
+    ).filter((conflict) => !approvedCarveOuts.some((carveOut) =>
+      carveOut.conflictingLeaseId === conflict.leaseId
+      && carveOut.requestedPaths.some((path) => pathScopeCovers(path, conflict.requestedPath))
+      && carveOut.transferredPaths.some((path) => pathScopeCovers(path, conflict.requestedPath)),
+    ));
+    return conflicts.map((conflict) => ({
+      id: randomUUID(),
+      leaseId: conflict.leaseId,
+      memberId: conflict.memberId,
+      memberName: conflict.memberName,
+      requestedPath: conflict.requestedPath,
+      existingPath: conflict.existingPath,
+      severity: conflict.severity,
+      decision: conflict.decision,
+      reason: conflict.reason,
+      expiresAt: conflict.expiresAt,
+      existingLeaseKind: conflict.existingLeaseKind,
+    }));
   }
 
   private expireLeases(roomId: string, ownTransaction = true): void {
@@ -1402,6 +2611,11 @@ export class AgentHubService {
       );
       for (const row of rows) {
         update.run(expiredAt, expiredAt, asString(row.id));
+        this.database.connection.prepare(`
+          UPDATE release_requests
+          SET status = 'cancelled', resolved_at = ?
+          WHERE conflicting_lease_id = ? AND status = 'pending'
+        `).run(expiredAt, asString(row.id));
         this.insertActivity({
           roomId,
           actorMemberId: null,
@@ -1423,7 +2637,8 @@ export class AgentHubService {
     const rows = this.database.connection
       .prepare(`
         SELECT id AS member_id, room_id, name AS member_name, role, client_name,
-          created_at AS member_created_at, last_seen_at, is_admin, removed_at
+          created_at AS member_created_at, last_seen_at, is_admin, removed_at,
+          client_version, protocol_version, schema_version
         FROM members WHERE room_id = ? AND removed_at IS NULL ORDER BY created_at ASC
       `)
       .all(roomId) as Row[];
@@ -1522,12 +2737,16 @@ export class AgentHubService {
   private listConflicts(roomId: string): LeaseConflict[] {
     const rows = this.database.connection
       .prepare(`
-        SELECT c.*, m.id AS existing_member_id, m.name AS member_name, l.expires_at
+        SELECT c.*, m.id AS existing_member_id, m.name AS member_name, l.expires_at, l.kind AS existing_lease_kind
         FROM conflicts c
         JOIN leases l ON l.id = c.existing_lease_id
         JOIN members m ON m.id = l.member_id
         WHERE c.room_id = ?
           AND l.status = 'active' AND l.expires_at > ?
+          AND EXISTS (
+            SELECT 1 FROM lease_paths lp
+            WHERE lp.lease_id = l.id AND lp.path = c.existing_path COLLATE NOCASE
+          )
         ORDER BY c.created_at DESC LIMIT 200
       `)
       .all(roomId, this.timestamp()) as Row[];
@@ -1542,6 +2761,7 @@ export class AgentHubService {
       decision: asString(row.decision) as LeaseConflict["decision"],
       reason: asString(row.reason),
       expiresAt: asString(row.expires_at),
+      existingLeaseKind: asString(row.existing_lease_kind) as LeaseKind,
     }));
   }
 
@@ -1666,7 +2886,8 @@ export class AgentHubService {
     const row = this.database.connection
       .prepare(`
         SELECT id AS member_id, room_id, name AS member_name, role, client_name,
-          created_at AS member_created_at, last_seen_at, is_admin, removed_at
+          created_at AS member_created_at, last_seen_at, is_admin, removed_at,
+          client_version, protocol_version, schema_version
         FROM members WHERE id = ?
       `)
       .get(id) as Row | undefined;
@@ -1749,6 +2970,166 @@ export class AgentHubService {
     return session.id;
   }
 
+  private featureActor(auth: AuthenticatedMember): FeatureMemoryActor {
+    return {
+      roomId: auth.room.id,
+      memberId: auth.member.id,
+      memberName: auth.member.displayName,
+      defaultBranch: auth.room.defaultBranch,
+    };
+  }
+
+  private featureSession(
+    session: WorkSession,
+    promotionEvidenceVerified = false,
+  ): FeatureMemorySession {
+    return {
+      id: session.id,
+      memberId: session.memberId,
+      branch: session.branch,
+      baseCommit: session.baseCommit,
+      status: session.status,
+      promotionEvidenceVerified,
+    };
+  }
+
+  private featurePromotionEvidenceVerified(
+    session: WorkSession,
+    claims: FeaturePromotionClaims,
+  ): boolean {
+    if (session.status !== "active" || !claims.finalCommit || claims.verifications.length === 0) return false;
+    if (claims.verifications.some((verification) => verification.result !== "passed")) return false;
+
+    const scanRow = this.database.connection.prepare(`
+      SELECT * FROM local_scans
+      WHERE session_id = ?
+      ORDER BY scanned_at DESC
+    `).all(session.id).find((row) => featureEvidenceAttestation(mapLocalScan(row as Row).metadata)) as Row | undefined;
+    if (!scanRow) return false;
+    const scan = mapLocalScan(scanRow);
+    const evidence = featureEvidenceAttestation(scan.metadata);
+    if (!evidence) return false;
+
+    if (!sameText(evidence.finalCommit, claims.finalCommit)) return false;
+    if (!sameText(evidence.branch, claims.branch)) return false;
+    if (!sameText(scan.branch, evidence.branch) || !sameText(session.branch, evidence.branch)) return false;
+    if (!evidence.committed || evidence.uncommittedPathCount > 0 || evidence.changedPathCount === 0) return false;
+    if (evidence.committedPathCount !== evidence.changedPathCount) return false;
+    if (scan.changedPaths.length !== evidence.changedPathCount) return false;
+    if (digestEvidenceSet(scan.changedPaths, pathComparisonKey) !== evidence.changedPathsSha256) return false;
+    if (!evidence.finalCommitIncluded) return false;
+    if (!gitClaimsMatchAttestation(claims.gitEvidence ?? {}, evidence, scan.changedPaths)) return false;
+
+    const claimedPaths = uniqueStrings(claims.paths);
+    if (claimedPaths.length === 0) return false;
+    if (!claimedPaths.every((claimedPath) =>
+      scan.changedPaths.some((changedPath) => pathsOverlap(claimedPath, changedPath)))) return false;
+    if (!scan.changedPaths.every((changedPath) =>
+      claimedPaths.some((claimedPath) => pathsOverlap(claimedPath, changedPath)))) return false;
+
+    const verificationRows = this.database.connection.prepare(`
+      SELECT v.*, l.session_id, lp.path AS lease_path
+      FROM verifications v
+      JOIN leases l ON l.id = v.lease_id
+      JOIN lease_paths lp ON lp.lease_id = l.id
+      WHERE l.session_id = ?
+        AND v.author_member_id = ?
+        AND v.created_at >= ?
+        AND v.created_at <= ?
+      ORDER BY v.created_at DESC, v.id DESC
+    `).all(session.id, session.memberId, session.openedAt, scan.scannedAt) as Row[];
+    const consumedVerificationIds = new Set<string>();
+    for (const claim of claims.verifications) {
+      const matching = verificationRows.find((row) => {
+        const id = asString(row.id);
+        if (consumedVerificationIds.has(id)) return false;
+        if (asString(row.result) !== claim.result || asString(row.summary) !== claim.summary) return false;
+        if (!sameNullableText(nullableString(row.command), claim.command)) return false;
+        if (!sameNullableText(nullableString(row.evidence), claim.evidence)) return false;
+        const leasePath = nullableString(row.lease_path);
+        return leasePath !== null
+          && scan.changedPaths.some((changedPath) => pathsOverlap(leasePath, changedPath));
+      });
+      if (!matching) return false;
+      consumedVerificationIds.add(asString(matching.id));
+    }
+    return true;
+  }
+
+  private featureRevisionTargetPaths(roomId: string, revisionId: string): string[] {
+    const rows = this.database.connection.prepare(`
+      SELECT t.path
+      FROM feature_revision_targets t
+      JOIN feature_revisions r ON r.id = t.revision_id
+      JOIN feature_memories f ON f.id = r.feature_id
+      WHERE t.revision_id = ? AND f.room_id = ? AND t.path IS NOT NULL
+    `).all(revisionId, roomId) as Row[];
+    return uniqueStrings(rows.map((row) => asString(row.path)));
+  }
+
+  private promoteRecordedSessionCandidates(
+    auth: AuthenticatedMember,
+    session: WorkSession,
+    scan: LocalScan,
+  ): void {
+    if (!featureEvidenceAttestation(scan.metadata)) return;
+    const rows = this.database.connection.prepare(`
+      SELECT r.id, r.branch, r.final_commit, r.git_evidence_json, r.verifications_json
+      FROM feature_revisions r
+      JOIN feature_revision_events e ON e.sequence = (
+        SELECT MAX(latest.sequence)
+        FROM feature_revision_events latest
+        WHERE latest.revision_id = r.id
+      )
+      WHERE r.source_session_id = ? AND e.status = 'candidate'
+      ORDER BY r.revision_number ASC
+    `).all(session.id) as Row[];
+    for (const row of rows) {
+      const revisionId = asString(row.id);
+      const pathRows = this.database.connection.prepare(`
+        SELECT path FROM feature_revision_targets
+        WHERE revision_id = ? AND path IS NOT NULL
+      `).all(revisionId) as Row[];
+      const gitEvidence = parseObject(row.git_evidence_json);
+      const submittedTargetPaths = stringListValue(gitEvidence[FEATURE_SUBMITTED_TARGET_PATHS_KEY])
+        ?? pathRows.map((pathRow) => asString(pathRow.path));
+      const claims: FeaturePromotionClaims = {
+        branch: nullableString(row.branch),
+        finalCommit: nullableString(row.final_commit) ?? undefined,
+        gitEvidence,
+        verifications: parseJsonArray<FeatureVerificationEvidence>(row.verifications_json),
+        paths: submittedTargetPaths,
+      };
+      if (!this.featurePromotionEvidenceVerified(session, claims)) continue;
+      const revision = this.featureMemoryCall(() => this.featureMemory.promoteCandidate(
+        this.featureActor(auth),
+        this.featureSession(session, true),
+        revisionId,
+      ));
+      if (revision.status === "current" || revision.status === "deprecated") {
+        this.auditRecord(
+          auth,
+          "feature.revision.promoted",
+          "feature_revision",
+          revision.id,
+          `Promoted feature revision ${revision.revisionNumber} after matching final Hook and verification evidence.`,
+          { featureId: revision.featureId, sessionId: session.id, scanId: scan.id },
+        );
+      }
+    }
+  }
+
+  private featureMemoryCall<T>(operation: () => T): T {
+    try {
+      return operation();
+    } catch (error) {
+      if (error instanceof FeatureMemoryError) {
+        throw new AgentHubError(error.code, error.message, error.status, error.details);
+      }
+      throw error;
+    }
+  }
+
   private requireLeaseSession(lease: Lease, sessionId: string | null | undefined): void {
     if (sessionId === undefined) return;
     if (lease.sessionId !== sessionId) {
@@ -1775,6 +3156,7 @@ export class AgentHubService {
       branch: nullableString(row.branch),
       baseCommit: nullableString(row.base_commit),
       mode: asString(row.mode) as LeaseMode,
+      kind: asString(row.kind ?? "standard") as LeaseKind,
       decision: asString(row.decision) as Lease["decision"],
       overrideReason: nullableString(row.override_reason),
       status: asString(row.status) as Lease["status"],
@@ -1822,6 +3204,8 @@ function mapRoom(row: Row): Room {
 }
 
 function mapMember(row: Row): Member {
+  const protocolVersion = nullableNumber(row.protocol_version);
+  const schemaVersion = nullableNumber(row.schema_version);
   return {
     id: asString(row.member_id),
     roomId: asString(row.room_id),
@@ -1832,6 +3216,10 @@ function mapMember(row: Row): Member {
     lastSeenAt: asString(row.last_seen_at),
     isAdmin: Number(row.is_admin ?? 0) !== 0,
     removedAt: nullableString(row.removed_at),
+    clientVersion: nullableString(row.client_version),
+    protocolVersion,
+    schemaVersion,
+    compatibility: memberCompatibility(protocolVersion, schemaVersion),
   };
 }
 
@@ -1948,6 +3336,9 @@ function mapSession(row: Row): WorkSession {
     openedAt: asString(row.opened_at),
     lastSeenAt: asString(row.last_seen_at),
     closedAt: nullableString(row.closed_at),
+    clientVersion: nullableString(row.client_version),
+    protocolVersion: nullableNumber(row.protocol_version),
+    schemaVersion: nullableNumber(row.schema_version),
   };
 }
 
@@ -1993,6 +3384,48 @@ function normalizeLeaseMode(mode: LeaseMode | undefined): LeaseMode {
   return mode;
 }
 
+function normalizeLeaseKind(kind: LeaseKind | undefined, autoClaim: boolean | undefined): LeaseKind {
+  if (autoClaim) {
+    if (kind && kind !== "automatic") {
+      throw new AgentHubError(
+        "invalid_lease_kind",
+        "autoClaim can only create an automatic lease.",
+      );
+    }
+    return "automatic";
+  }
+  if (kind === undefined) return "standard";
+  if (!["automatic", "standard", "exclusive"].includes(kind)) {
+    throw new AgentHubError(
+      "invalid_lease_kind",
+      "Lease kind must be automatic, standard, or exclusive.",
+    );
+  }
+  return kind;
+}
+
+function normalizeAutomaticTtlMinutes(value: number): RoomSettings["automaticLeaseTtlMinutes"] {
+  if (!Number.isInteger(value) || !AUTOMATIC_TTL_OPTIONS.includes(
+    value as (typeof AUTOMATIC_TTL_OPTIONS)[number],
+  )) {
+    throw new AgentHubError(
+      "invalid_automatic_lease_ttl",
+      "Automatic lease TTL must be 5, 10, 15, 30, or 60 minutes.",
+    );
+  }
+  return value as RoomSettings["automaticLeaseTtlMinutes"];
+}
+
+function normalizeMaximumExclusiveLeaseMinutes(value: number): number {
+  if (!Number.isInteger(value) || value < 5 || value > 7 * 24 * 60) {
+    throw new AgentHubError(
+      "invalid_maximum_exclusive_lease_ttl",
+      "Maximum exclusive lease duration must be between 5 minutes and 7 days.",
+    );
+  }
+  return value;
+}
+
 function normalizeRecordKind(kind: RecordKind): RecordKind {
   if (!["decision", "validation", "handoff", "risk"].includes(kind)) {
     throw new AgentHubError("invalid_record_kind", "Unsupported record kind.");
@@ -2004,17 +3437,6 @@ function defaultRecordStatus(kind: RecordKind): string {
   if (kind === "risk") return "open";
   if (kind === "decision") return "accepted";
   return "reported";
-}
-
-function normalizeTtl(ttlMs?: number): number {
-  if (ttlMs === undefined) return DEFAULT_TTL_MS;
-  if (!Number.isFinite(ttlMs) || ttlMs < MIN_TTL_MS || ttlMs > MAX_TTL_MS) {
-    throw new AgentHubError(
-      "invalid_ttl",
-      `Lease TTL must be between ${MIN_TTL_MS} and ${MAX_TTL_MS} milliseconds.`,
-    );
-  }
-  return Math.round(ttlMs);
 }
 
 function requiredString(value: unknown, label: string, maxLength: number): string {
@@ -2031,6 +3453,14 @@ function requiredString(value: unknown, label: string, maxLength: number): strin
 function optionalString(value: unknown, label: string, maxLength: number): string | null {
   if (value === undefined || value === null || value === "") return null;
   return requiredString(value, label, maxLength);
+}
+
+function optionalVersionNumber(value: unknown, label: string): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 1_000_000) {
+    throw new AgentHubError("invalid_input", `${label} must be a positive integer.`);
+  }
+  return value;
 }
 
 function stringArray(
@@ -2066,6 +3496,31 @@ function nullableString(value: unknown): string | null {
   return value === null || value === undefined ? null : asString(value);
 }
 
+function nullableNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const result = Number(value);
+  return Number.isFinite(result) ? result : null;
+}
+
+function memberCompatibility(
+  protocolVersion: number | null,
+  schemaVersion: number | null,
+): Member["compatibility"] {
+  if (protocolVersion === null || schemaVersion === null) return "unknown";
+  return protocolVersion === AGENT_HUB_PROTOCOL_VERSION && schemaVersion === AGENT_HUB_SCHEMA_VERSION
+    ? "compatible"
+    : "incompatible";
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const unique = new Map<string, string>();
+  for (const value of values) {
+    const key = value.toLocaleLowerCase("en-US");
+    if (!unique.has(key)) unique.set(key, value);
+  }
+  return [...unique.values()];
+}
+
 function json(value: unknown): string {
   return JSON.stringify(value);
 }
@@ -2074,6 +3529,25 @@ function parseStringArray(value: unknown): string[] {
   try {
     const parsed = JSON.parse(asString(value));
     return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseOverlapPaths(
+  value: unknown,
+): Array<{ requestedPath: string; existingPath: string }> {
+  try {
+    const parsed: unknown = JSON.parse(asString(value));
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const record = item as Record<string, unknown>;
+      if (typeof record.requestedPath !== "string" || typeof record.existingPath !== "string") {
+        return [];
+      }
+      return [{ requestedPath: record.requestedPath, existingPath: record.existingPath }];
+    });
   } catch {
     return [];
   }
@@ -2088,4 +3562,181 @@ function parseObject(value: unknown): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function parseJsonArray<T>(value: unknown): T[] {
+  try {
+    const parsed: unknown = JSON.parse(asString(value));
+    return Array.isArray(parsed) ? parsed as T[] : [];
+  } catch {
+    return [];
+  }
+}
+
+function featureEvidenceAttestation(metadata: Record<string, unknown>): FeatureEvidenceAttestation | null {
+  if (metadata.source !== "codex-hook" || metadata.event !== "SessionEnd") return null;
+  const value = metadata.featureEvidence;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const branch = stringField(record, "branch");
+  const baseCommit = stringField(record, "baseCommit");
+  const finalCommit = stringField(record, "finalCommit");
+  const diffSha256 = stringField(record, "diffSha256");
+  if (
+    typeof record.committed !== "boolean"
+    || !branch
+    || !/^[0-9a-f]{7,64}$/i.test(baseCommit ?? "")
+    || !/^[0-9a-f]{7,64}$/i.test(finalCommit ?? "")
+    || !/^[0-9a-f]{64}$/i.test(diffSha256 ?? "")
+  ) {
+    return null;
+  }
+  if (record.version === 1) {
+    const committedPaths = stringListField(record, "committedPaths");
+    const uncommittedPaths = stringListField(record, "uncommittedPaths");
+    const changedPaths = stringListField(record, "changedPaths");
+    const commitHashes = stringListField(record, "commitHashes");
+    if (!committedPaths || !uncommittedPaths || !changedPaths || !commitHashes) return null;
+    return {
+      version: 1,
+      branch,
+      baseCommit: baseCommit!,
+      finalCommit: finalCommit!,
+      committed: record.committed,
+      committedPathCount: evidenceSetSize(committedPaths, pathComparisonKey),
+      uncommittedPathCount: evidenceSetSize(uncommittedPaths, pathComparisonKey),
+      changedPathCount: evidenceSetSize(changedPaths, pathComparisonKey),
+      changedPathsSha256: digestEvidenceSet(changedPaths, pathComparisonKey),
+      commitHashCount: evidenceSetSize(commitHashes, normalizedEvidenceText),
+      commitHashesSha256: digestEvidenceSet(commitHashes, normalizedEvidenceText),
+      finalCommitIncluded: commitHashes.some((hash) => sameText(hash, finalCommit)),
+      diffSha256: diffSha256!,
+    };
+  }
+  const committedPathCount = nonNegativeIntegerField(record, "committedPathCount");
+  const uncommittedPathCount = nonNegativeIntegerField(record, "uncommittedPathCount");
+  const changedPathCount = nonNegativeIntegerField(record, "changedPathCount");
+  const changedPathsSha256 = stringField(record, "changedPathsSha256");
+  const commitHashCount = nonNegativeIntegerField(record, "commitHashCount");
+  const commitHashesSha256 = stringField(record, "commitHashesSha256");
+  if (
+    record.version !== 2
+    || committedPathCount === null
+    || uncommittedPathCount === null
+    || changedPathCount === null
+    || commitHashCount === null
+    || !/^[0-9a-f]{64}$/i.test(changedPathsSha256 ?? "")
+    || !/^[0-9a-f]{64}$/i.test(commitHashesSha256 ?? "")
+    || typeof record.finalCommitIncluded !== "boolean"
+  ) return null;
+  return {
+    version: 2,
+    branch,
+    baseCommit: baseCommit!,
+    finalCommit: finalCommit!,
+    committed: record.committed,
+    committedPathCount,
+    uncommittedPathCount,
+    changedPathCount,
+    changedPathsSha256: changedPathsSha256!,
+    commitHashCount,
+    commitHashesSha256: commitHashesSha256!,
+    finalCommitIncluded: record.finalCommitIncluded,
+    diffSha256: diffSha256!,
+  };
+}
+
+function gitClaimsMatchAttestation(
+  claims: Record<string, unknown>,
+  evidence: FeatureEvidenceAttestation,
+  changedPaths: string[],
+): boolean {
+  const scalarClaims: Array<[string, string]> = [
+    ["branch", evidence.branch],
+    ["baseCommit", evidence.baseCommit],
+    ["finalCommit", evidence.finalCommit],
+    ["diffSha256", evidence.diffSha256],
+  ];
+  for (const [key, expected] of scalarClaims) {
+    if (key in claims && !sameText(claims[key], expected)) return false;
+  }
+  if ("committed" in claims && claims.committed !== evidence.committed) return false;
+  if ("changedPaths" in claims) {
+    const values = stringListValue(claims.changedPaths);
+    if (!values || !samePathSet(values, changedPaths)) return false;
+  }
+  if ("committedPaths" in claims) {
+    const values = stringListValue(claims.committedPaths);
+    if (!values || evidenceSetSize(values, pathComparisonKey) !== evidence.committedPathCount) return false;
+    if (evidence.uncommittedPathCount === 0 && !samePathSet(values, changedPaths)) return false;
+  }
+  if ("uncommittedPaths" in claims) {
+    const values = stringListValue(claims.uncommittedPaths);
+    if (!values || evidenceSetSize(values, pathComparisonKey) !== evidence.uncommittedPathCount) return false;
+  }
+  if ("commits" in claims) {
+    if (!Array.isArray(claims.commits)) return false;
+    const commitHashes = claims.commits.flatMap((commit) => {
+      if (!commit || typeof commit !== "object" || Array.isArray(commit)) return [];
+      const hash = stringField(commit as Record<string, unknown>, "hash");
+      return hash ? [hash] : [];
+    });
+    if (evidenceSetSize(commitHashes, normalizedEvidenceText) !== evidence.commitHashCount) return false;
+    if (digestEvidenceSet(commitHashes, normalizedEvidenceText) !== evidence.commitHashesSha256) return false;
+  }
+  return true;
+}
+
+function samePathSet(left: string[], right: string[]): boolean {
+  return sameTextSet(left.map(pathComparisonKey), right.map(pathComparisonKey));
+}
+
+function sameTextSet(left: string[], right: string[]): boolean {
+  const normalizedLeft = [...new Set(left.map(normalizedEvidenceText).filter(Boolean))].sort();
+  const normalizedRight = [...new Set(right.map(normalizedEvidenceText).filter(Boolean))].sort();
+  return normalizedLeft.length === normalizedRight.length
+    && normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
+
+function evidenceSetSize(values: string[], normalize: (value: string) => string): number {
+  return new Set(values.map(normalize).filter(Boolean)).size;
+}
+
+function digestEvidenceSet(values: string[], normalize: (value: string) => string): string {
+  const normalized = [...new Set(values.map(normalize).filter(Boolean))].sort((left, right) =>
+    left.localeCompare(right, "en-US"));
+  return createHash("sha256").update(JSON.stringify(normalized), "utf8").digest("hex");
+}
+
+function sameText(left: unknown, right: unknown): boolean {
+  return normalizedEvidenceText(left) === normalizedEvidenceText(right);
+}
+
+function sameNullableText(left: string | null, right: string | undefined): boolean {
+  return normalizedEvidenceText(left) === normalizedEvidenceText(right);
+}
+
+function normalizedEvidenceText(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLocaleLowerCase("en-US") : "";
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function nonNegativeIntegerField(record: Record<string, unknown>, key: string): number | null {
+  const value = record[key];
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 10_000
+    ? value
+    : null;
+}
+
+function stringListField(record: Record<string, unknown>, key: string): string[] | null {
+  return stringListValue(record[key]);
+}
+
+function stringListValue(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) return null;
+  return value.map((item) => item.trim()).filter(Boolean);
 }

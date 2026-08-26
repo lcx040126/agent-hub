@@ -12,6 +12,7 @@ import {
   type ListToolsResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { SecretProtector } from "../desktop/connection-store.js";
+import { AGENT_HUB_VERSION } from "../shared/version.js";
 import { resolveConnectionById } from "./connection-runtime.js";
 
 export interface RunMcpBridgeOptions {
@@ -31,7 +32,7 @@ interface RemoteMcpTools {
 
 export function createMcpProxyServer(remote: RemoteMcpTools): Server {
   const server = new Server(
-    { name: "agent-hub-local-bridge", version: "0.1.0" },
+    { name: "agent-hub-local-bridge", version: AGENT_HUB_VERSION },
     {
       capabilities: { tools: {} },
       instructions: remote.getInstructions(),
@@ -57,7 +58,7 @@ export async function runMcpBridge(options: RunMcpBridgeOptions): Promise<void> 
     },
   });
   const remoteClient = new Client(
-    { name: "agent-hub-desktop-bridge", version: "0.1.0" },
+    { name: "agent-hub-desktop-bridge", version: AGENT_HUB_VERSION },
     { capabilities: {} },
   );
   await remoteClient.connect(remoteTransport);

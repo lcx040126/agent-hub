@@ -1,3 +1,5 @@
+import type { RiskPolicyRule } from "./risk-policy.js";
+
 export const CONTEXT_KINDS = [
   "rule",
   "architecture",
@@ -26,7 +28,27 @@ export type PathRisk = "normal" | "high";
 export type ConflictSeverity = "warning" | "blocking";
 export type ConflictDecision = "allow" | "warn" | "deny";
 export type LeaseMode = "read" | "write";
+export type LeaseKind = "automatic" | "standard" | "exclusive";
+export type ReleaseRequestStatus = "pending" | "approved" | "rejected" | "cancelled";
+export type MemberCompatibility = "compatible" | "incompatible" | "unknown";
 export type RecordKind = "decision" | "validation" | "handoff" | "risk";
+export type FeatureRevisionRelation =
+  | "add"
+  | "extend"
+  | "replace"
+  | "deprecate"
+  | "rollback"
+  | "conflict";
+export type FeatureRevisionStatus =
+  | "draft"
+  | "candidate"
+  | "current"
+  | "conflict"
+  | "superseded"
+  | "deprecated";
+export type FeatureTargetKind = "system" | "path" | "symbol" | "interface" | "resource" | "test";
+export type FeatureTargetRole = "implementation" | "contract" | "dependency" | "verification";
+export type FeatureEditPrecision = "symbol" | "resource" | "path";
 
 export interface Room {
   id: string;
@@ -50,6 +72,10 @@ export interface Member {
   lastSeenAt: string;
   isAdmin: boolean;
   removedAt: string | null;
+  clientVersion: string | null;
+  protocolVersion: number | null;
+  schemaVersion: number | null;
+  compatibility: MemberCompatibility;
 }
 
 export interface LeasePath {
@@ -69,6 +95,7 @@ export interface Lease {
   branch: string | null;
   baseCommit: string | null;
   mode: LeaseMode;
+  kind: LeaseKind;
   decision: ConflictDecision;
   overrideReason: string | null;
   status: LeaseStatus;
@@ -91,6 +118,7 @@ export interface LeaseConflict {
   decision: Exclude<ConflictDecision, "allow">;
   reason: string;
   expiresAt: string;
+  existingLeaseKind: LeaseKind;
 }
 
 export type LeaseClaimResult =
@@ -99,8 +127,43 @@ export type LeaseClaimResult =
       decision: "allow" | "warn";
       lease: Lease;
       conflicts: LeaseConflict[];
+      releaseRequests: ReleaseRequest[];
     }
-  | { acquired: false; decision: "warn" | "deny"; conflicts: LeaseConflict[] };
+  | {
+      acquired: false;
+      decision: "warn" | "deny";
+      conflicts: LeaseConflict[];
+      releaseRequests: ReleaseRequest[];
+    };
+
+export interface ReleaseRequest {
+  id: string;
+  roomId: string;
+  requesterMemberId: string;
+  requesterName: string;
+  requesterSessionId: string | null;
+  requesterLeaseId: string | null;
+  holderMemberId: string;
+  holderName: string;
+  conflictingLeaseId: string;
+  conflictingLeaseTitle: string;
+  conflictingLeaseKind: LeaseKind;
+  requestTitle: string;
+  requestObjective: string | null;
+  requestedKind: LeaseKind;
+  requestedMode: LeaseMode;
+  requestedPaths: string[];
+  overlapPaths: Array<{ requestedPath: string; existingPath: string }>;
+  reason: string;
+  status: ReleaseRequestStatus;
+  rejectionReason: string | null;
+  transferredLeaseId: string | null;
+  occurrenceCount: number;
+  requestedAt: string;
+  lastRequestedAt: string;
+  resolvedAt: string | null;
+  holderLeaseExpiresAt: string;
+}
 
 export interface ContextEntry {
   id: string;
@@ -171,6 +234,7 @@ export interface Activity {
 
 export interface RoomSnapshot {
   room: Room;
+  settings: RoomSettings;
   members: Member[];
   activeLeases: Lease[];
   contextEntries: ContextEntry[];
@@ -181,14 +245,17 @@ export interface RoomSnapshot {
   sessions: WorkSession[];
   localScans: LocalScan[];
   activities: Activity[];
+  releaseRequests: ReleaseRequest[];
   generatedAt: string;
 }
 
 export interface EditIssue {
-  code: "uncovered_path" | "lease_conflict";
+  code: "uncovered_path" | "lease_conflict" | "feature_confirmation_required";
   path: string;
   message: string;
   conflict?: LeaseConflict;
+  featureImpact?: FeatureImpact;
+  confirmationId?: string;
 }
 
 export interface EditCheckResult {
@@ -197,6 +264,204 @@ export interface EditCheckResult {
   warnings: EditIssue[];
   coveredPaths: string[];
   uncoveredPaths: string[];
+  historicalImpacts: FeatureImpact[];
+  featureConfirmation?: FeatureChangeConfirmation;
+  releaseRequests: ReleaseRequest[];
+}
+
+export interface ProposedFeatureEdit {
+  path: string;
+  precision?: FeatureEditPrecision;
+  symbols?: string[];
+  operation?: "add" | "update" | "delete" | "move" | "unknown";
+}
+
+export interface FeatureContract {
+  key: string;
+  behavior: string;
+  constraints: string[];
+}
+
+export interface FeatureContractChange {
+  operation: "add" | "update" | "remove";
+  key: string;
+  behavior?: string;
+  constraints?: string[];
+}
+
+export interface FeatureTargetInput {
+  kind: FeatureTargetKind;
+  role?: FeatureTargetRole;
+  path?: string;
+  symbol?: string;
+  signature?: string;
+  label?: string;
+}
+
+export interface FeatureTarget {
+  id: string;
+  revisionId: string;
+  kind: FeatureTargetKind;
+  role: FeatureTargetRole;
+  path: string | null;
+  symbol: string | null;
+  signature: string | null;
+  label: string | null;
+}
+
+export interface FeatureVerificationEvidence {
+  testKey: string;
+  result: VerificationResult;
+  summary: string;
+  command?: string;
+  evidence?: string;
+}
+
+export interface FeatureRevisionSnapshot {
+  name: string;
+  systemId: string;
+  objective: string;
+  contracts: FeatureContract[];
+  constraints: string[];
+  dependencies: string[];
+}
+
+export interface FeatureMemory {
+  id: string;
+  roomId: string;
+  featureKey: string;
+  name: string;
+  systemId: string;
+  currentRevisionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FeatureRevision {
+  id: string;
+  featureId: string;
+  revisionNumber: number;
+  parentRevisionId: string | null;
+  relation: FeatureRevisionRelation;
+  status: FeatureRevisionStatus;
+  sourceSessionId: string;
+  authorMemberId: string;
+  authorName: string;
+  branch: string | null;
+  baseCommit: string | null;
+  finalCommit: string | null;
+  completed: boolean;
+  changeSummary: string;
+  snapshot: FeatureRevisionSnapshot;
+  contractChanges: FeatureContractChange[];
+  targets: FeatureTarget[];
+  verifications: FeatureVerificationEvidence[];
+  remainingRisks: string[];
+  gitEvidence: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface FeatureMemoryCard {
+  featureId: string;
+  featureKey: string;
+  name: string;
+  systemId: string;
+  revisionId: string;
+  revisionNumber: number;
+  status: FeatureRevisionStatus;
+  coreContract: string;
+  paths: string[];
+  symbols: string[];
+  verificationStatus: VerificationResult | "missing";
+  hitReasons: string[];
+}
+
+export interface FeatureMemoryQueryInput {
+  memberToken: string;
+  sessionId?: string;
+  level?: "cards" | "detail";
+  query?: string;
+  featureIds?: string[];
+  paths?: string[];
+  systems?: string[];
+  symbols?: string[];
+  statuses?: FeatureRevisionStatus[];
+  limit?: number;
+  cursor?: string;
+}
+
+export interface FeatureMemoryQueryResult {
+  level: "cards" | "detail";
+  cards: FeatureMemoryCard[];
+  details: FeatureRevision[];
+  nextCursor: string | null;
+}
+
+export interface SubmitFeatureRevisionInput {
+  memberToken: string;
+  sessionId: string;
+  featureKey: string;
+  name: string;
+  systemId: string;
+  parentRevisionId?: string;
+  relation?: Exclude<FeatureRevisionRelation, "rollback">;
+  objective: string;
+  changeSummary: string;
+  contractChanges: FeatureContractChange[];
+  constraints?: string[];
+  dependencies?: string[];
+  targets: FeatureTargetInput[];
+  finalCommit?: string;
+  completed?: boolean;
+  verifications?: FeatureVerificationEvidence[];
+  remainingRisks?: string[];
+  gitEvidence?: Record<string, unknown>;
+}
+
+export interface RollbackFeatureRevisionInput {
+  memberToken: string;
+  sessionId: string;
+  featureId: string;
+  targetRevisionId: string;
+  changeSummary: string;
+  finalCommit?: string;
+  completed?: boolean;
+  verifications?: FeatureVerificationEvidence[];
+  gitEvidence?: Record<string, unknown>;
+}
+
+export interface FeatureImpact {
+  featureId: string;
+  featureName: string;
+  revisionId: string;
+  revisionNumber: number;
+  path: string;
+  symbols: string[];
+  contracts: string[];
+  reason: string;
+  confidence: "exact" | "fallback";
+}
+
+export interface FeatureChangeConfirmation {
+  id: string;
+  roomId: string;
+  sessionId: string;
+  memberId: string;
+  proposalHash: string;
+  impacts: FeatureImpact[];
+  status: "pending" | "approved" | "rejected" | "expired";
+  reason: string | null;
+  createdAt: string;
+  resolvedAt: string | null;
+  expiresAt: string;
+}
+
+export interface ResolveFeatureConfirmationInput {
+  memberToken: string;
+  sessionId: string;
+  confirmationId: string;
+  decision: "approved" | "rejected";
+  reason?: string;
 }
 
 export interface CreateRoomInput {
@@ -206,6 +471,9 @@ export interface CreateRoomInput {
   defaultBranch?: string;
   hostName: string;
   hostAgent?: string;
+  clientVersion?: string;
+  protocolVersion?: number;
+  schemaVersion?: number;
 }
 
 export interface CreateRoomResult {
@@ -219,6 +487,9 @@ export interface JoinRoomInput {
   roomToken: string;
   displayName: string;
   agent?: string;
+  clientVersion?: string;
+  protocolVersion?: number;
+  schemaVersion?: number;
 }
 
 export interface JoinRoomResult {
@@ -236,8 +507,10 @@ export interface ClaimLeaseInput {
   baseCommit?: string;
   paths: string[];
   mode?: LeaseMode;
+  kind?: LeaseKind;
   overrideReason?: string;
   ttlMs?: number;
+  ttlMinutes?: number;
   autoClaim?: boolean;
 }
 
@@ -246,6 +519,19 @@ export interface RenewLeaseInput {
   leaseId: string;
   sessionId?: string;
   ttlMs?: number;
+  ttlMinutes?: number;
+}
+
+export interface ResolveReleaseRequestInput {
+  memberToken: string;
+  requestId: string;
+  decision: "approve" | "reject";
+  reason?: string;
+}
+
+export interface ListReleaseRequestsInput {
+  memberToken: string;
+  status?: ReleaseRequestStatus | "all";
 }
 
 export interface ProjectRecord {
@@ -281,6 +567,9 @@ export interface WorkSession {
   openedAt: string;
   lastSeenAt: string;
   closedAt: string | null;
+  clientVersion: string | null;
+  protocolVersion: number | null;
+  schemaVersion: number | null;
 }
 
 export interface LocalScan {
@@ -301,6 +590,11 @@ export interface LocalScan {
 
 export interface RoomSettings {
   autoLockAfterAutoClaim: boolean;
+  blockingProtectionEnabled: boolean;
+  automaticLeaseTtlMinutes: 5 | 10 | 15 | 30 | 60;
+  maximumExclusiveLeaseMinutes: number;
+  riskPolicyVersion: number;
+  riskRules: RiskPolicyRule[];
   updatedAt: string;
   updatedBy: string;
 }
@@ -330,6 +624,7 @@ export interface CheckEditsInput {
   sessionId?: string;
   paths: string[];
   leaseId?: string;
+  proposedEdits?: ProposedFeatureEdit[];
 }
 
 export interface AddContextEntryInput {

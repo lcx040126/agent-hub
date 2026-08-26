@@ -2,14 +2,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express, { type Request, type Response, type Router } from "express";
 import * as z from "zod/v4";
+import { AGENT_HUB_VERSION } from "../shared/version.js";
 
 const SERVER_INSTRUCTIONS = [
   "Agent Hub is an automatic collaboration guard. Follow this workflow for every coding task:",
-  "1. Call session_open before planning or editing, retain its returned session.id, then call context_query for the paths and systems involved.",
+  "1. If Codex SessionStart context supplies an Agent Hub sessionId, reuse that exact Hook session for every MCP tool and do not call session_open. Otherwise call session_open once, retain its returned session.id, then call context_query for the paths and systems involved.",
   "2. Call lease_acquire with that sessionId before writing. If the lease is denied or blocking conflicts are returned, do not edit those paths.",
   "3. Call edit_check with the same sessionId before touching newly discovered paths, and call lease_renew with it while long-running work is active.",
   "4. Use event_append with the same sessionId to record decisions, verification evidence, risks, and handoffs as they occur.",
-  "5. Call session_close with the retained sessionId when work stops, including incomplete work. Never claim compatibility without relevant verification.",
+  "5. Use feature_context_query during planning and before related edits. When edit_check requires historical confirmation, ask the current member and call feature_change_confirm only after an explicit answer.",
+  "6. Submit a structured feature revision before closing completed coding work, then call session_close even when work is incomplete. Never claim compatibility without relevant verification.",
   "Handle technical coordination automatically. Ask a human only when requirements or business rules genuinely conflict.",
 ].join("\n");
 
@@ -22,6 +24,8 @@ const optionalShortText = z.string().trim().min(1).max(500).optional();
 const optionalLongText = z.string().trim().min(1).max(10_000).optional();
 const pathsSchema = z.array(pathSchema).max(100);
 const sessionIdSchema = z.string().trim().min(1).max(128);
+const budgetTokensSchema = z.number().int().min(256).max(3_000).optional();
+const cursorSchema = z.string().trim().min(1).max(2_048).optional();
 
 const sessionOpenInputSchema = z.object({
   clientName: z.string().trim().min(1).max(120).optional(),
@@ -30,6 +34,9 @@ const sessionOpenInputSchema = z.object({
   branch: optionalShortText,
   baseCommit: z.string().trim().min(4).max(128).optional(),
   paths: pathsSchema.optional(),
+  budgetTokens: budgetTokensSchema,
+  limit: z.number().int().min(1).max(50).optional(),
+  cursor: cursorSchema,
 });
 
 const contextQueryInputSchema = z.object({
@@ -53,6 +60,8 @@ const contextQueryInputSchema = z.object({
     .max(10)
     .optional(),
   limit: z.number().int().min(1).max(200).default(50),
+  budgetTokens: budgetTokensSchema,
+  cursor: cursorSchema,
 });
 
 const leaseAcquireInputSchema = z.object({
@@ -76,6 +85,109 @@ const editCheckInputSchema = z.object({
   sessionId: sessionIdSchema,
   paths: pathsSchema.min(1),
   leaseId: z.string().trim().min(1).max(128).optional(),
+  proposedEdits: z.array(z.object({
+    path: pathSchema,
+    precision: z.enum(["symbol", "resource", "path"]).optional(),
+    symbols: z.array(z.string().trim().min(1).max(1_000)).max(100).optional(),
+    operation: z.enum(["add", "update", "delete", "move", "unknown"]).optional(),
+  })).max(100).optional(),
+});
+
+const featureTargetSchema = z.object({
+  kind: z.enum(["system", "path", "symbol", "interface", "resource", "test"]),
+  role: z.enum(["implementation", "contract", "dependency", "verification"]).optional(),
+  path: pathSchema.optional(),
+  symbol: z.string().trim().min(1).max(1_000).optional(),
+  signature: z.string().trim().min(1).max(2_000).optional(),
+  label: z.string().trim().min(1).max(1_000).optional(),
+});
+
+const featureContractChangeSchema = z.object({
+  operation: z.enum(["add", "update", "remove"]),
+  key: z.string().trim().min(1).max(240),
+  behavior: z.string().trim().min(1).max(10_000).optional(),
+  constraints: z.array(z.string().trim().min(1).max(2_000)).max(100).optional(),
+});
+
+const featureVerificationSchema = z.object({
+  testKey: z.string().trim().min(1).max(500),
+  result: z.enum(["passed", "failed", "pending"]),
+  summary: z.string().trim().min(1).max(10_000),
+  command: z.string().trim().min(1).max(4_000).optional(),
+  evidence: z.string().trim().min(1).max(10_000).optional(),
+});
+
+const featureContextQueryInputSchema = z.object({
+  sessionId: sessionIdSchema,
+  level: z.enum(["cards", "detail"]).default("cards"),
+  query: z.string().trim().min(1).max(500).optional(),
+  objective: optionalLongText,
+  featureIds: z.array(z.string().trim().min(1).max(128)).max(20).optional(),
+  paths: pathsSchema.optional(),
+  systems: z.array(z.string().trim().min(1).max(500)).max(50).optional(),
+  symbols: z.array(z.string().trim().min(1).max(1_000)).max(100).optional(),
+  tests: z.array(pathSchema).max(100).optional(),
+  statuses: z.array(z.enum(["draft", "candidate", "current", "conflict", "superseded", "deprecated"])).max(6).optional(),
+  sections: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+  knownVersions: z.record(
+    z.string().trim().min(1).max(128),
+    z.union([
+      z.string().trim().min(1).max(128),
+      z.object({
+        versionId: z.string().trim().min(1).max(128),
+        sectionHashes: z.record(
+          z.string().trim().min(1).max(100),
+          z.string().trim().min(1).max(128),
+        ).optional(),
+      }),
+    ]),
+  ).optional(),
+  budgetTokens: budgetTokensSchema,
+  limit: z.number().int().min(1).max(8).optional(),
+  cursor: cursorSchema,
+});
+
+const featureHistoryInputSchema = z.object({
+  sessionId: sessionIdSchema,
+  featureId: z.string().trim().min(1).max(128),
+});
+
+const featureRevisionSubmitInputSchema = z.object({
+  sessionId: sessionIdSchema,
+  featureKey: z.string().trim().min(1).max(240),
+  name: z.string().trim().min(1).max(240),
+  systemId: z.string().trim().min(1).max(500),
+  parentRevisionId: z.string().trim().min(1).max(128).optional(),
+  relation: z.enum(["add", "extend", "replace", "deprecate", "conflict"]).default("add"),
+  objective: z.string().trim().min(1).max(10_000),
+  changeSummary: z.string().trim().min(1).max(10_000),
+  contractChanges: z.array(featureContractChangeSchema).max(100),
+  constraints: z.array(z.string().trim().min(1).max(2_000)).max(200).optional(),
+  dependencies: z.array(z.string().trim().min(1).max(2_000)).max(200).optional(),
+  targets: z.array(featureTargetSchema).min(1).max(300),
+  finalCommit: z.string().trim().min(4).max(255).optional(),
+  completed: z.boolean().default(false),
+  verifications: z.array(featureVerificationSchema).max(100).optional(),
+  remainingRisks: z.array(z.string().trim().min(1).max(2_000)).max(100).optional(),
+  gitEvidence: z.record(z.string(), z.unknown()).optional(),
+});
+
+const featureRollbackInputSchema = z.object({
+  sessionId: sessionIdSchema,
+  featureId: z.string().trim().min(1).max(128),
+  targetRevisionId: z.string().trim().min(1).max(128),
+  changeSummary: z.string().trim().min(1).max(10_000),
+  finalCommit: z.string().trim().min(4).max(255).optional(),
+  completed: z.boolean().default(false),
+  verifications: z.array(featureVerificationSchema).max(100).optional(),
+  gitEvidence: z.record(z.string(), z.unknown()).optional(),
+});
+
+const featureChangeConfirmInputSchema = z.object({
+  sessionId: sessionIdSchema,
+  confirmationId: z.string().trim().min(1).max(128),
+  decision: z.enum(["approved", "rejected"]),
+  reason: z.string().trim().min(1).max(2_000).optional(),
 });
 
 const contextEventSchema = z.object({
@@ -189,6 +301,11 @@ export type LeaseRenewInput = z.infer<typeof leaseRenewInputSchema>;
 export type EditCheckInput = z.infer<typeof editCheckInputSchema>;
 export type EventAppendInput = z.infer<typeof eventAppendInputSchema>;
 export type SessionCloseInput = z.infer<typeof sessionCloseInputSchema>;
+export type FeatureContextQueryInput = z.infer<typeof featureContextQueryInputSchema>;
+export type FeatureHistoryInput = z.infer<typeof featureHistoryInputSchema>;
+export type FeatureRevisionSubmitInput = z.infer<typeof featureRevisionSubmitInputSchema>;
+export type FeatureRollbackInput = z.infer<typeof featureRollbackInputSchema>;
+export type FeatureChangeConfirmInput = z.infer<typeof featureChangeConfirmInputSchema>;
 
 export interface AgentHubMemberIdentity {
   id: string;
@@ -233,6 +350,26 @@ export interface AgentHubServiceLike {
     context: AgentHubToolContext,
     input: EditCheckInput,
   ): MaybePromise<unknown>;
+  featureContextQuery(
+    context: AgentHubToolContext,
+    input: FeatureContextQueryInput,
+  ): MaybePromise<unknown>;
+  featureHistory(
+    context: AgentHubToolContext,
+    input: FeatureHistoryInput,
+  ): MaybePromise<unknown>;
+  featureRevisionSubmit(
+    context: AgentHubToolContext,
+    input: FeatureRevisionSubmitInput,
+  ): MaybePromise<unknown>;
+  featureRollback(
+    context: AgentHubToolContext,
+    input: FeatureRollbackInput,
+  ): MaybePromise<unknown>;
+  featureChangeConfirm(
+    context: AgentHubToolContext,
+    input: FeatureChangeConfirmInput,
+  ): MaybePromise<unknown>;
   eventAppend(
     context: AgentHubToolContext,
     input: EventAppendInput,
@@ -257,7 +394,7 @@ function asStructuredResult(value: unknown) {
 
 function createServer(service: AgentHubServiceLike, context: AgentHubToolContext) {
   const server = new McpServer(
-    { name: "agent-hub", version: "0.1.0" },
+    { name: "agent-hub", version: AGENT_HUB_VERSION },
     {
       capabilities: { tools: {} },
       instructions: SERVER_INSTRUCTIONS,
@@ -347,6 +484,91 @@ function createServer(service: AgentHubServiceLike, context: AgentHubToolContext
       },
     },
     async (input) => asStructuredResult(await service.editCheck(context, input)),
+  );
+
+  server.registerTool(
+    "feature_context_query",
+    {
+      title: "Query versioned feature memory",
+      description:
+        "Retrieve a small set of relevant current feature-memory cards or details by task, path, system, or symbol. Empty selectors never return the whole room history.",
+      inputSchema: featureContextQueryInputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (input) => asStructuredResult(await service.featureContextQuery(context, input)),
+  );
+
+  server.registerTool(
+    "feature_history",
+    {
+      title: "Read feature revision history",
+      description:
+        "Read the immutable revision chain for one feature when auditing, resolving a conflict, or preparing a rollback.",
+      inputSchema: featureHistoryInputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (input) => asStructuredResult(await service.featureHistory(context, input)),
+  );
+
+  server.registerTool(
+    "feature_revision_submit",
+    {
+      title: "Submit a feature-memory revision",
+      description:
+        "Submit structured behavior contracts, implementation targets, Git evidence, and regression results before closing completed coding work. Unverified or non-default-branch work remains draft or candidate.",
+      inputSchema: featureRevisionSubmitInputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (input) => asStructuredResult(await service.featureRevisionSubmit(context, input)),
+  );
+
+  server.registerTool(
+    "feature_revision_rollback",
+    {
+      title: "Create a feature rollback revision",
+      description:
+        "Create a new immutable revision that restores an earlier effective feature snapshot. History is preserved and normal commit and verification promotion rules still apply.",
+      inputSchema: featureRollbackInputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (input) => asStructuredResult(await service.featureRollback(context, input)),
+  );
+
+  server.registerTool(
+    "feature_change_confirm",
+    {
+      title: "Resolve an exact historical feature change",
+      description:
+        "Approve or reject the exact proposal returned by edit_check. Call this only after the current member explicitly answers in the active conversation; approval is session-bound and expires when the proposal changes.",
+      inputSchema: featureChangeConfirmInputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (input) => asStructuredResult(await service.featureChangeConfirm(context, input)),
   );
 
   server.registerTool(

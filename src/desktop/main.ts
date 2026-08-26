@@ -1,5 +1,6 @@
 import { homedir, networkInterfaces } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import {
   app as electronApp,
@@ -9,24 +10,46 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  Notification,
   shell,
   Tray,
   type IpcMainInvokeEvent,
   type OpenDialogOptions,
 } from "electron";
 import { inspectRepository } from "../companion/repository.js";
+import {
+  startCodexSessionHeartbeatScheduler,
+  type CodexSessionHeartbeatScheduler,
+} from "../companion/codex-session-heartbeat.js";
 import { WindowsDpapiProtector } from "../companion/windows-dpapi.js";
 import {
   startRepositoryScanScheduler,
   type RepositoryScanScheduler,
 } from "../companion/scan-scheduler.js";
+import {
+  AGENT_HUB_PROTOCOL_VERSION,
+  AGENT_HUB_RELEASE_OWNER,
+  AGENT_HUB_RELEASE_REPOSITORY,
+  AGENT_HUB_SCHEMA_VERSION,
+  AGENT_HUB_VERSION,
+} from "../shared/version.js";
+import { createConsistentSqliteBackup } from "../server/sqlite-backup.js";
+import { DesktopAppUpdater, type ElectronUpdateEngine } from "./app-updater.js";
 import { installCodexMcpConfig, codexServerName } from "./codex-config.js";
 import { CONNECTION_STORE_FILENAME, ConnectionStore } from "./connection-store.js";
 import { DESKTOP_IPC, type SaveRoomConnectionInput, type DesktopServerInfo } from "./contracts.js";
 import { installHeadlessLauncher } from "./headless-launcher.js";
 import { candidatePorts, collectLanUrls } from "./network.js";
 import { requestRoomServer } from "./room-server-proxy.js";
+import {
+  startReleaseRequestNotificationScheduler,
+  type ReleaseRequestNotificationScheduler,
+} from "./release-request-notifier.js";
 import { createServiceSupervisor, type ServiceSupervisor } from "./service-supervisor.js";
+import { verifyStartupHealthAndMark } from "./startup-health.js";
+import { FileDesktopUpdateRecovery } from "./update-recovery.js";
+import { reconcilePendingUpdateAtStartup } from "./update-startup-recovery.js";
+import { WindowsUpdateRecoveryExecutor } from "./windows-update-watchdog.js";
 
 const HOST = "0.0.0.0";
 const PREFERRED_PORT = 4173;
@@ -36,6 +59,10 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let hostServer: ServiceSupervisor | null = null;
 let scanScheduler: RepositoryScanScheduler | null = null;
+let hookHeartbeatScheduler: CodexSessionHeartbeatScheduler | null = null;
+let releaseRequestNotifier: ReleaseRequestNotificationScheduler | null = null;
+let desktopUpdater: DesktopAppUpdater | null = null;
+let unsubscribeUpdateStatus: (() => void) | null = null;
 let isQuitting = false;
 
 startDesktopLifecycle();
@@ -50,6 +77,14 @@ function startDesktopLifecycle(): void {
     isQuitting = true;
     scanScheduler?.stop();
     scanScheduler = null;
+    hookHeartbeatScheduler?.stop();
+    hookHeartbeatScheduler = null;
+    releaseRequestNotifier?.stop();
+    releaseRequestNotifier = null;
+    unsubscribeUpdateStatus?.();
+    unsubscribeUpdateStatus = null;
+    desktopUpdater?.dispose();
+    desktopUpdater = null;
     void hostServer?.stop();
     hostServer = null;
   });
@@ -67,6 +102,25 @@ function startDesktopLifecycle(): void {
 
 async function bootstrap(): Promise<void> {
   const userDataDirectory = electronApp.getPath("userData");
+  const updateDirectory = path.join(userDataDirectory, "updates");
+  const recovery = new FileDesktopUpdateRecovery(updateDirectory);
+  const recoveryExecutor = new WindowsUpdateRecoveryExecutor(updateDirectory);
+  const updaterEnabled = electronApp.isPackaged
+    && process.platform === "win32"
+    && !process.env.PORTABLE_EXECUTABLE_FILE;
+  const currentVersion = electronApp.isPackaged ? electronApp.getVersion() : AGENT_HUB_VERSION;
+  if (updaterEnabled) {
+    const recoveryAction = await reconcilePendingUpdateAtStartup({
+      recovery,
+      recoveryExecutor,
+      currentVersion,
+    });
+    if (recoveryAction === "quit-for-rollback") {
+      isQuitting = true;
+      electronApp.quit();
+      return;
+    }
+  }
   const serviceScript = path.join(electronApp.getAppPath(), "dist", "server", "index.js");
   const servicePort = await findAvailableServicePort();
   hostServer = createServiceSupervisor({
@@ -74,30 +128,133 @@ async function bootstrap(): Promise<void> {
     scriptPath: serviceScript,
     port: servicePort,
     dataDir: path.join(userDataDirectory, "server"),
-    env: { AGENT_HUB_UPDATE_MANIFEST_URL: process.env.AGENT_HUB_UPDATE_MANIFEST_URL },
   });
   await hostServer.start();
   const serverInfo: DesktopServerInfo = {
     localServerUrl: hostServer.url,
     lanUrls: collectLanUrls(hostServer.port, networkInterfaces()),
     port: hostServer.port,
+    appVersion: AGENT_HUB_VERSION,
+    protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+    schemaVersion: AGENT_HUB_SCHEMA_VERSION,
   };
   const store = new ConnectionStore(
     path.join(userDataDirectory, CONNECTION_STORE_FILENAME),
     new WindowsDpapiProtector(),
   );
-  scanScheduler = startRepositoryScanScheduler({
+  const startScanner = () => startRepositoryScanScheduler({
     store,
     onError(error, connection) {
       const repository = connection?.repositoryPath ? ` (${connection.repositoryPath})` : "";
       console.error(`Agent Hub repository scan failed${repository}: ${error.message}`);
     },
   });
+  scanScheduler = startScanner();
+  hookHeartbeatScheduler = startCodexSessionHeartbeatScheduler({
+    userDataPath: userDataDirectory,
+    store,
+    onError(error, state) {
+      const session = state?.hubSessionId ? ` (${state.hubSessionId})` : "";
+      console.error(`Agent Hub Codex heartbeat failed${session}: ${error.message}`);
+    },
+  });
+  releaseRequestNotifier = startReleaseRequestNotificationScheduler({
+    store,
+    notify(request, connection) {
+      if (!Notification.isSupported()) return;
+      const notification = new Notification({
+        title: `${connection.roomName || "Agent Hub"}：保护范围交接申请`,
+        body: `${request.requesterName} 请求“${request.requestTitle}”${request.requestedPaths[0] ? `\n${request.requestedPaths[0]}` : ""}`,
+        silent: false,
+      });
+      notification.on("click", () => showMainWindow());
+      notification.show();
+    },
+    onError(error, connection) {
+      const room = connection?.roomName ? ` (${connection.roomName})` : "";
+      console.error(`Agent Hub release-request notification check failed${room}: ${error.message}`);
+    },
+  });
 
-  registerIpc(serverInfo, store, userDataDirectory);
-  mainWindow = createMainWindow(serverInfo.localServerUrl);
+  const engine = await createElectronUpdateEngine();
+  const updater = new DesktopAppUpdater({
+    engine,
+    recovery,
+    enabled: updaterEnabled,
+    currentVersion,
+    recoveryApplication: {
+      applicationDirectory: path.dirname(process.execPath),
+      applicationExecutablePath: process.execPath,
+      restoreRootDirectory: userDataDirectory,
+    },
+    recoveryExecutor,
+    installHooks: {
+      async prepareForInstall() {
+        scanScheduler?.stop();
+        scanScheduler = null;
+        await hostServer?.stop();
+        const databasePath = path.join(userDataDirectory, "server", "agent-hub.sqlite");
+        const snapshotPath = path.join(updateDirectory, "staging", "agent-hub-pre-update.sqlite");
+        const database = new DatabaseSync(databasePath);
+        try {
+          await createConsistentSqliteBackup(database, snapshotPath);
+        } finally {
+          database.close();
+        }
+        return [
+          {
+            sourcePath: snapshotPath,
+            relativeName: "server/agent-hub.sqlite",
+            restorePath: databasePath,
+            required: true,
+            removeSourceAfterCopy: true,
+          },
+        ];
+      },
+      onInstallLaunching() {
+        isQuitting = true;
+      },
+      async onInstallAborted() {
+        isQuitting = false;
+        await hostServer?.start();
+        if (!scanScheduler) scanScheduler = startScanner();
+      },
+    },
+  });
+  desktopUpdater = updater;
+
+  registerIpc(serverInfo, store, userDataDirectory, updater);
+  const window = createMainWindow(serverInfo.localServerUrl);
+  mainWindow = window;
+  unsubscribeUpdateStatus = updater.subscribe((status) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(DESKTOP_IPC.desktopUpdateStatus, status);
+    }
+  });
   if (!noTray) createTray(serverInfo);
-  await mainWindow.loadURL(serverInfo.localServerUrl);
+  await verifyStartupHealthAndMark({
+    localServerUrl: serverInfo.localServerUrl,
+    electronExecutable: process.execPath,
+    headlessRunnerPath: path.join(
+      electronApp.getAppPath(),
+      "dist",
+      "companion",
+      "headless-runner.js",
+    ),
+    expectedVersion: currentVersion,
+    loadRenderer: () => window.loadURL(serverInfo.localServerUrl),
+    markHealthy: () => updater.markCurrentStartupHealthy(),
+  });
+  updater.startAutomaticChecks();
+}
+
+async function createElectronUpdateEngine(): Promise<ElectronUpdateEngine> {
+  const { NsisUpdater } = await import("electron-updater");
+  return new NsisUpdater({
+    provider: "github",
+    owner: AGENT_HUB_RELEASE_OWNER,
+    repo: AGENT_HUB_RELEASE_REPOSITORY,
+  }) as ElectronUpdateEngine;
 }
 
 async function findAvailableServicePort(): Promise<number> {
@@ -187,6 +344,7 @@ function registerIpc(
   serverInfo: DesktopServerInfo,
   store: ConnectionStore,
   userDataDirectory: string,
+  updater: DesktopAppUpdater,
 ): void {
   const allowedRepositories = new Set<string>();
   void store.list().then((connections) => {
@@ -239,18 +397,29 @@ function registerIpc(
     return requestRoomServer(input, store);
   });
 
+  ipcMain.handle(DESKTOP_IPC.getDesktopUpdateStatus, (event) => {
+    assertTrustedRenderer(event, serverInfo.localServerUrl);
+    return updater.getStatus();
+  });
+
+  ipcMain.handle(DESKTOP_IPC.checkDesktopUpdate, async (event) => {
+    assertTrustedRenderer(event, serverInfo.localServerUrl);
+    return updater.check();
+  });
+
+  ipcMain.handle(DESKTOP_IPC.downloadDesktopUpdate, async (event) => {
+    assertTrustedRenderer(event, serverInfo.localServerUrl);
+    return updater.download();
+  });
+
+  ipcMain.handle(DESKTOP_IPC.installDesktopUpdate, async (event) => {
+    assertTrustedRenderer(event, serverInfo.localServerUrl);
+    return updater.install();
+  });
+
   ipcMain.handle(DESKTOP_IPC.applyRoomServerUpdate, async (event) => {
     assertTrustedRenderer(event, serverInfo.localServerUrl);
-    if (!hostServer) throw new Error("The local room service is not running.");
-    const connections = await store.list();
-    const local = connections.find((connection) => connection.serverUrl === serverInfo.localServerUrl);
-    if (!local) throw new Error("Save the local room connection before applying an update.");
-    const token = await store.readMemberToken(local.id);
-    const response = await fetch(`${serverInfo.localServerUrl}/api/update/status`, { headers: { Authorization: `Bearer ${token}` } });
-    const payload = await response.json() as { update?: { state?: string; stagedPath?: string } };
-    if (payload.update?.state !== "staged" || !payload.update.stagedPath) throw new Error("No verified update package is ready.");
-    await hostServer.restartWithScript(payload.update.stagedPath);
-    return { restarted: true as const, port: hostServer.port };
+    throw new Error("Room-service-only updates were retired. Use the signed desktop updater instead.");
   });
 
   ipcMain.handle(DESKTOP_IPC.installCodexIntegration, async (event, connectionId: unknown) => {

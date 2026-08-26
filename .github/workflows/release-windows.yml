@@ -21,6 +21,7 @@ jobs:
       AGENT_HUB_TOKEN: ${{ secrets.AGENT_HUB_GATE_TOKEN }}
       AGENT_HUB_SHARED_BRANCHES: ${{ vars.AGENT_HUB_SHARED_BRANCHES }}
       AGENT_HUB_BRANCH: ${{ vars.AGENT_HUB_RELEASE_BRANCH || 'main' }}
+      AGENT_HUB_ALLOW_UNGATED_RELEASE: ${{ vars.AGENT_HUB_ALLOW_UNGATED_RELEASE }}
     steps:
       - name: Checkout tag
         uses: actions/checkout@v4
@@ -40,6 +41,36 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Validate release tag and package version
+        shell: pwsh
+        run: |
+          $package = Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json
+          $expectedTag = "v$($package.version)"
+          if ("${{ github.ref_name }}" -ne $expectedTag) {
+            throw "Release tag ${{ github.ref_name }} must exactly match package version $expectedTag."
+          }
+
+      - name: Validate release notes are finalized
+        shell: pwsh
+        run: |
+          $notesPath = "docs/releases/${{ github.ref_name }}.md"
+          if (-not (Test-Path -LiteralPath $notesPath)) {
+            throw "Required release notes were not found at $notesPath."
+          }
+          $releaseNotes = Get-Content -LiteralPath $notesPath -Raw -Encoding utf8
+          $updateLog = Get-Content -LiteralPath UPDATE_LOG.txt -Raw -Encoding utf8
+          $forbiddenMarkers = @(
+            "当前为发布说明草稿",
+            "待正式发布前填写",
+            "已确认，待实现",
+            "（暂无）"
+          )
+          foreach ($marker in $forbiddenMarkers) {
+            if ($releaseNotes.Contains($marker) -or $updateLog.Contains($marker)) {
+              throw "Release documentation is not finalized; found marker: $marker"
+            }
+          }
+
       - name: Prepare Electron runtime
         shell: pwsh
         run: |
@@ -56,28 +87,60 @@ jobs:
       - name: Test
         run: pnpm test
 
+      - name: Validate Agent Hub release gate configuration
+        shell: pwsh
+        run: |
+          $hasUrl = -not [string]::IsNullOrWhiteSpace($env:AGENT_HUB_URL)
+          $hasToken = -not [string]::IsNullOrWhiteSpace($env:AGENT_HUB_TOKEN)
+          if ($hasUrl -xor $hasToken) {
+            throw "Agent Hub publication gate requires both AGENT_HUB_GATE_URL and AGENT_HUB_GATE_TOKEN."
+          }
+          if (-not $hasUrl -and $env:AGENT_HUB_ALLOW_UNGATED_RELEASE -ne "true") {
+            throw "Agent Hub publication gate is not configured. Set AGENT_HUB_ALLOW_UNGATED_RELEASE=true only for an explicitly audited ungated release."
+          }
+
       - name: Agent Hub release gate
         if: env.AGENT_HUB_URL != '' && env.AGENT_HUB_TOKEN != ''
         run: pnpm gate:publish -- --branch "$env:AGENT_HUB_BRANCH"
 
-      - name: Agent Hub gate not configured
-        if: env.AGENT_HUB_URL == '' || env.AGENT_HUB_TOKEN == ''
-        run: Write-Host "Agent Hub publication gate is not configured for this repository yet."
+      - name: Record explicit ungated release override
+        if: env.AGENT_HUB_URL == '' && env.AGENT_HUB_TOKEN == '' && env.AGENT_HUB_ALLOW_UNGATED_RELEASE == 'true'
+        run: Write-Warning "Publishing with the repository's explicit AGENT_HUB_ALLOW_UNGATED_RELEASE override."
 
-      - name: Build NSIS and portable packages
+      - name: Build signed-update-compatible NSIS package
         run: pnpm desktop:pack:ci
 
-      - name: Verify and checksum packages
+      - name: Create signed update manifest
+        shell: pwsh
+        env:
+          AGENT_HUB_UPDATE_SIGNING_KEY_B64: ${{ secrets.AGENT_HUB_UPDATE_SIGNING_KEY_B64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:AGENT_HUB_UPDATE_SIGNING_KEY_B64)) {
+            throw "Required GitHub secret AGENT_HUB_UPDATE_SIGNING_KEY_B64 is not configured."
+          }
+          $notesPath = "docs/releases/${{ github.ref_name }}.md"
+          if (-not (Test-Path -LiteralPath $notesPath)) {
+            throw "Required release notes were not found at $notesPath."
+          }
+          $env:AGENT_HUB_RELEASE_NOTES = (Get-Content -LiteralPath $notesPath -Raw -Encoding utf8).Trim()
+          node scripts/create-update-manifest.mjs --release-dir release --tag "${{ github.ref_name }}"
+
+      - name: Verify and checksum update assets
         shell: pwsh
         run: |
           $setup = @(Get-ChildItem -LiteralPath release -Filter "AgentHub-Setup-*.exe")
-          $portable = @(Get-ChildItem -LiteralPath release -Filter "AgentHub-Portable-*.exe")
+          $blockmap = @(Get-ChildItem -LiteralPath release -Filter "AgentHub-Setup-*.exe.blockmap")
           if ($setup.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($setup.Count)." }
-          if ($portable.Count -ne 1) { throw "Expected exactly one portable package, found $($portable.Count)." }
-          @($setup + $portable) |
+          if ($blockmap.Count -ne 1) { throw "Expected exactly one NSIS blockmap, found $($blockmap.Count)." }
+          $required = @(
+            (Get-Item -LiteralPath release/latest.yml),
+            (Get-Item -LiteralPath release/agent-hub-update.json),
+            (Get-Item -LiteralPath release/agent-hub-update.sig)
+          )
+          @($setup + $blockmap + $required) |
             Get-FileHash -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $([System.IO.Path]::GetFileName($_.Path))" } |
-            Set-Content -LiteralPath release/SHA256SUMS.txt -Encoding utf8
+            Set-Content -LiteralPath release/SHA256SUMS.txt -Encoding utf8NoBOM
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
@@ -85,23 +148,38 @@ jobs:
           name: AgentHub-${{ github.ref_name }}-windows-x64
           path: |
             release/AgentHub-Setup-*.exe
-            release/AgentHub-Portable-*.exe
+            release/AgentHub-Setup-*.exe.blockmap
+            release/latest.yml
+            release/agent-hub-update.json
+            release/agent-hub-update.sig
             release/SHA256SUMS.txt
           if-no-files-found: error
 
-      - name: Create GitHub Release and upload packages
+      - name: Create draft GitHub Release and upload update assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "${{ github.ref_name }}" *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create "${{ github.ref_name }}" --verify-tag --generate-notes --title "Agent Hub ${{ github.ref_name }}"
+          $notesPath = "docs/releases/${{ github.ref_name }}.md"
+          $draft = gh release view "${{ github.ref_name }}" --json isDraft --jq .isDraft 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            if ($draft -ne "true") {
+              throw "Refusing to replace assets on an already published stable release."
+            }
+          } else {
+            gh release create "${{ github.ref_name }}" --draft --verify-tag --notes-file $notesPath --title "Agent Hub ${{ github.ref_name }}"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           $releaseFiles = @(
             (Resolve-Path release/AgentHub-Setup-*.exe).Path
-            (Resolve-Path release/AgentHub-Portable-*.exe).Path
+            (Resolve-Path release/AgentHub-Setup-*.exe.blockmap).Path
+            (Resolve-Path release/latest.yml).Path
+            (Resolve-Path release/agent-hub-update.json).Path
+            (Resolve-Path release/agent-hub-update.sig).Path
             (Resolve-Path release/SHA256SUMS.txt).Path
           )
           gh release upload "${{ github.ref_name }}" @releaseFiles --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release edit "${{ github.ref_name }}" --title "Agent Hub ${{ github.ref_name }}" --notes-file $notesPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Draft release is ready for asset and release-note verification before publication."

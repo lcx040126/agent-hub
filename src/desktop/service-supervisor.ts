@@ -17,21 +17,19 @@ export interface ServiceSupervisor {
   start(): Promise<void>;
   stop(): Promise<void>;
   restart(): Promise<void>;
-  restartWithScript(scriptPath: string): Promise<void>;
 }
 
 export function createServiceSupervisor(options: ServiceSupervisorOptions): ServiceSupervisor {
   const fetchImpl = options.fetchImpl ?? fetch;
   const startupTimeoutMs = options.startupTimeoutMs ?? 15_000;
   let child: ChildProcess | null = null;
-  let activeScriptPath = options.scriptPath;
   let stopping = false;
   const url = `http://127.0.0.1:${options.port}`;
 
   const start = async () => {
     if (child && child.exitCode === null) return;
     stopping = false;
-    child = spawn(options.executable, [activeScriptPath], {
+    child = spawn(options.executable, [options.scriptPath], {
       env: {
         ...process.env,
         ...options.env,
@@ -72,20 +70,6 @@ export function createServiceSupervisor(options: ServiceSupervisorOptions): Serv
     async restart() {
       await stop();
       await start();
-    },
-    async restartWithScript(scriptPath: string) {
-      if (!scriptPath.trim()) throw new Error("An update script path is required.");
-      const previousScriptPath = activeScriptPath;
-      activeScriptPath = scriptPath;
-      await stop();
-      try {
-        await start();
-      } catch (error) {
-        await stop();
-        activeScriptPath = previousScriptPath;
-        await start().catch(() => undefined);
-        throw error;
-      }
     },
   };
 }

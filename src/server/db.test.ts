@@ -16,6 +16,18 @@ afterEach(() => {
 });
 
 describe("Agent Hub database migrations", () => {
+  it("refuses to open a database created by a newer schema", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-hub-future-db-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "agent-hub.sqlite");
+    const future = new DatabaseSync(databasePath);
+    future.exec("PRAGMA user_version = 4");
+    future.close();
+    expect(() => new AgentHubDatabase({ path: databasePath })).toThrow(
+      /newer than supported schema 3/,
+    );
+  });
+
   it("adds lease session ownership to a legacy database without losing data", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-hub-legacy-db-"));
     temporaryDirectories.push(directory);
@@ -117,12 +129,39 @@ describe("Agent Hub database migrations", () => {
       .prepare("PRAGMA table_info(leases)")
       .all() as Array<{ name: string }>;
     expect(columns.filter((column) => column.name === "session_id")).toHaveLength(1);
+    expect(columns.filter((column) => column.name === "kind")).toHaveLength(1);
     expect(database.connection
-      .prepare("SELECT id, session_id FROM leases WHERE id = 'legacy-lease'")
-      .get()).toEqual({ id: "legacy-lease", session_id: null });
+      .prepare("SELECT id, session_id, kind FROM leases WHERE id = 'legacy-lease'")
+      .get()).toEqual({ id: "legacy-lease", session_id: null, kind: "standard" });
+    expect(database.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    expect(database.connection.prepare(`
+      SELECT blocking_protection_enabled, automatic_lease_ttl_minutes,
+        maximum_exclusive_lease_minutes, risk_policy_version
+      FROM rooms WHERE id = 'legacy-room'
+    `).get()).toEqual({
+      blocking_protection_enabled: 1,
+      automatic_lease_ttl_minutes: 10,
+      maximum_exclusive_lease_minutes: 1440,
+      risk_policy_version: 1,
+    });
     expect(database.connection
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'leases_session_idx'")
       .get()).toEqual({ name: "leases_session_idx" });
+    const featureTables = database.connection
+      .prepare(`
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name LIKE 'feature_%'
+        ORDER BY name
+      `)
+      .all() as Array<{ name: string }>;
+    expect(featureTables.map((table) => table.name)).toEqual([
+      "feature_change_confirmations",
+      "feature_memories",
+      "feature_revision_events",
+      "feature_revision_targets",
+      "feature_revisions",
+    ]);
     expect(database.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
 
     const service = new AgentHubService(database);
@@ -130,9 +169,19 @@ describe("Agent Hub database migrations", () => {
       expect.objectContaining({
         id: "legacy-lease",
         sessionId: null,
+        kind: "standard",
         paths: [expect.objectContaining({ path: "Assets/Scenes/Legacy.unity", risk: "high" })],
       }),
     ]);
+    expect(service.getRoomSettings(memberToken)).toMatchObject({
+      blockingProtectionEnabled: true,
+      automaticLeaseTtlMinutes: 10,
+      maximumExclusiveLeaseMinutes: 1440,
+      riskPolicyVersion: 1,
+      riskRules: expect.arrayContaining([
+        expect.objectContaining({ kind: "category", selector: "luban", level: "warning" }),
+      ]),
+    });
     const session = service.openSession({
       memberToken,
       clientName: "Agent Hub MCP",
@@ -146,7 +195,11 @@ describe("Agent Hub database migrations", () => {
       paths: ["Assets/Scenes/Legacy.unity"],
       mode: "write",
     });
-    expect(overlapping).toMatchObject({ acquired: false, decision: "deny" });
+    expect(overlapping).toMatchObject({
+      acquired: true,
+      decision: "warn",
+      lease: { sessionId: session.id, kind: "standard" },
+    });
     expect(() => service.renewLease({
       memberToken,
       sessionId: session.id,
