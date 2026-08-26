@@ -13,6 +13,7 @@ const channels = {
   listRoomConnections: "agent-hub:list-room-connections",
   requestRoomServer: "agent-hub:request-room-server",
   installCodexIntegration: "agent-hub:install-codex-integration",
+  applyRoomServerUpdate: "agent-hub:apply-room-server-update",
 } as const;
 
 const desktopApi: AgentHubDesktopApi = Object.freeze({
@@ -27,6 +28,7 @@ const desktopApi: AgentHubDesktopApi = Object.freeze({
     ipcRenderer.invoke(channels.requestRoomServer, input),
   installCodexIntegration: (connectionId: string) =>
     ipcRenderer.invoke(channels.installCodexIntegration, connectionId),
+  applyRoomServerUpdate: () => ipcRenderer.invoke(channels.applyRoomServerUpdate),
 });
 
 contextBridge.exposeInMainWorld("agentHubDesktop", desktopApi);

@@ -16,6 +16,9 @@ const SAVED_GET_ROUTES = new Set([
   "/api/snapshot",
   "/api/context",
   "/api/activity",
+  "/api/room/settings",
+  "/api/room/context/export",
+  "/api/update/status",
 ]);
 
 const SAVED_POST_ROUTES = [
@@ -28,7 +31,13 @@ const SAVED_POST_ROUTES = [
   /^\/api\/verifications$/,
   /^\/api\/handoffs$/,
   /^\/api\/sessions$/,
-  /^\/api\/sessions\/[A-Za-z0-9_-]{1,128}\/(?:scan|close)$/,
+  /^\/api\/sessions\/[A-Za-z0-9_-]{1,128}\/(?:scan|close|sync|rebaseline)$/,
+  /^\/api\/room\/settings$/,
+  /^\/api\/room\/transfer$/,
+  /^\/api\/room\/dissolve$/,
+  /^\/api\/room\/context\/import$/,
+  /^\/api\/room\/members\/[A-Za-z0-9_-]{1,128}\/(?:role|remove)$/,
+  /^\/api\/update\/(?:check|stage)$/,
 ];
 
 interface RoomConnectionLookup {

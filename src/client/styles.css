@@ -918,6 +918,18 @@ code {
   min-width: 0;
 }
 
+.management-settings { margin: 18px 0; }
+.toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; border-bottom: 1px solid var(--line, #e1e4e8); }
+.toggle-row span { display: grid; gap: 4px; }
+.toggle-row small { color: var(--muted); }
+.toggle-row input { width: 18px; height: 18px; }
+.management-actions, .member-management-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.member-management-list { display: grid; gap: 8px; margin-top: 16px; }
+.member-management-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px; border: 1px solid var(--line, #e1e4e8); border-radius: 6px; }
+.member-management-row > div:first-child { display: grid; gap: 3px; }
+.member-management-row small { color: var(--muted); }
+.danger-button { margin-top: 18px; color: #a12828; }
+
 .section-block + .section-block,
 .right-column .section-block + .section-block {
   margin-top: 30px;

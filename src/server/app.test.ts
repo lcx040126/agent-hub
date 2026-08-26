@@ -18,6 +18,49 @@ afterEach(() => {
 });
 
 describe("Agent Hub REST API", () => {
+  it("supports owner transfer, administrator management, room settings, and removal", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    const carol = await joinRoom(app, owner.body.inviteCode, "Carol");
+    const granted = await auth(request(app).post(`/api/room/members/${bob.body.member.id}/role`).send({ isAdmin: true }), owner.body.token);
+    expect(granted.status).toBe(200);
+    const settings = await auth(request(app).post("/api/room/settings").send({ autoLockAfterAutoClaim: false }), bob.body.token);
+    expect(settings.status).toBe(200);
+    const transferred = await auth(request(app).post("/api/room/transfer").send({ targetMemberId: bob.body.member.id }), owner.body.token);
+    expect(transferred.status).toBe(200);
+    const denied = await auth(request(app).post(`/api/room/members/${carol.body.member.id}/role`).send({ isAdmin: true }), bob.body.token);
+    expect(denied.status).toBe(200);
+    const removed = await auth(request(app).post(`/api/room/members/${carol.body.member.id}/remove`).send({}), bob.body.token);
+    expect(removed.status).toBe(204);
+    const kicked = await auth(request(app).get("/api/dashboard"), carol.body.token);
+    expect(kicked.status).toBe(401);
+  });
+
+  it("locks automatic overlapping ranges when the room setting is enabled", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    await createLease(app, owner.body.token, { title: "Source work", paths: ["src/shared.ts"] });
+    const denied = await auth(request(app).post("/api/leases").send({ title: "Automatic work", paths: ["src/shared.ts"], mode: "write", branch: "main", autoClaim: true }), bob.body.token);
+    expect(denied.body).toMatchObject({ acquired: false, decision: "deny" });
+    await auth(request(app).post("/api/room/settings").send({ autoLockAfterAutoClaim: false }), owner.body.token);
+    const warning = await auth(request(app).post("/api/leases").send({ title: "Automatic work", paths: ["src/shared.ts"], mode: "write", branch: "main", autoClaim: true }), bob.body.token);
+    expect(warning.body).toMatchObject({ acquired: false, decision: "warn" });
+  });
+
+  it("freezes a session and cancels its leases when the branch changes", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const session = await auth(request(app).post("/api/sessions").send({ branch: "feature/a", baseCommit: "aaaa1111" }), owner.body.token);
+    const lease = await auth(request(app).post("/api/leases").send({ title: "Work", paths: ["src/a.ts"], branch: "feature/a", baseCommit: "aaaa1111", sessionId: session.body.session.id }), owner.body.token);
+    expect(lease.body.acquired).toBe(true);
+    const changed = await auth(request(app).post(`/api/sessions/${session.body.session.id}/sync`).send({ branch: "feature/b", baseCommit: "bbbb2222" }), owner.body.token);
+    expect(changed.status).toBe(409);
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases).toHaveLength(0);
+    expect(dashboard.body.sessions[0].status).toBe("frozen");
+  });
   it("creates a room, stores only a token hash, joins a member, and protects the dashboard", async () => {
     const { app, database } = testApp();
     const created = await createRoom(app);

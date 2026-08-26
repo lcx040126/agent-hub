@@ -4,7 +4,7 @@ export type HealthResponse = {
   version: string;
 };
 
-export type MemberRole = "owner" | "member" | "viewer";
+export type MemberRole = "owner" | "admin" | "member" | "viewer";
 export type LeaseMode = "read" | "write";
 export type LeaseStatus = "active" | "completed" | "released" | "expired";
 export type ConflictDecision = "allow" | "warn" | "deny";
@@ -26,6 +26,8 @@ export type MemberSummary = {
   role: MemberRole;
   clientName?: string;
   lastSeenAt: string;
+  isAdmin?: boolean;
+  removedAt?: string;
 };
 
 export type LeaseSummary = {

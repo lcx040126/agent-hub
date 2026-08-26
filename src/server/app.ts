@@ -9,6 +9,7 @@ import {
   type AddRecordInput,
   type CloseLeaseReportInput,
 } from "./service.js";
+import { UpdateCoordinator } from "./update-coordinator.js";
 
 export interface CreateAgentHubAppOptions {
   database?: AgentHubDatabase;
@@ -17,6 +18,7 @@ export interface CreateAgentHubAppOptions {
   service?: AgentHubService;
   mcpUrl?: string;
   includeNotFound?: boolean;
+  updateCoordinator?: UpdateCoordinator;
 }
 
 export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): express.Express {
@@ -31,6 +33,7 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
   const app = express();
   app.locals.agentHubService = service;
   app.locals.agentHubDatabase = database;
+  const updates = options.updateCoordinator;
 
   app.use((request, response, next) => {
     const origin = request.header("origin");
@@ -48,7 +51,26 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
   });
   app.use(express.json({ limit: "256kb" }));
   app.get("/api/health", (_request, response) => {
-    response.json({ status: "ok", service: "agent-hub", version: "0.1.0" });
+    response.json({ status: "ok", service: "agent-hub", version: "0.1.0", protocolVersion: 1, schemaVersion: 2, update: updates?.getStatus() ?? { state: "unconfigured" } });
+  });
+
+  app.get("/api/update/status", (request, response) => {
+    service.authenticateMemberToken(bearerToken(request));
+    response.json({ update: updates?.getStatus() ?? { state: "unconfigured" } });
+  });
+
+  app.post("/api/update/check", async (request, response) => {
+    const auth = service.authenticateMemberToken(bearerToken(request));
+    if (auth.member.role !== "host") throw new AgentHubError("owner_required", "Only the room owner can check for updates.", 403);
+    if (!updates) throw new AgentHubError("update_unconfigured", "No update source is configured.", 503);
+    response.json({ update: await updates.check() });
+  });
+
+  app.post("/api/update/stage", async (request, response) => {
+    const auth = service.authenticateMemberToken(bearerToken(request));
+    if (auth.member.role !== "host") throw new AgentHubError("owner_required", "Only the room owner can stage updates.", 403);
+    if (!updates) throw new AgentHubError("update_unconfigured", "No update source is configured.", 503);
+    response.json({ update: await updates.stage(), backup: await updates.backupDatabase() });
   });
 
   app.post("/api/rooms", (request, response) => {
@@ -106,6 +128,43 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
     response.json(service.getSnapshot(bearerToken(request)));
   });
 
+  app.get("/api/room/settings", (request, response) => {
+    response.json({ settings: service.getRoomSettings(bearerToken(request)) });
+  });
+
+  app.post("/api/room/settings", (request, response) => {
+    const body = bodyObject(request);
+    response.json({ settings: service.updateRoomSettings({ memberToken: bearerToken(request), autoLockAfterAutoClaim: Boolean(body.autoLockAfterAutoClaim) }) });
+  });
+
+  app.post("/api/room/members/:id/role", (request, response) => {
+    const body = bodyObject(request);
+    response.json({ member: memberResponse(service.changeMemberRole({ memberToken: bearerToken(request), targetMemberId: parameter(request, "id"), isAdmin: Boolean(body.isAdmin) })) });
+  });
+
+  app.post("/api/room/members/:id/remove", (request, response) => {
+    service.removeMember({ memberToken: bearerToken(request), targetMemberId: parameter(request, "id") });
+    response.status(204).end();
+  });
+
+  app.post("/api/room/transfer", (request, response) => {
+    const body = bodyObject(request);
+    response.json({ member: memberResponse(service.transferOwnership({ memberToken: bearerToken(request), targetMemberId: value(body, "targetMemberId") })) });
+  });
+
+  app.post("/api/room/dissolve", (request, response) => {
+    service.dissolveRoom(bearerToken(request));
+    response.status(204).end();
+  });
+
+  app.get("/api/room/context/export", (request, response) => {
+    response.json(service.exportContext(bearerToken(request)));
+  });
+
+  app.post("/api/room/context/import", (request, response) => {
+    response.json(service.importContext({ memberToken: bearerToken(request), payload: request.body }));
+  });
+
   app.get("/api/context", (request, response) => {
     response.json(service.getRelevantContext(bearerToken(request), queryPaths(request)));
   });
@@ -135,6 +194,7 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       paths: stringArrayValue(body.paths),
       mode: optionalValue(body, "mode") as "read" | "write" | undefined,
       overrideReason: optionalValue(body, "overrideReason"),
+      autoClaim: body.autoClaim === true,
       ttlMs: ttlMinutes === undefined ? optionalNumber(body.ttlMs) : ttlMinutes * 60_000,
     });
     response.status(result.acquired ? 201 : 200).json({
@@ -297,6 +357,16 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
     response.status(201).json({ scan });
   });
 
+  app.post("/api/sessions/:id/sync", (request, response) => {
+    const body = bodyObject(request);
+    response.json({ session: service.syncSessionBranch({ memberToken: bearerToken(request), sessionId: parameter(request, "id"), branch: optionalValue(body, "branch"), baseCommit: optionalValue(body, "baseCommit") }) });
+  });
+
+  app.post("/api/sessions/:id/rebaseline", (request, response) => {
+    const body = bodyObject(request);
+    response.json({ session: service.rebaselineSession({ memberToken: bearerToken(request), sessionId: parameter(request, "id"), branch: optionalValue(body, "branch"), baseCommit: optionalValue(body, "baseCommit") }) });
+  });
+
   app.post("/api/sessions/:id/close", (request, response) => {
     const body = bodyObject(request);
     const session = service.closeSession({
@@ -344,6 +414,8 @@ function roomResponse(room: ReturnType<AgentHubService["authenticateMemberToken"
     repository: room.repository,
     defaultBranch: room.defaultBranch,
     createdAt: room.createdAt,
+    status: room.status,
+    autoLockAfterAutoClaim: room.autoLockAfterAutoClaim,
   };
 }
 
@@ -352,7 +424,9 @@ function memberResponse(member: ReturnType<AgentHubService["authenticateMemberTo
     id: member.id,
     name: member.displayName,
     displayName: member.displayName,
-    role: member.role === "host" ? "owner" : "member",
+    role: member.role === "host" ? "owner" : member.isAdmin ? "admin" : "member",
+    isAdmin: member.isAdmin,
+    removedAt: member.removedAt ?? undefined,
     clientName: member.agent ?? undefined,
     agent: member.agent,
     lastSeenAt: member.lastSeenAt,

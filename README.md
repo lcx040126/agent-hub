@@ -45,6 +45,18 @@ Agent Hub 是一个面向多人、多 Agent 开发的项目协作房间。它让
 
 成员凭证由 Windows DPAPI 加密后保存在本机，不会写入项目仓库。不同成员应各自加入房间并安装连接，不要相互复制成员凭证。
 
+### 房间管理与服务更新
+
+房主或管理员进入“房间管理”后，可以调整自动范围锁定、管理成员并导出/导入结构化项目上下文。房主额外拥有房主交接、解散房间和更新检查权限；管理员不能解散房间或转移房主。
+
+如果房主服务配置了内网更新清单，房主可在管理界面检查并准备更新包。配置方式：
+
+```powershell
+$env:AGENT_HUB_UPDATE_MANIFEST_URL="http://内网地址/agent-hub/manifest.json"
+```
+
+更新清单必须包含 `version`、`protocolVersion`、`schemaVersion`、`packageUrl` 和 64 位十六进制 `sha256`，可选 `sizeBytes` 与 `notes`。更新包应是可独立运行的 Node `.mjs` 房间服务入口，并从 `HOST`、`PORT`、`AGENT_HUB_DATA_DIR` 读取运行参数。Agent Hub 会先下载、校验并暂存更新包，同时备份 SQLite 数据库；房主点击“应用更新”后 supervisor 会短暂重启服务，健康检查失败则自动恢复旧入口。
+
 ## 日常怎么用
 
 完成首次设置后，正常情况下只需要保持 Agent Hub 运行，然后照常在 Codex 中打开该项目并开发：

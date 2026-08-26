@@ -36,6 +36,8 @@ export interface Room {
   repository: string;
   defaultBranch: string;
   createdAt: string;
+  status: "active" | "dissolved";
+  autoLockAfterAutoClaim: boolean;
 }
 
 export interface Member {
@@ -46,6 +48,8 @@ export interface Member {
   agent: string | null;
   createdAt: string;
   lastSeenAt: string;
+  isAdmin: boolean;
+  removedAt: string | null;
 }
 
 export interface LeasePath {
@@ -234,6 +238,7 @@ export interface ClaimLeaseInput {
   mode?: LeaseMode;
   overrideReason?: string;
   ttlMs?: number;
+  autoClaim?: boolean;
 }
 
 export interface RenewLeaseInput {
@@ -269,7 +274,9 @@ export interface WorkSession {
   worktree: string | null;
   baseCommit: string | null;
   task: string | null;
-  status: "active" | "closed";
+  status: "active" | "frozen" | "closed";
+  branchEpoch: number;
+  frozenReason: string | null;
   metadata: Record<string, unknown>;
   openedAt: string;
   lastSeenAt: string;
@@ -290,6 +297,24 @@ export interface LocalScan {
   systems: string[];
   metadata: Record<string, unknown>;
   scannedAt: string;
+}
+
+export interface RoomSettings {
+  autoLockAfterAutoClaim: boolean;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export interface ContextExport {
+  format: "agent-hub-context";
+  version: 1;
+  room: { id: string; name: string; projectName: string };
+  exportedAt: string;
+  contextEntries: Array<Omit<ContextEntry, "id" | "roomId" | "authorMemberId"> & { originalId?: string }>;
+  decisions: Array<Omit<Decision, "id" | "roomId" | "authorMemberId"> & { originalId?: string }>;
+  verifications: Array<Omit<Verification, "id" | "roomId" | "authorMemberId"> & { originalId?: string }>;
+  handoffs: Array<Omit<Handoff, "id" | "roomId" | "fromMemberId" | "toMemberId" | "leaseId"> & { originalId?: string }>;
+  records: Array<Omit<ProjectRecord, "id" | "roomId" | "memberId"> & { originalId?: string }>;
 }
 
 export interface ReleaseLeaseInput {

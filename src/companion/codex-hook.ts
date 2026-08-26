@@ -149,6 +149,20 @@ async function handlePreToolUse(
   if (!intent.writes) return undefined;
   const runtime = await findHookRuntime(options, input);
   if (!runtime) return undefined;
+  runtime.git = await inspectGitWorkingState(runtime.connection.repositoryPath, { gitExecutable: options.gitExecutable });
+  try {
+    await runtime.client.post(`/api/sessions/${encodeURIComponent(runtime.state.hubSessionId)}/sync`, {
+      branch: runtime.git.branch,
+      baseCommit: runtime.git.headCommit,
+    });
+  } catch (error) {
+    if (error instanceof AgentHubHttpError && (error.code === "branch_changed" || error.code === "session_frozen")) {
+      runtime.state.quarantine = { reason: error.message, paths: [], detectedAt: new Date().toISOString() };
+      await runtime.stateStore.save(runtime.state);
+      return denyOutput(`${error.message} 请确认新分支基线后重新开始 Codex 会话。`);
+    }
+    throw error;
+  }
   if (runtime.state.quarantine) {
     return denyOutput(
       `Agent Hub 已隔离当前会话，因为先前检测到越界写入：${runtime.state.quarantine.reason}`
@@ -195,6 +209,7 @@ async function handlePreToolUse(
     paths,
     mode: "write",
     ttlMinutes: LEASE_TTL_MINUTES,
+    autoClaim: true,
   });
   if (!claim.acquired || !claim.lease) {
     return denyOutput(formatConflicts(claim.conflicts ?? [], claim.decision));

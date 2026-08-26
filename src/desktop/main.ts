@@ -1,8 +1,6 @@
-import { createServer, type Server } from "node:http";
 import { homedir, networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import express from "express";
 import {
   app as electronApp,
   BrowserWindow,
@@ -22,17 +20,13 @@ import {
   startRepositoryScanScheduler,
   type RepositoryScanScheduler,
 } from "../companion/scan-scheduler.js";
-import { createAgentHubApp } from "../server/app.js";
-import { AgentHubDatabase } from "../server/db.js";
-import { createMcpServiceAdapter } from "../server/mcp-adapter.js";
-import { createMcpRouter } from "../server/mcp.js";
-import { AgentHubService } from "../server/service.js";
 import { installCodexMcpConfig, codexServerName } from "./codex-config.js";
 import { CONNECTION_STORE_FILENAME, ConnectionStore } from "./connection-store.js";
 import { DESKTOP_IPC, type SaveRoomConnectionInput, type DesktopServerInfo } from "./contracts.js";
 import { installHeadlessLauncher } from "./headless-launcher.js";
 import { candidatePorts, collectLanUrls } from "./network.js";
 import { requestRoomServer } from "./room-server-proxy.js";
+import { createServiceSupervisor, type ServiceSupervisor } from "./service-supervisor.js";
 
 const HOST = "0.0.0.0";
 const PREFERRED_PORT = 4173;
@@ -40,8 +34,7 @@ const noTray = process.argv.includes("--no-tray");
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
-let hostServer: Server | null = null;
-let database: AgentHubDatabase | null = null;
+let hostServer: ServiceSupervisor | null = null;
 let scanScheduler: RepositoryScanScheduler | null = null;
 let isQuitting = false;
 
@@ -57,9 +50,8 @@ function startDesktopLifecycle(): void {
     isQuitting = true;
     scanScheduler?.stop();
     scanScheduler = null;
-    hostServer?.close();
-    database?.close();
-    database = null;
+    void hostServer?.stop();
+    hostServer = null;
   });
   electronApp.on("activate", () => showMainWindow());
   electronApp.on("window-all-closed", () => {
@@ -75,16 +67,20 @@ function startDesktopLifecycle(): void {
 
 async function bootstrap(): Promise<void> {
   const userDataDirectory = electronApp.getPath("userData");
-  database = new AgentHubDatabase({ dataDir: path.join(userDataDirectory, "server") });
-  const service = new AgentHubService(database);
-  const clientDirectory = fileURLToPath(new URL("../client/", import.meta.url));
-  const webApp = createDesktopWebApp(clientDirectory, service, database);
-  const listening = await listenOnAvailablePort(webApp);
-  hostServer = listening.server;
+  const serviceScript = path.join(electronApp.getAppPath(), "dist", "server", "index.js");
+  const servicePort = await findAvailableServicePort();
+  hostServer = createServiceSupervisor({
+    executable: process.execPath,
+    scriptPath: serviceScript,
+    port: servicePort,
+    dataDir: path.join(userDataDirectory, "server"),
+    env: { AGENT_HUB_UPDATE_MANIFEST_URL: process.env.AGENT_HUB_UPDATE_MANIFEST_URL },
+  });
+  await hostServer.start();
   const serverInfo: DesktopServerInfo = {
-    localServerUrl: `http://127.0.0.1:${listening.port}`,
-    lanUrls: collectLanUrls(listening.port, networkInterfaces()),
-    port: listening.port,
+    localServerUrl: hostServer.url,
+    lanUrls: collectLanUrls(hostServer.port, networkInterfaces()),
+    port: hostServer.port,
   };
   const store = new ConnectionStore(
     path.join(userDataDirectory, CONNECTION_STORE_FILENAME),
@@ -104,53 +100,13 @@ async function bootstrap(): Promise<void> {
   await mainWindow.loadURL(serverInfo.localServerUrl);
 }
 
-function createDesktopWebApp(
-  clientDirectory: string,
-  service: AgentHubService,
-  agentHubDatabase: AgentHubDatabase,
-): express.Express {
-  const webApp = express();
-  webApp.disable("x-powered-by");
-  webApp.use((_request, response, next) => {
-    response.setHeader(
-      "Content-Security-Policy",
-      "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
-    );
-    response.setHeader("Referrer-Policy", "no-referrer");
-    response.setHeader("X-Content-Type-Options", "nosniff");
-    next();
-  });
-  webApp.use(
-    express.static(clientDirectory, {
-      index: "index.html",
-      setHeaders(response, filePath) {
-        if (path.basename(filePath) === "index.html") response.setHeader("Cache-Control", "no-store");
-      },
-    }),
-  );
-  webApp.use("/mcp", createMcpRouter(createMcpServiceAdapter(service)));
-  const apiApp = createAgentHubApp({ database: agentHubDatabase, service });
-  apiApp.disable("x-powered-by");
-  webApp.use(apiApp);
-  return webApp;
-}
-
-async function listenOnAvailablePort(webApp: express.Express): Promise<{ server: Server; port: number }> {
+async function findAvailableServicePort(): Promise<number> {
   for (const port of candidatePorts(PREFERRED_PORT)) {
-    const server = createServer(webApp);
     try {
-      await new Promise<void>((resolve, reject) => {
-        const onError = (error: NodeJS.ErrnoException) => reject(error);
-        server.once("error", onError);
-        server.listen(port, HOST, () => {
-          server.off("error", onError);
-          resolve();
-        });
-      });
-      return { server, port };
-    } catch (error) {
-      server.close();
-      if (!isAddressInUse(error)) throw error;
+      const probe = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(150) });
+      if (!probe.ok) return port;
+    } catch {
+      return port;
     }
   }
   throw new Error("Agent Hub could not find an available local port from 4173 through 4272.");
@@ -281,6 +237,20 @@ function registerIpc(
   ipcMain.handle(DESKTOP_IPC.requestRoomServer, async (event, input: unknown) => {
     assertTrustedRenderer(event, serverInfo.localServerUrl);
     return requestRoomServer(input, store);
+  });
+
+  ipcMain.handle(DESKTOP_IPC.applyRoomServerUpdate, async (event) => {
+    assertTrustedRenderer(event, serverInfo.localServerUrl);
+    if (!hostServer) throw new Error("The local room service is not running.");
+    const connections = await store.list();
+    const local = connections.find((connection) => connection.serverUrl === serverInfo.localServerUrl);
+    if (!local) throw new Error("Save the local room connection before applying an update.");
+    const token = await store.readMemberToken(local.id);
+    const response = await fetch(`${serverInfo.localServerUrl}/api/update/status`, { headers: { Authorization: `Bearer ${token}` } });
+    const payload = await response.json() as { update?: { state?: string; stagedPath?: string } };
+    if (payload.update?.state !== "staged" || !payload.update.stagedPath) throw new Error("No verified update package is ready.");
+    await hostServer.restartWithScript(payload.update.stagedPath);
+    return { restarted: true as const, port: hostServer.port };
   });
 
   ipcMain.handle(DESKTOP_IPC.installCodexIntegration, async (event, connectionId: unknown) => {

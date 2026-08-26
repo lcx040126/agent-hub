@@ -75,6 +75,7 @@ export interface AgentHubDesktopApi {
   listRoomConnections(): Promise<SavedRoomConnection[]>;
   requestRoomServer(input: RoomServerRequestInput): Promise<RoomServerResponse>;
   installCodexIntegration(connectionId: string): Promise<CodexInstallResult>;
+  applyRoomServerUpdate(): Promise<{ restarted: true; port: number }>;
 }
 
 export const DESKTOP_IPC = {
@@ -85,4 +86,5 @@ export const DESKTOP_IPC = {
   listRoomConnections: "agent-hub:list-room-connections",
   requestRoomServer: "agent-hub:request-room-server",
   installCodexIntegration: "agent-hub:install-codex-integration",
+  applyRoomServerUpdate: "agent-hub:apply-room-server-update",
 } as const;

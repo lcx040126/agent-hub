@@ -2,9 +2,11 @@ import { once } from "node:events";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
 import express from "express";
 import { createAgentHubApp } from "./app.js";
 import type { AgentHubDatabase } from "./db.js";
+import { UpdateCoordinator } from "./update-coordinator.js";
 
 export interface StartAgentHubServerOptions {
   host?: string;
@@ -26,10 +28,17 @@ export async function startAgentHubServer(
   options: StartAgentHubServerOptions = {},
 ): Promise<AgentHubRuntime> {
   const host = options.host ?? "0.0.0.0";
+  const databasePath = options.databasePath ?? resolve(options.dataDir ?? process.env.AGENT_HUB_DATA_DIR ?? join(process.cwd(), "data"), "agent-hub.sqlite");
+  const updates = new UpdateCoordinator({
+    manifestUrl: process.env.AGENT_HUB_UPDATE_MANIFEST_URL,
+    stagingDirectory: resolve(options.dataDir ?? process.env.AGENT_HUB_DATA_DIR ?? join(process.cwd(), "data"), "updates"),
+    databasePath,
+  });
   const app = createAgentHubApp({
     dataDir: options.dataDir,
     databasePath: options.databasePath,
     includeNotFound: false,
+    updateCoordinator: updates,
   });
   const development = options.development ?? process.env.NODE_ENV !== "production";
   let closeFrontend: () => Promise<void> = async () => {};

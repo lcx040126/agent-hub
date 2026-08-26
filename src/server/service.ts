@@ -37,6 +37,8 @@ import {
   type Verification,
   type WorkSession,
   type ClaimLeaseInput,
+  type ContextExport,
+  type RoomSettings,
 } from "./domain.js";
 import { AgentHubDatabase } from "./db.js";
 
@@ -128,6 +130,41 @@ export interface DashboardData {
   sessions: WorkSession[];
   localScans: LocalScan[];
 }
+
+export interface UpdateRoomSettingsInput {
+  memberToken: string;
+  autoLockAfterAutoClaim: boolean;
+}
+
+export interface ChangeMemberRoleInput {
+  memberToken: string;
+  targetMemberId: string;
+  isAdmin: boolean;
+}
+
+export interface RemoveMemberInput {
+  memberToken: string;
+  targetMemberId: string;
+}
+
+export interface TransferOwnershipInput {
+  memberToken: string;
+  targetMemberId: string;
+}
+
+export interface ImportContextInput {
+  memberToken: string;
+  payload: unknown;
+}
+
+export interface SyncSessionBranchInput {
+  memberToken: string;
+  sessionId: string;
+  branch?: string;
+  baseCommit?: string;
+}
+
+export interface RebaselineSessionInput extends SyncSessionBranchInput {}
 
 export interface AgentHubServiceOptions {
   now?: () => Date;
@@ -262,9 +299,10 @@ export class AgentHubService {
       .prepare(`
         SELECT
           m.id AS member_id, m.room_id, m.name AS member_name, m.role, m.client_name,
-          m.created_at AS member_created_at, m.last_seen_at,
+          m.created_at AS member_created_at, m.last_seen_at, m.is_admin, m.removed_at,
           r.code, r.name AS room_name, r.project_name, r.repository,
-          r.default_branch, r.created_at AS room_created_at
+          r.default_branch, r.created_at AS room_created_at, r.status AS room_status,
+          r.auto_lock_after_auto_claim, r.settings_updated_at, r.settings_updated_by
         FROM members m
         JOIN rooms r ON r.id = m.room_id
         WHERE m.token_hash = ?
@@ -273,6 +311,8 @@ export class AgentHubService {
     if (!row) {
       throw new AgentHubError("unauthorized", "The member token is invalid.", 401);
     }
+    if (row.removed_at) throw new AgentHubError("member_removed", "This member has been removed from the room.", 403);
+    if ((typeof row.room_status === "string" ? row.room_status : "active") === "dissolved") throw new AgentHubError("room_dissolved", "This room has been dissolved.", 410);
 
     const lastSeenAt = this.timestamp();
     this.database.connection
@@ -320,6 +360,129 @@ export class AgentHubService {
     };
   }
 
+  getRoomSettings(memberToken: string): RoomSettings {
+    const auth = this.authenticateMemberToken(memberToken);
+    return {
+      autoLockAfterAutoClaim: auth.room.autoLockAfterAutoClaim,
+      updatedAt: (this.database.connection.prepare("SELECT settings_updated_at FROM rooms WHERE id = ?").get(auth.room.id) as Row | undefined)?.settings_updated_at as string ?? auth.room.createdAt,
+      updatedBy: (this.database.connection.prepare("SELECT settings_updated_by FROM rooms WHERE id = ?").get(auth.room.id) as Row | undefined)?.settings_updated_by as string ?? auth.member.displayName,
+    };
+  }
+
+  updateRoomSettings(input: UpdateRoomSettingsInput): RoomSettings {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    this.requireAdmin(auth);
+    if (typeof input.autoLockAfterAutoClaim !== "boolean") throw new AgentHubError("invalid_setting", "autoLockAfterAutoClaim must be boolean.");
+    const now = this.timestamp();
+    this.database.transaction(() => {
+      this.database.connection.prepare("UPDATE rooms SET auto_lock_after_auto_claim = ?, settings_updated_at = ?, settings_updated_by = ? WHERE id = ?").run(input.autoLockAfterAutoClaim ? 1 : 0, now, auth.member.id, auth.room.id);
+      this.auditRecord(auth, "room.settings.updated", "room", auth.room.id, `${auth.member.displayName} updated room settings.`, { autoLockAfterAutoClaim: input.autoLockAfterAutoClaim });
+    });
+    return { autoLockAfterAutoClaim: input.autoLockAfterAutoClaim, updatedAt: now, updatedBy: auth.member.displayName };
+  }
+
+  changeMemberRole(input: ChangeMemberRoleInput): Member {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    this.requireOwner(auth);
+    const target = this.requireRoomMember(input.targetMemberId, auth.room.id);
+    if (target.role === "host") throw new AgentHubError("owner_role_immutable", "The owner cannot be changed to an administrator.", 409);
+    const now = this.timestamp();
+    this.database.transaction(() => {
+      this.database.connection.prepare("UPDATE members SET is_admin = ? WHERE id = ? AND room_id = ? AND removed_at IS NULL").run(input.isAdmin ? 1 : 0, target.id, auth.room.id);
+      this.auditRecord(auth, input.isAdmin ? "member.admin_granted" : "member.admin_revoked", "member", target.id, `${auth.member.displayName} changed ${target.displayName}'s administrator status.`, { isAdmin: input.isAdmin });
+    });
+    return this.requireMemberById(target.id);
+  }
+
+  removeMember(input: RemoveMemberInput): void {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const target = this.requireRoomMember(input.targetMemberId, auth.room.id);
+    if (target.id === auth.member.id || target.role === "host") throw new AgentHubError("member_remove_forbidden", "The owner cannot be removed and members cannot remove themselves.", 403);
+    if (!this.isOwner(auth) && (!auth.member.isAdmin || target.isAdmin)) throw new AgentHubError("member_remove_forbidden", "Only the owner can remove administrators.", 403);
+    const now = this.timestamp();
+    this.database.transaction(() => {
+      this.database.connection.prepare("UPDATE members SET removed_at = ?, token_hash = ? WHERE id = ? AND room_id = ?").run(now, `revoked_${randomUUID()}`, target.id, auth.room.id);
+      this.auditRecord(auth, "member.removed", "member", target.id, `${auth.member.displayName} removed ${target.displayName} from the room.`, {});
+    });
+  }
+
+  transferOwnership(input: TransferOwnershipInput): Member {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    this.requireOwner(auth);
+    const target = this.requireRoomMember(input.targetMemberId, auth.room.id);
+    if (target.id === auth.member.id) throw new AgentHubError("owner_transfer_invalid", "The owner is already this member.", 409);
+    const now = this.timestamp();
+    this.database.transaction(() => {
+      this.database.connection.prepare("UPDATE members SET role = 'member', is_admin = 0 WHERE id = ?").run(auth.member.id);
+      this.database.connection.prepare("UPDATE members SET role = 'host', is_admin = 0 WHERE id = ? AND room_id = ? AND removed_at IS NULL").run(target.id, auth.room.id);
+      this.auditRecord(auth, "room.owner_transferred", "member", target.id, `${auth.member.displayName} transferred room ownership to ${target.displayName}.`, { previousOwnerId: auth.member.id });
+    });
+    return this.requireMemberById(target.id);
+  }
+
+  dissolveRoom(memberToken: string): void {
+    const auth = this.authenticateMemberToken(memberToken);
+    this.requireOwner(auth);
+    const now = this.timestamp();
+    this.database.transaction(() => {
+      this.database.connection.prepare("UPDATE rooms SET status = 'dissolved', dissolved_at = ? WHERE id = ?").run(now, auth.room.id);
+      this.database.connection.prepare("UPDATE members SET token_hash = ? WHERE room_id = ?").run(`revoked_${randomUUID()}`, auth.room.id);
+      this.auditRecord(auth, "room.dissolved", "room", auth.room.id, `${auth.member.displayName} dissolved the room.`, {});
+    });
+  }
+
+  exportContext(memberToken: string): ContextExport {
+    const auth = this.authenticateMemberToken(memberToken);
+    this.requireAdmin(auth);
+    return {
+      format: "agent-hub-context",
+      version: 1,
+      room: { id: auth.room.id, name: auth.room.name, projectName: auth.room.projectName },
+      exportedAt: this.timestamp(),
+      contextEntries: this.listContextEntries(auth.room.id).map(({ id, roomId, authorMemberId, ...entry }) => ({ ...entry, originalId: id })),
+      decisions: this.listDecisions(auth.room.id).map(({ id, roomId, authorMemberId, ...entry }) => ({ ...entry, originalId: id })),
+      verifications: this.listVerifications(auth.room.id).map(({ id, roomId, authorMemberId, ...entry }) => ({ ...entry, originalId: id })),
+      handoffs: this.listHandoffs(auth.room.id).map(({ id, roomId, fromMemberId, toMemberId, leaseId, ...entry }) => ({ ...entry, originalId: id })),
+      records: this.listRecords(auth.room.id).map(({ id, roomId, memberId, ...entry }) => ({ ...entry, originalId: id })),
+    };
+  }
+
+  importContext(input: ImportContextInput): { imported: number; rejected: number } {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    this.requireAdmin(auth);
+    const payload = input.payload as Partial<ContextExport>;
+    if (!payload || payload.format !== "agent-hub-context" || payload.version !== 1) throw new AgentHubError("invalid_context_export", "Unsupported context export format.");
+    const arrays = [payload.contextEntries, payload.decisions, payload.verifications, payload.handoffs, payload.records];
+    if (arrays.some((items) => !Array.isArray(items) || items.length > 500)) throw new AgentHubError("invalid_context_export", "Context export contains too many records.");
+    let imported = 0;
+    const now = this.timestamp();
+    this.database.transaction(() => {
+      for (const entry of payload.contextEntries ?? []) {
+        const value = entry as any;
+        this.database.connection.prepare("INSERT INTO context_entries (id, room_id, author_member_id, kind, title, content, paths_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, value.kind, requiredString(value.title, "Context title", 200), requiredString(value.content, "Context content", 20000), json(normalizePathList(value.paths ?? [], true).map((p) => p.path)), now, now); imported++;
+      }
+      for (const entry of payload.decisions ?? []) {
+        const value = entry as any;
+        this.database.connection.prepare("INSERT INTO decisions (id, room_id, author_member_id, title, decision, rationale, paths_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, requiredString(value.title, "Decision title", 200), requiredString(value.decision, "Decision", 20000), optionalString(value.rationale, "Rationale", 10000) ?? null, json(normalizePathList(value.paths ?? [], true).map((p) => p.path)), now); imported++;
+      }
+      for (const entry of payload.verifications ?? []) {
+        const value = entry as any;
+        this.database.connection.prepare("INSERT INTO verifications (id, room_id, author_member_id, lease_id, kind, result, summary, command, evidence, created_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, value.kind, value.result, requiredString(value.summary, "Verification summary", 10000), optionalString(value.command, "Command", 10000) ?? null, optionalString(value.evidence, "Evidence", 10000) ?? null, now); imported++;
+      }
+      for (const entry of payload.handoffs ?? []) {
+        const value = entry as any;
+        this.database.connection.prepare("INSERT INTO handoffs (id, room_id, from_member_id, to_member_id, lease_id, summary, completed_json, remaining_json, risks_json, created_at) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, requiredString(value.summary, "Handoff summary", 10000), json(stringArray(value.completed, "Completed", 100, 2000)), json(stringArray(value.remaining, "Remaining", 100, 2000)), json(stringArray(value.risks, "Risks", 100, 2000)), now); imported++;
+      }
+      for (const entry of payload.records ?? []) {
+        const value = entry as any;
+        const kind = normalizeRecordKind(value.kind);
+        this.insertRecord(auth, { kind, title: requiredString(value.title, "Record title", 200), summary: requiredString(value.summary, "Record summary", 12000), paths: normalizePathList(value.paths ?? [], true).map((p) => p.path), status: optionalString(value.status, "Record status", 100) ?? defaultRecordStatus(kind), evidence: stringArray(value.evidence, "Record evidence", 100, 4000), commitHash: optionalString(value.commitHash, "Commit hash", 255) ?? null, createdAt: now }); imported++;
+      }
+      this.auditRecord(auth, "room.context.imported", "room", auth.room.id, `${auth.member.displayName} imported shared context.`, { imported });
+    });
+    return { imported, rejected: 0 };
+  }
+
   getRelevantContext(memberToken: string, paths: string[] = []): RelevantContextResult {
     const snapshot = this.getSnapshot(memberToken);
     const scopes = normalizePathList(paths, true).map((entry) => entry.path);
@@ -364,6 +527,15 @@ export class AgentHubService {
       const conflicts = mode === "write"
         ? this.findLeaseConflicts(auth.room.id, auth.member.id, sessionId, paths)
         : [];
+      if (input.autoClaim && auth.room.autoLockAfterAutoClaim) {
+        for (const conflict of conflicts) {
+          if (conflict.severity === "warning") {
+            conflict.severity = "blocking";
+            conflict.decision = "deny";
+            conflict.reason = "Automatic range locking is enabled for this room; overlapping automatic work is denied.";
+          }
+        }
+      }
       const hasBlocking = conflicts.some((conflict) => conflict.severity === "blocking");
       const hasWarning = conflicts.some((conflict) => conflict.severity === "warning");
       const decision = hasBlocking ? "deny" : hasWarning ? "warn" : "allow";
@@ -959,6 +1131,8 @@ export class AgentHubService {
       baseCommit: optionalString(input.baseCommit, "Base commit", 255),
       task: optionalString(input.task, "Task", 4000),
       status: "active",
+      branchEpoch: 1,
+      frozenReason: null,
       metadata: objectValue(input.metadata, "Session metadata"),
       openedAt: this.timestamp(),
       lastSeenAt: this.timestamp(),
@@ -995,6 +1169,43 @@ export class AgentHubService {
       });
     });
     return session;
+  }
+
+  syncSessionBranch(input: SyncSessionBranchInput): WorkSession {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const session = this.requireOwnedSession(input.sessionId, auth);
+    const branch = optionalString(input.branch, "Branch", 255) ?? null;
+    const baseCommit = optionalString(input.baseCommit, "Base commit", 255) ?? null;
+    if (session.status === "frozen") throw new AgentHubError("session_frozen", session.frozenReason ?? "The session is frozen after a branch change.", 409);
+    if (session.branch === branch) {
+      const now = this.timestamp();
+      this.database.connection.prepare("UPDATE work_sessions SET base_commit = ?, last_seen_at = ? WHERE id = ?").run(baseCommit, now, session.id);
+      return this.requireSessionById(session.id);
+    }
+    const now = this.timestamp();
+    const reason = `Branch changed from ${session.branch ?? "(unknown)"} to ${branch ?? "(detached)"}; re-baselining is required.`;
+    this.database.transaction(() => {
+      this.database.connection.prepare("UPDATE work_sessions SET branch = ?, base_commit = ?, frozen_reason = ?, last_seen_at = ? WHERE id = ?").run(branch, baseCommit, reason, now, session.id);
+      const leases = this.database.connection.prepare("SELECT id, title FROM leases WHERE session_id = ? AND status = 'active'").all(session.id) as Row[];
+      for (const lease of leases) {
+        this.database.connection.prepare("UPDATE leases SET status = 'cancelled', completed_at = ?, updated_at = ?, completion_summary = ? WHERE id = ?").run(now, now, reason, asString(lease.id));
+      }
+      this.auditRecord(auth, "session.branch_changed", "session", session.id, reason, { previousBranch: session.branch, branch, previousBaseCommit: session.baseCommit, baseCommit, cancelledLeaseCount: leases.length });
+    });
+    throw new AgentHubError("branch_changed", reason, 409, { branch, baseCommit, sessionId: session.id });
+  }
+
+  rebaselineSession(input: RebaselineSessionInput): WorkSession {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const session = this.requireOwnedSession(input.sessionId, auth);
+    const branch = optionalString(input.branch, "Branch", 255) ?? null;
+    const baseCommit = optionalString(input.baseCommit, "Base commit", 255) ?? null;
+    const now = this.timestamp();
+    this.database.transaction(() => {
+      this.database.connection.prepare("UPDATE work_sessions SET branch = ?, base_commit = ?, branch_epoch = branch_epoch + 1, frozen_reason = NULL, last_seen_at = ? WHERE id = ?").run(branch, baseCommit, now, session.id);
+      this.auditRecord(auth, "session.rebaselined", "session", session.id, "Re-baselined a session after a branch change.", { branch, baseCommit, previousBranch: session.branch });
+    });
+    return this.requireSessionById(session.id);
   }
 
   recordLocalScan(input: RecordLocalScanInput): LocalScan {
@@ -1212,8 +1423,8 @@ export class AgentHubService {
     const rows = this.database.connection
       .prepare(`
         SELECT id AS member_id, room_id, name AS member_name, role, client_name,
-          created_at AS member_created_at, last_seen_at
-        FROM members WHERE room_id = ? ORDER BY created_at ASC
+          created_at AS member_created_at, last_seen_at, is_admin, removed_at
+        FROM members WHERE room_id = ? AND removed_at IS NULL ORDER BY created_at ASC
       `)
       .all(roomId) as Row[];
     return rows.map(mapMember);
@@ -1442,7 +1653,8 @@ export class AgentHubService {
     const row = this.database.connection
       .prepare(`
         SELECT id AS room_id, code, name AS room_name, project_name, repository,
-          default_branch, created_at AS room_created_at
+          default_branch, created_at AS room_created_at, status AS room_status,
+          auto_lock_after_auto_claim, settings_updated_at, settings_updated_by
         FROM rooms WHERE id = ?
       `)
       .get(id) as Row | undefined;
@@ -1454,7 +1666,7 @@ export class AgentHubService {
     const row = this.database.connection
       .prepare(`
         SELECT id AS member_id, room_id, name AS member_name, role, client_name,
-          created_at AS member_created_at, last_seen_at
+          created_at AS member_created_at, last_seen_at, is_admin, removed_at
         FROM members WHERE id = ?
       `)
       .get(id) as Row | undefined;
@@ -1495,6 +1707,26 @@ export class AgentHubService {
       .get(id) as Row | undefined;
     if (!row) throw new AgentHubError("session_not_found", "Session not found.", 404);
     return mapSession(row);
+  }
+
+  private requireRoomMember(id: string, roomId: string): Member {
+    const member = this.requireMemberById(requiredString(id, "Member id", 128));
+    if (member.roomId !== roomId || member.removedAt) {
+      throw new AgentHubError("member_not_found", "Member not found in this room.", 404);
+    }
+    return member;
+  }
+
+  private isOwner(auth: AuthenticatedMember): boolean {
+    return auth.member.role === "host";
+  }
+
+  private requireOwner(auth: AuthenticatedMember): void {
+    if (!this.isOwner(auth)) throw new AgentHubError("owner_required", "Only the room owner can perform this operation.", 403);
+  }
+
+  private requireAdmin(auth: AuthenticatedMember): void {
+    if (!this.isOwner(auth) && !auth.member.isAdmin) throw new AgentHubError("admin_required", "Only the owner or an administrator can perform this operation.", 403);
   }
 
   private requireOwnedSession(id: string, auth: AuthenticatedMember): WorkSession {
@@ -1584,6 +1816,8 @@ function mapRoom(row: Row): Room {
     repository: asString(row.repository),
     defaultBranch: asString(row.default_branch),
     createdAt: asString(row.room_created_at),
+    status: (typeof row.room_status === "string" ? row.room_status : "active") as Room["status"],
+    autoLockAfterAutoClaim: Number(row.auto_lock_after_auto_claim ?? 1) !== 0,
   };
 }
 
@@ -1596,6 +1830,8 @@ function mapMember(row: Row): Member {
     agent: nullableString(row.client_name),
     createdAt: asString(row.member_created_at),
     lastSeenAt: asString(row.last_seen_at),
+    isAdmin: Number(row.is_admin ?? 0) !== 0,
+    removedAt: nullableString(row.removed_at),
   };
 }
 
@@ -1705,7 +1941,9 @@ function mapSession(row: Row): WorkSession {
     worktree: nullableString(row.worktree),
     baseCommit: nullableString(row.base_commit),
     task: nullableString(row.task),
-    status: asString(row.status) as WorkSession["status"],
+    status: row.frozen_reason ? "frozen" : asString(row.status) as WorkSession["status"],
+    branchEpoch: Number(row.branch_epoch ?? 1),
+    frozenReason: nullableString(row.frozen_reason),
     metadata: parseObject(row.metadata_json),
     openedAt: asString(row.opened_at),
     lastSeenAt: asString(row.last_seen_at),

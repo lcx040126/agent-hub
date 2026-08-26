@@ -51,7 +51,12 @@ export class AgentHubDatabase {
         project_name TEXT NOT NULL,
         repository TEXT NOT NULL,
         default_branch TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'dissolved')),
+        auto_lock_after_auto_claim INTEGER NOT NULL DEFAULT 1,
+        settings_updated_at TEXT,
+        settings_updated_by TEXT,
+        dissolved_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS members (
@@ -63,6 +68,8 @@ export class AgentHubDatabase {
         token_hash TEXT NOT NULL UNIQUE,
         created_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL
+        ,is_admin INTEGER NOT NULL DEFAULT 0
+        ,removed_at TEXT
       );
       CREATE INDEX IF NOT EXISTS members_room_idx ON members(room_id);
 
@@ -210,7 +217,9 @@ export class AgentHubDatabase {
         worktree TEXT,
         base_commit TEXT,
         task TEXT,
-        status TEXT NOT NULL CHECK (status IN ('active', 'closed')),
+        status TEXT NOT NULL CHECK (status IN ('active', 'frozen', 'closed')),
+        branch_epoch INTEGER NOT NULL DEFAULT 1,
+        frozen_reason TEXT,
         metadata_json TEXT NOT NULL,
         opened_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
@@ -244,6 +253,21 @@ export class AgentHubDatabase {
       );
     }
     this.connection.exec("CREATE INDEX IF NOT EXISTS leases_session_idx ON leases(session_id)");
+
+    const roomColumns = this.connection.prepare("PRAGMA table_info(rooms)").all() as Array<{ name: string }>;
+    if (!roomColumns.some((column) => column.name === "status")) this.connection.exec("ALTER TABLE rooms ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+    if (!roomColumns.some((column) => column.name === "auto_lock_after_auto_claim")) this.connection.exec("ALTER TABLE rooms ADD COLUMN auto_lock_after_auto_claim INTEGER NOT NULL DEFAULT 1");
+    if (!roomColumns.some((column) => column.name === "settings_updated_at")) this.connection.exec("ALTER TABLE rooms ADD COLUMN settings_updated_at TEXT");
+    if (!roomColumns.some((column) => column.name === "settings_updated_by")) this.connection.exec("ALTER TABLE rooms ADD COLUMN settings_updated_by TEXT");
+    if (!roomColumns.some((column) => column.name === "dissolved_at")) this.connection.exec("ALTER TABLE rooms ADD COLUMN dissolved_at TEXT");
+
+    const memberColumns = this.connection.prepare("PRAGMA table_info(members)").all() as Array<{ name: string }>;
+    if (!memberColumns.some((column) => column.name === "is_admin")) this.connection.exec("ALTER TABLE members ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0");
+    if (!memberColumns.some((column) => column.name === "removed_at")) this.connection.exec("ALTER TABLE members ADD COLUMN removed_at TEXT");
+
+    const sessionColumns = this.connection.prepare("PRAGMA table_info(work_sessions)").all() as Array<{ name: string }>;
+    if (!sessionColumns.some((column) => column.name === "branch_epoch")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN branch_epoch INTEGER NOT NULL DEFAULT 1");
+    if (!sessionColumns.some((column) => column.name === "frozen_reason")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN frozen_reason TEXT");
   }
 }
 

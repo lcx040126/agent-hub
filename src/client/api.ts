@@ -6,12 +6,16 @@ export type Room = {
   repository: string;
   defaultBranch: string;
   createdAt?: string;
+  status?: "active" | "dissolved";
+  autoLockAfterAutoClaim?: boolean;
 };
 
 export type Member = {
   id: string;
   name: string;
   role: "host" | "member" | "viewer" | string;
+  isAdmin?: boolean;
+  removedAt?: string;
   status: "online" | "away" | "offline";
   agent?: string;
   lastSeenAt?: string;
@@ -168,6 +172,7 @@ type DesktopApi = {
     mcpServerName: string;
     restartRequired: true;
   }>;
+  applyRoomServerUpdate(): Promise<{ restarted: true; port: number }>;
 };
 
 export type DesktopServerInfo = {
@@ -205,6 +210,7 @@ export type CreateLeaseInput = {
   baseCommit?: string;
   paths: string[];
   ttlMinutes: number;
+  autoClaim?: boolean;
 };
 
 export type CloseLeaseInput = {
@@ -307,6 +313,8 @@ function normalizeRoom(value: unknown, roomToken?: string): Room {
     repository: asString(room.repository, asString(room.repositoryUrl)),
     defaultBranch: asString(room.defaultBranch, "main"),
     createdAt: asString(room.createdAt) || undefined,
+    status: asString(room.status, "active") as Room["status"],
+    autoLockAfterAutoClaim: room.autoLockAfterAutoClaim !== false,
   };
 }
 
@@ -323,6 +331,7 @@ function normalizeMember(value: unknown): Member {
     id: asString(member.id),
     name: asString(member.name, asString(member.displayName, "未知成员")),
     role: rawRole === "owner" ? "host" : rawRole,
+    isAdmin: member.isAdmin === true || rawRole === "admin",
     status,
     agent: asString(member.agent, asString(member.clientName)) || undefined,
     lastSeenAt,
@@ -933,6 +942,7 @@ export async function createLease(access: RequestAccess, input: CreateLeaseInput
     paths: input.paths,
     mode: "write",
     ttlMinutes: input.ttlMinutes,
+    autoClaim: input.autoClaim,
   });
   const payload = asObject(
     await requestFirst(
@@ -955,6 +965,63 @@ export async function createLease(access: RequestAccess, input: CreateLeaseInput
         ? "allow"
         : "deny",
   };
+}
+
+export async function getRoomSettings(access: RequestAccess): Promise<{ autoLockAfterAutoClaim: boolean; updatedAt?: string; updatedBy?: string }> {
+  const payload = asObject(await requestFirst([{ path: "/api/room/settings" }], access));
+  return asObject(payload.settings) as { autoLockAfterAutoClaim: boolean; updatedAt?: string; updatedBy?: string };
+}
+
+export async function updateRoomSettings(access: RequestAccess, autoLockAfterAutoClaim: boolean): Promise<void> {
+  await requestFirst([{ path: "/api/room/settings", init: { method: "POST", body: JSON.stringify({ autoLockAfterAutoClaim }) } }], access);
+}
+
+export async function manageMember(access: RequestAccess, memberId: string, action: "admin" | "remove", isAdmin?: boolean): Promise<void> {
+  if (action === "admin") {
+    await requestFirst([{ path: `/api/room/members/${encodeURIComponent(memberId)}/role`, init: { method: "POST", body: JSON.stringify({ isAdmin: Boolean(isAdmin) }) } }], access);
+  } else {
+    await requestFirst([{ path: `/api/room/members/${encodeURIComponent(memberId)}/remove`, init: { method: "POST", body: "{}" } }], access);
+  }
+}
+
+export async function transferOwnership(access: RequestAccess, targetMemberId: string): Promise<void> {
+  await requestFirst([{ path: "/api/room/transfer", init: { method: "POST", body: JSON.stringify({ targetMemberId }) } }], access);
+}
+
+export async function dissolveRoom(access: RequestAccess): Promise<void> {
+  await requestFirst([{ path: "/api/room/dissolve", init: { method: "POST", body: "{}" } }], access);
+}
+
+export async function exportRoomContext(access: RequestAccess): Promise<unknown> {
+  return requestFirst([{ path: "/api/room/context/export" }], access);
+}
+
+export async function importRoomContext(access: RequestAccess, payload: unknown): Promise<{ imported: number; rejected: number }> {
+  return requestFirst([{ path: "/api/room/context/import", init: { method: "POST", body: JSON.stringify(payload) } }], access);
+}
+
+export async function rebaselineSession(access: RequestAccess, sessionId: string, branch: string, baseCommit: string): Promise<void> {
+  await requestFirst([{ path: `/api/sessions/${encodeURIComponent(sessionId)}/rebaseline`, init: { method: "POST", body: JSON.stringify({ branch, baseCommit }) } }], access);
+}
+
+export async function getUpdateStatus(access: RequestAccess): Promise<Record<string, unknown>> {
+  const payload = asObject(await requestFirst([{ path: "/api/update/status" }], access));
+  return asObject(payload.update);
+}
+
+export async function checkForUpdate(access: RequestAccess): Promise<Record<string, unknown>> {
+  const payload = asObject(await requestFirst([{ path: "/api/update/check", init: { method: "POST", body: "{}" } }], access));
+  return asObject(payload.update);
+}
+
+export async function stageUpdate(access: RequestAccess): Promise<Record<string, unknown>> {
+  const payload = asObject(await requestFirst([{ path: "/api/update/stage", init: { method: "POST", body: "{}" } }], access));
+  return asObject(payload.update);
+}
+
+export async function applyRoomServerUpdate(): Promise<void> {
+  if (!window.agentHubDesktop) throw new ApiError("请在桌面版中应用房间服务更新。", 400);
+  await window.agentHubDesktop.applyRoomServerUpdate();
 }
 
 export async function renewLease(access: RequestAccess, leaseId: string, ttlMinutes = 120): Promise<void> {

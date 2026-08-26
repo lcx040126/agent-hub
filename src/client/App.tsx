@@ -32,6 +32,10 @@ import {
   Users,
   X,
   XCircle,
+  Settings,
+  UserCog,
+  Download,
+  Upload,
 } from "lucide-react";
 import {
   ApiError,
@@ -42,6 +46,16 @@ import {
   createRecord,
   createRoom,
   getDashboard,
+  manageMember,
+  transferOwnership,
+  dissolveRoom,
+  exportRoomContext,
+  importRoomContext,
+  rebaselineSession,
+  checkForUpdate,
+  stageUpdate,
+  applyRoomServerUpdate,
+  updateRoomSettings,
   getDesktopServerInfo,
   installCodexConnection,
   isDesktopApp,
@@ -62,7 +76,7 @@ import {
   type Session,
 } from "./api";
 
-type View = "work" | "records" | "connection";
+type View = "work" | "records" | "connection" | "management";
 type Notice = { tone: "success" | "warning" | "danger"; message: string };
 
 const ACTIVE_STATUSES = new Set(["active", "pending", "working"]);
@@ -449,6 +463,7 @@ function AppNav({ view, onChange, open, onClose }: { view: View; onChange: (view
   const items: Array<{ id: View; label: string; icon: ReactNode }> = [
     { id: "work", label: "当前协作", icon: <Activity aria-hidden="true" /> },
     { id: "records", label: "团队记录", icon: <FileClock aria-hidden="true" /> },
+    { id: "management", label: "房间管理", icon: <UserCog aria-hidden="true" /> },
     { id: "connection", label: "连接设置", icon: <Link2 aria-hidden="true" /> },
   ];
   return (
@@ -482,6 +497,32 @@ function AppNav({ view, onChange, open, onClose }: { view: View; onChange: (view
       </aside>
     </>
   );
+}
+
+function ManagementView({ dashboard, session, onRefresh, onNotice }: { dashboard: Dashboard; session: Session; onRefresh: () => Promise<void>; onNotice: (message: string, tone?: Notice["tone"]) => void }) {
+  const canManage = dashboard.currentMember.role === "host" || dashboard.currentMember.isAdmin;
+  const isOwner = dashboard.currentMember.role === "host";
+  const [busy, setBusy] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<Record<string, unknown> | null>(null);
+  if (!canManage) return <EmptyState icon={<Settings aria-hidden="true" />} title="没有房间管理权限" detail="只有房主和管理员可以查看这里。" />;
+  const run = async (operation: () => Promise<void>, success: string) => { setBusy(true); try { await operation(); onNotice(success); await onRefresh(); } catch (error) { onNotice(error instanceof Error ? error.message : "操作失败。", "danger"); } finally { setBusy(false); } };
+  const download = async () => { const payload = await exportRoomContext(session); const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = `${dashboard.room.name}-context.json`; anchor.click(); URL.revokeObjectURL(url); onNotice("房间上下文已导出。"); };
+  const checkUpdate = () => void run(async () => { setUpdateStatus(await checkForUpdate(session)); }, "更新检查完成。");
+  const stageUpdatePackage = () => void run(async () => { setUpdateStatus(await stageUpdate(session)); }, "更新包已校验并准备就绪。");
+  const applyUpdate = () => void run(async () => { await applyRoomServerUpdate(); setUpdateStatus({ state: "restarted" }); }, "房间服务已重启，连接将自动恢复。");
+  return <div className="content-grid wide-main"><section className="section-block" aria-labelledby="management-title"><div className="section-heading"><div><span className="section-kicker">房间管理</span><h2 id="management-title">成员与房间设置</h2></div></div><div className="management-settings"><label className="toggle-row"><span><strong>自动领取后强制锁定范围</strong><small>开启后，自动领取的重叠范围会直接阻止写入。</small></span><input type="checkbox" checked={dashboard.room.autoLockAfterAutoClaim !== false} disabled={busy} onChange={(event) => void run(() => updateRoomSettings(session, event.target.checked), "房间设置已更新。")} /></label></div><div className="management-actions"><button type="button" className="secondary-button" onClick={() => void download()}><Download aria-hidden="true" />导出上下文</button><label className="secondary-button"><Upload aria-hidden="true" />导入上下文<input type="file" accept="application/json" hidden onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; void file.text().then((text) => { try { return run(() => importRoomContext(session, JSON.parse(text)).then(() => undefined), "上下文已追加导入。"); } catch (error) { onNotice(error instanceof Error ? error.message : "导入文件格式不正确。", "danger"); } }); }} /></label>{isOwner && <><button type="button" className="secondary-button" disabled={busy} onClick={checkUpdate}><RefreshCw aria-hidden="true" />检查更新</button>{updateStatus?.state === "available" && <button type="button" className="secondary-button" disabled={busy} onClick={stageUpdatePackage}><Download aria-hidden="true" />准备更新</button>}</>}</div>{updateStatus && <div className="update-status" role="status">更新状态：{String(updateStatus.state)}{updateStatus.availableVersion ? ` · ${String(updateStatus.availableVersion)}` : ""}{updateStatus.error ? ` · ${String(updateStatus.error)}` : ""}</div>}<div className="member-management-list">{dashboard.members.map((member) => <div className="member-management-row" key={member.id}><div><strong>{member.name}</strong><small>{member.role === "host" ? "房主" : member.isAdmin ? "管理员" : "成员"}</small></div>{member.id !== dashboard.currentMember.id && member.role !== "host" && <div className="member-management-actions">{isOwner && <button type="button" className="text-button" disabled={busy} onClick={() => void run(() => manageMember(session, member.id, "admin", !member.isAdmin), member.isAdmin ? "管理员权限已撤销。" : "管理员权限已授予。")}>{member.isAdmin ? "撤销管理员" : "设为管理员"}</button>}{(isOwner || (!member.isAdmin && dashboard.currentMember.isAdmin)) && <button type="button" className="text-button danger" disabled={busy} onClick={() => void run(() => manageMember(session, member.id, "remove"), "成员已移出房间。")}>踢出</button>}{isOwner && <button type="button" className="text-button" disabled={busy} onClick={() => void run(() => transferOwnership(session, member.id), "房主已交接。")}>交接房主</button>}</div>}</div>)}</div><div className="member-management-list">{dashboard.sessions.filter((item) => item.status === "frozen").map((item) => <div className="member-management-row" key={item.id}><div><strong>会话已冻结</strong><small>{item.branch || "新分支"} · {item.baseCommit || "未记录基线"}</small></div><button type="button" className="text-button" disabled={busy} onClick={() => void run(() => rebaselineSession(session, item.id, item.branch || dashboard.room.defaultBranch, item.baseCommit || "0000000"), "会话已重新建立基线。")}>重新建立基线</button></div>)}</div>{isOwner && <button type="button" className="danger-button" disabled={busy} onClick={() => { if (window.confirm("确定解散房间吗？")) void run(() => dissolveRoom(session), "房间已解散。"); }}><XCircle aria-hidden="true" />解散房间</button>}</section></div>;
+}
+
+function UpdateControl({ session, onNotice }: { session: Session; onNotice: (message: string, tone?: Notice["tone"]) => void }) {
+  const [status, setStatus] = useState<Record<string, unknown> | null>(null);
+  const [busy, setBusy] = useState(false);
+  const run = async (operation: () => Promise<Record<string, unknown> | void>, success: string) => {
+    setBusy(true);
+    try { setStatus((await operation()) as Record<string, unknown> | undefined ?? status); onNotice(success); }
+    catch (error) { onNotice(error instanceof Error ? error.message : "更新操作失败。", "danger"); }
+    finally { setBusy(false); }
+  };
+  return <div className="update-control"><button type="button" className="secondary-button" disabled={busy} onClick={() => void run(() => checkForUpdate(session), "更新检查完成。")}><RefreshCw aria-hidden="true" />检查更新</button>{status?.state === "available" && <button type="button" className="secondary-button" disabled={busy} onClick={() => void run(() => stageUpdate(session), "更新包已准备。")}><Download aria-hidden="true" />准备更新</button>}{status?.state === "staged" && isDesktopApp() && <button type="button" className="secondary-button" disabled={busy} onClick={() => void run(async () => { await applyRoomServerUpdate(); return { state: "restarted" }; }, "房间服务已重启，连接将自动恢复。")}><RefreshCw aria-hidden="true" />应用更新</button>}{status && <small>更新状态：{String(status.state)}{status.availableVersion ? ` · ${String(status.availableVersion)}` : ""}</small>}</div>;
 }
 
 function StatusSummary({ dashboard, online, conflicts }: { dashboard: Dashboard; online: boolean; conflicts?: Conflict[] }) {
@@ -1262,6 +1303,7 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
           {error && <div className="inline-alert"><AlertTriangle aria-hidden="true" />{error}</div>}
           {view === "work" && <WorkView dashboard={dashboard} busyLeaseId={busyLeaseId} transientConflicts={transientConflicts} onClaim={() => setClaimOpen(true)} onRenew={handleRenew} onClose={setClosingLease} />}
           {view === "records" && <RecordsView dashboard={dashboard} onAdd={setRecordKind} />}
+          {view === "management" && <><ManagementView dashboard={dashboard} session={session} onRefresh={() => refresh(true)} onNotice={(message, tone = "success") => setNotice({ message, tone })} />{dashboard.currentMember.role === "host" && <UpdateControl session={session} onNotice={(message, tone = "success") => setNotice({ message, tone })} />}</>}
           {view === "connection" && <ConnectionView dashboard={dashboard} session={session} online={online} />}
         </main>
       </div>
