@@ -40,6 +40,16 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Prepare Electron runtime
+        shell: pwsh
+        run: |
+          node node_modules/electron/install.js
+          $electronPath = Join-Path $PWD "node_modules/electron/dist/electron.exe"
+          if (-not (Test-Path -LiteralPath $electronPath)) {
+            throw "Electron runtime was not installed at $electronPath."
+          }
+          & $electronPath --version
+
       - name: Type check
         run: pnpm typecheck
 
