@@ -9,6 +9,7 @@ import {
   type ContextBudgetCandidate,
 } from "../server/context-budget.js";
 import {
+  AmbiguousRepositoryConnectionError,
   openConnectionStore,
   resolveConnectionRecordById,
   resolveConnectionRecordForPath,
@@ -1217,7 +1218,9 @@ function contextOutput(additionalContext: string): Record<string, unknown> {
 function failureOutput(event: CodexHookEventName, error: unknown): Record<string, unknown> | undefined {
   const message = humanError(error);
   if (isSoftIntegrationFailure(error)) {
-    const warning = `Agent Hub 暂时无法连接（${message}）。本次操作不会因网络故障被阻止；恢复连接后再补登记和协作检查。`;
+    const warning = error instanceof AmbiguousRepositoryConnectionError
+      ? `Agent Hub 检测到这个项目同时存在多个活动房间，无法安全判断本次会话属于哪一个房间（${message}）。本次操作不会被阻止，但没有完成跨成员协作检查；请在 Agent Hub 中明确打开目标房间。`
+      : `Agent Hub 暂时无法连接（${message}）。本次操作不会因网络故障被阻止；恢复连接后再补登记和协作检查。`;
     if (event === "PreToolUse") return allowOutput(warning);
     if (event === "SessionStart") {
       return {
@@ -1257,6 +1260,7 @@ function failureOutput(event: CodexHookEventName, error: unknown): Record<string
 }
 
 function isSoftIntegrationFailure(error: unknown): boolean {
+  if (error instanceof AmbiguousRepositoryConnectionError) return true;
   if (error instanceof HookCleanupPendingError) return true;
   if (error instanceof AgentHubHttpError) {
     return error.status === 408 || error.status === 429 || error.status >= 500;

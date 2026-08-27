@@ -112,6 +112,21 @@ describe("integration operation tracker", () => {
 
     await operation.end();
   });
+
+  it("removes only the selected connection operation directory after drain", async () => {
+    const root = await temporaryDirectory();
+    const tracker = new IntegrationOperationTracker(root);
+    const first = await tracker.begin("connection-a");
+    const second = await tracker.begin("connection-b");
+    await first.end();
+    await second.end();
+
+    await tracker.removeConnectionState("connection-a");
+
+    const operationRoot = path.join(root, "integration-operations");
+    await expect(readdir(operationRoot)).resolves.toHaveLength(1);
+    await expect(tracker.drain("connection-b", { pollIntervalMs: 5 })).resolves.toBeUndefined();
+  });
 });
 
 async function temporaryDirectory(): Promise<string> {

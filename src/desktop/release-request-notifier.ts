@@ -1,4 +1,4 @@
-import type { ConnectionStore } from "./connection-store.js";
+import { canonicalRepositoryIdentity, type ConnectionStore } from "./connection-store.js";
 import type { RoomServerResponse, SavedRoomConnection } from "./contracts.js";
 import { requestRoomServer } from "./room-server-proxy.js";
 
@@ -69,7 +69,22 @@ async function notifyPendingRequests(
   options: StartReleaseRequestNotifierOptions,
   notified: Set<string>,
 ): Promise<void> {
-  const connections = (await options.store.list()).filter((connection) => connection.integrationEnabled !== false);
+  const activeConnections = (await options.store.list())
+    .filter((connection) => connection.integrationEnabled !== false);
+  const byRepository = new Map<string, SavedRoomConnection[]>();
+  for (const connection of activeConnections) {
+    const identity = await canonicalRepositoryIdentity(connection.repositoryPath);
+    const matching = byRepository.get(identity) ?? [];
+    matching.push(connection);
+    byRepository.set(identity, matching);
+  }
+  const connections: SavedRoomConnection[] = [];
+  for (const [identity, matching] of byRepository) {
+    if (matching.length === 1) connections.push(matching[0]!);
+    else options.onError?.(new Error(
+      `Agent Hub skipped notifications because repository ${identity} has multiple active room connections.`,
+    ));
+  }
   const requester = options.request ?? requestRoomServer;
   await Promise.all(connections.map(async (connection) => {
     try {

@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  activateSavedConnection,
   createLease,
   createRoom,
+  deleteSavedConnection,
   getDashboard,
   joinRoom,
   loadSession,
@@ -43,6 +45,28 @@ class MemoryStorage implements Storage {
 const originalWindow = globalThis.window;
 const originalLocalStorage = globalThis.localStorage;
 const originalSessionStorage = globalThis.sessionStorage;
+
+function desktopSession(connectionId: string): Session {
+  return {
+    connectionId,
+    serverUrl: "http://127.0.0.1:4173",
+    repositoryPath: "D:\\UGit\\projectvanguard",
+    room: {
+      id: "room-1",
+      name: "先锋协作",
+      projectName: "Project Vanguard",
+      repository: "https://github.com/example/project-vanguard.git",
+      defaultBranch: "main",
+    },
+    member: {
+      id: "member-a",
+      name: "成员 A",
+      role: "member",
+      status: "online",
+      compatibility: "unknown",
+    },
+  };
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -103,7 +127,7 @@ describe("desktop room transport", () => {
 
   it("uses the server URL only for joining, then uses a saved connection ID", async () => {
     const requests: Array<Record<string, unknown>> = [];
-    const saveRoomConnection = vi.fn(async () => ({
+    const savedConnection = {
       id: "connection-1",
       serverUrl: "http://192.168.1.25:4173",
       repositoryPath: "D:\\UGit\\projectvanguard",
@@ -114,6 +138,11 @@ describe("desktop room transport", () => {
       integrationEnabled: true,
       createdAt: "2026-08-25T12:00:00.000Z",
       updatedAt: "2026-08-25T12:00:00.000Z",
+    };
+    const saveRoomConnection = vi.fn(async () => ({
+      connection: savedConnection,
+      pausedConnectionIds: ["connection-old"],
+      warnings: ["旧房间离线，远端清理将在稍后重试。"],
     }));
     const requestRoomServer = vi.fn(async (input: Record<string, unknown>) => {
       requests.push(input);
@@ -190,11 +219,12 @@ describe("desktop room transport", () => {
       body: { inviteCode: "ROOM-123", memberName: "成员 B", clientName: "Codex" },
     });
 
-    const saved = await secureDesktopSession(
+    const secured = await secureDesktopSession(
       joined,
       "http://192.168.1.25:4173",
       "D:\\UGit\\projectvanguard",
     );
+    const saved = secured.session;
     expect(saveRoomConnection).toHaveBeenCalledWith(expect.objectContaining({
       memberToken: "secret-member-token",
       repositoryPath: "D:\\UGit\\projectvanguard",
@@ -202,6 +232,10 @@ describe("desktop room transport", () => {
     }));
     expect(saved.memberToken).toBeUndefined();
     expect(saved.connectionId).toBe("connection-1");
+    expect(secured.activation).toMatchObject({
+      pausedConnectionIds: ["connection-old"],
+      warnings: ["旧房间离线，远端清理将在稍后重试。"],
+    });
 
     await getDashboard(saved);
     await createLease(saved, {
@@ -227,16 +261,20 @@ describe("desktop room transport", () => {
 
   it("persists and restores the host role for a saved desktop room", async () => {
     const saveRoomConnection = vi.fn(async (input: Record<string, unknown>) => ({
-      id: "host-connection",
-      serverUrl: input.serverUrl as string,
-      repositoryPath: input.repositoryPath as string,
-      roomId: input.roomId as string,
-      roomName: input.roomName as string,
-      memberName: input.memberName as string,
-      memberRole: input.memberRole as "host" | "member",
-      integrationEnabled: true,
-      createdAt: "2026-08-27T00:00:00.000Z",
-      updatedAt: "2026-08-27T00:00:00.000Z",
+      connection: {
+        id: "host-connection",
+        serverUrl: input.serverUrl as string,
+        repositoryPath: input.repositoryPath as string,
+        roomId: input.roomId as string,
+        roomName: input.roomName as string,
+        memberName: input.memberName as string,
+        memberRole: input.memberRole as "host" | "member",
+        integrationEnabled: true,
+        createdAt: "2026-08-27T00:00:00.000Z",
+        updatedAt: "2026-08-27T00:00:00.000Z",
+      },
+      pausedConnectionIds: [],
+      warnings: [],
     }));
     const pauseRoomConnection = vi.fn(async () => ({
       queued: false,
@@ -265,11 +303,11 @@ describe("desktop room transport", () => {
       },
     };
 
-    const secured = await secureDesktopSession(
+    const secured = (await secureDesktopSession(
       hostSession,
       "http://127.0.0.1:4173",
       "D:\\UGit\\projectvanguard",
-    );
+    )).session;
     expect(saveRoomConnection).toHaveBeenCalledWith(expect.objectContaining({ memberRole: "host" }));
     const restored = resumeSavedConnection({
       id: secured.connectionId!,
@@ -307,6 +345,132 @@ describe("desktop room transport", () => {
       queued: false,
       cleanupError: "The member token is invalid.",
     });
+  });
+
+  it("returns activation details when switching the active room for a project", async () => {
+    const result = {
+      connection: {
+        id: "connection-b",
+        serverUrl: "http://127.0.0.1:4173",
+        repositoryPath: "D:\\UGit\\projectvanguard",
+        roomName: "当前房间",
+        integrationEnabled: true,
+        createdAt: "2026-08-27T00:00:00.000Z",
+        updatedAt: "2026-08-27T01:00:00.000Z",
+      },
+      pausedConnectionIds: ["connection-a"],
+      warnings: ["旧房间离线，远端清理将在稍后重试。"],
+    };
+    const activateRoomConnection = vi.fn(async () => result);
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { agentHubDesktop: { activateRoomConnection } },
+    });
+
+    await expect(activateSavedConnection("connection-b")).resolves.toEqual(result);
+    expect(activateRoomConnection).toHaveBeenCalledWith("connection-b");
+  });
+
+  it("deletes a saved room through the desktop bridge and returns cleanup status", async () => {
+    const local = new MemoryStorage();
+    const runtime = new MemoryStorage();
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, value: local });
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: runtime });
+    saveSession(desktopSession("connection-a"));
+    const result = {
+      deletedConnectionId: "connection-a",
+      remoteCleanup: "pending" as const,
+      codexConfigChanged: true,
+      codexRestartRequired: true,
+      warnings: ["房间服务当前离线。"],
+    };
+    const deleteRoomConnection = vi.fn(async () => result);
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { agentHubDesktop: { deleteRoomConnection } },
+    });
+
+    await expect(deleteSavedConnection("connection-a")).resolves.toEqual(result);
+    expect(deleteRoomConnection).toHaveBeenCalledWith("connection-a");
+    expect(loadSession()).toBeNull();
+    expect(local.length).toBe(0);
+    expect(runtime.length).toBe(0);
+  });
+
+  it("keeps the current room pointer when another saved room is deleted", async () => {
+    const local = new MemoryStorage();
+    const runtime = new MemoryStorage();
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, value: local });
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: runtime });
+    saveSession(desktopSession("connection-current"));
+    const deleteRoomConnection = vi.fn(async () => ({
+      deletedConnectionId: "connection-other",
+      remoteCleanup: "completed" as const,
+      codexConfigChanged: false,
+      codexRestartRequired: false,
+      warnings: [],
+    }));
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { agentHubDesktop: { deleteRoomConnection } },
+    });
+
+    await deleteSavedConnection("connection-other");
+
+    expect(loadSession()?.connectionId).toBe("connection-current");
+  });
+
+  it("preserves the current room pointer when local deletion fails", async () => {
+    const local = new MemoryStorage();
+    const runtime = new MemoryStorage();
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, value: local });
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: runtime });
+    saveSession(desktopSession("connection-a"));
+    const deleteRoomConnection = vi.fn(async () => {
+      throw new Error("Codex 配置无法安全写回。");
+    });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { agentHubDesktop: { deleteRoomConnection } },
+    });
+
+    await expect(deleteSavedConnection("connection-a")).rejects.toThrow("Codex 配置无法安全写回");
+
+    expect(loadSession()?.connectionId).toBe("connection-a");
+  });
+
+  it("rejects a mismatched deletion result without clearing the current pointer", async () => {
+    const local = new MemoryStorage();
+    const runtime = new MemoryStorage();
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, value: local });
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: runtime });
+    saveSession(desktopSession("connection-a"));
+    const deleteRoomConnection = vi.fn(async () => ({
+      deletedConnectionId: "connection-b",
+      remoteCleanup: "completed" as const,
+      codexConfigChanged: false,
+      codexRestartRequired: false,
+      warnings: [],
+    }));
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { agentHubDesktop: { deleteRoomConnection } },
+    });
+
+    await expect(deleteSavedConnection("connection-a")).rejects.toThrow("不匹配的房间连接标识");
+
+    expect(loadSession()?.connectionId).toBe("connection-a");
+  });
+
+  it("does not pretend to delete local room data outside a supported desktop bridge", async () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { agentHubDesktop: {} },
+    });
+
+    await expect(deleteSavedConnection("connection-a")).rejects.toThrow(
+      "仅桌面客户端支持从本机移除已保存的房间连接",
+    );
   });
 });
 

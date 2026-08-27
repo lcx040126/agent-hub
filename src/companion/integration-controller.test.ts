@@ -3,8 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionStore } from "../desktop/connection-store.js";
+import type { SavedRoomConnection } from "../desktop/contracts.js";
 import {
   IntegrationController,
+  type ConnectionDeletionCleanupContext,
 } from "./integration-controller.js";
 import { getLocalIntegrationStatus } from "./integration-gate.js";
 import { PAUSE_PREPARATION_FILENAME } from "./pause-preparation.js";
@@ -100,9 +102,13 @@ describe("integration controller lifecycle", () => {
       calls.push("remote:pause");
       return pauseJsonResponse(init);
     });
-    store.activateIntegration = vi.fn(async () => {
+    store.setRepositoryIntegrationOwner = vi.fn(async () => {
       calls.push("connection:activate");
-      return (await store.get("connection-a"))!;
+      return {
+        repositoryIdentity: path.resolve("project"),
+        owner: (await store.get("connection-a"))!,
+        pausedConnectionIds: [],
+      };
     });
     const controller = new IntegrationController({
       userDataPath,
@@ -136,9 +142,13 @@ describe("integration controller lifecycle", () => {
       calls.push("remote:pause");
       return pauseJsonResponse(init);
     });
-    store.activateIntegration = vi.fn(async () => {
+    store.setRepositoryIntegrationOwner = vi.fn(async () => {
       calls.push("connection:activate");
-      return (await store.get("connection-a"))!;
+      return {
+        repositoryIdentity: path.resolve("project"),
+        owner: (await store.get("connection-a"))!,
+        pausedConnectionIds: [],
+      };
     });
     const controller = new IntegrationController({
       userDataPath,
@@ -151,12 +161,167 @@ describe("integration controller lifecycle", () => {
     await vi.waitFor(() => expect(drain).toHaveBeenCalledOnce());
     const activate = controller.activateConnection("connection-a");
     await Promise.resolve();
-    expect(store.activateIntegration).not.toHaveBeenCalled();
+    expect(store.setRepositoryIntegrationOwner).not.toHaveBeenCalled();
 
     releaseDrain?.();
     await pause;
     await activate;
     expect(calls).toEqual(["drain:start", "remote:pause", "connection:activate"]);
+  });
+
+  it("pauses the previous repository owner before activating the selected room", async () => {
+    const userDataPath = await temporaryDirectory();
+    const target = connectionRecord("connection-a", false);
+    const previous = connectionRecord("connection-b", true);
+    const { store, connections } = createMutableStore([target, previous]);
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) =>
+      pauseJsonResponse(init, "member"));
+    const controller = new IntegrationController({
+      userDataPath,
+      store,
+      fetchImpl,
+      operationTracker: { drain: vi.fn(async () => undefined) },
+    });
+
+    await expect(controller.activateExclusiveConnection(target.id)).resolves.toMatchObject({
+      connection: { id: target.id, integrationEnabled: true },
+      pausedConnectionIds: [previous.id],
+      warnings: [],
+    });
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(connections.get(target.id)?.integrationEnabled).toBe(true);
+    expect(connections.get(previous.id)?.integrationEnabled).toBe(false);
+  });
+
+  it("serializes concurrent room activations so one repository owner remains", async () => {
+    const userDataPath = await temporaryDirectory();
+    const first = connectionRecord("connection-a", false);
+    const second = connectionRecord("connection-b", false);
+    const { store, connections } = createMutableStore([first, second]);
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) =>
+      pauseJsonResponse(init, "member"));
+    const controller = new IntegrationController({
+      userDataPath,
+      store,
+      fetchImpl,
+      operationTracker: { drain: vi.fn(async () => undefined) },
+    });
+
+    const activations = await Promise.all([
+      controller.activateExclusiveConnection(first.id),
+      controller.activateExclusiveConnection(second.id),
+    ]);
+    const active = [...connections.values()].filter((connection) => connection.integrationEnabled);
+    const finalOwner = active[0];
+
+    expect(active).toHaveLength(1);
+    expect(new Set(activations.map((activation) => activation.connection.id)))
+      .toEqual(new Set([first.id, second.id]));
+    expect(activations.flatMap((activation) => activation.pausedConnectionIds))
+      .toEqual([finalOwner?.id === first.id ? second.id : first.id]);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it("returns the verified remote role and removes local state after deleting a room", async () => {
+    const userDataPath = await temporaryDirectory();
+    const connection = connectionRecord("connection-a", true);
+    const { store, connections } = createMutableStore([connection]);
+    const removeConnectionState = vi.fn(async () => undefined);
+    const cleanup = vi.fn(async () => ({ changed: true, restartRequired: true }));
+    const controller = new IntegrationController({
+      userDataPath,
+      store,
+      fetchImpl: vi.fn<typeof fetch>(async (_input, init) => pauseJsonResponse(init, "host")),
+      operationTracker: {
+        drain: vi.fn(async () => undefined),
+        removeConnectionState,
+      },
+    });
+
+    await expect(controller.deleteConnection(connection.id, cleanup)).resolves.toMatchObject({
+      deletedConnectionId: connection.id,
+      remoteCleanup: "completed",
+      memberRole: "host",
+      cleanup: { changed: true, restartRequired: true },
+    });
+
+    expect(cleanup).toHaveBeenCalledWith({ connection, isLastConnection: true });
+    expect(removeConnectionState).toHaveBeenCalledWith(connection.id);
+    expect(connections.has(connection.id)).toBe(false);
+  });
+
+  it("serializes deletion across repositories so the final connection removes shared hooks", async () => {
+    const userDataPath = await temporaryDirectory();
+    const first = connectionRecord("connection-a", true, path.resolve("project-a"));
+    const second = connectionRecord("connection-b", true, path.resolve("project-b"));
+    const { store, connections } = createMutableStore([first, second]);
+    let signalFirstCleanupStarted!: () => void;
+    let releaseFirstCleanup!: () => void;
+    let signalSecondCleanupStarted!: () => void;
+    const firstCleanupStarted = new Promise<void>((resolve) => {
+      signalFirstCleanupStarted = resolve;
+    });
+    const firstCleanupRelease = new Promise<void>((resolve) => {
+      releaseFirstCleanup = resolve;
+    });
+    const secondCleanupStarted = new Promise<void>((resolve) => {
+      signalSecondCleanupStarted = resolve;
+    });
+    const cleanupContexts: ConnectionDeletionCleanupContext[] = [];
+    const controller = new IntegrationController({
+      userDataPath,
+      store,
+      fetchImpl: vi.fn<typeof fetch>(async (_input, init) => pauseJsonResponse(init, "host")),
+      operationTracker: { drain: vi.fn(async () => undefined) },
+    });
+
+    const firstDeletion = controller.deleteConnection(first.id, async (context) => {
+      cleanupContexts.push(context);
+      signalFirstCleanupStarted();
+      await firstCleanupRelease;
+      return { changed: true };
+    });
+    await firstCleanupStarted;
+    const secondDeletion = controller.deleteConnection(second.id, async (context) => {
+      cleanupContexts.push(context);
+      signalSecondCleanupStarted();
+      return { changed: true };
+    });
+
+    const secondState = await Promise.race([
+      secondCleanupStarted.then(() => "started" as const),
+      new Promise<"queued">((resolve) => setTimeout(() => resolve("queued"), 25)),
+    ]);
+    expect(secondState).toBe("queued");
+    releaseFirstCleanup();
+    await expect(Promise.all([firstDeletion, secondDeletion])).resolves.toHaveLength(2);
+
+    expect(cleanupContexts).toEqual([
+      { connection: expect.objectContaining({ id: first.id }), isLastConnection: false },
+      { connection: expect.objectContaining({ id: second.id }), isLastConnection: true },
+    ]);
+    expect(connections.size).toBe(0);
+  });
+
+  it("retains a paused connection when local deletion cleanup fails", async () => {
+    const userDataPath = await temporaryDirectory();
+    const connection = connectionRecord("connection-a", true);
+    const { store, connections } = createMutableStore([connection]);
+    const cleanupFailure = new Error("Codex config is malformed");
+    const controller = new IntegrationController({
+      userDataPath,
+      store,
+      fetchImpl: vi.fn<typeof fetch>(async (_input, init) => pauseJsonResponse(init, "host")),
+      operationTracker: { drain: vi.fn(async () => undefined) },
+    });
+
+    await expect(controller.deleteConnection(connection.id, async () => {
+      throw cleanupFailure;
+    })).rejects.toBe(cleanupFailure);
+
+    expect(store.remove).not.toHaveBeenCalled();
+    expect(connections.get(connection.id)?.integrationEnabled).toBe(false);
   });
 
   it("persists a shutdown drain failure without sending an unsafe cutoff", async () => {
@@ -759,7 +924,79 @@ function createStore(overrides: Partial<Pick<ConnectionStore, "list">> = {}): Co
     readMemberToken: vi.fn(async () => "member-token"),
     pauseIntegration: vi.fn(async () => ({ ...connection, integrationEnabled: false })),
     activateIntegration: vi.fn(async () => connection),
+    setRepositoryIntegrationOwner: vi.fn(async (_repositoryPath: string, ownerId: string | null) => ({
+      repositoryIdentity: connection.repositoryPath,
+      owner: ownerId === connection.id ? connection : undefined,
+      pausedConnectionIds: ownerId === null ? [connection.id] : [],
+    })),
+    normalizeRepositoryIntegrationOwners: vi.fn(async () => []),
+    remove: vi.fn(async () => connection),
   } as unknown as ConnectionStore;
+}
+
+function connectionRecord(
+  id: string,
+  integrationEnabled: boolean,
+  repositoryPath = path.resolve("project"),
+): SavedRoomConnection {
+  return {
+    id,
+    serverUrl: "http://127.0.0.1:4173",
+    repositoryPath,
+    memberRole: "host",
+    integrationEnabled,
+    createdAt: "2026-08-27T00:00:00.000Z",
+    updatedAt: "2026-08-27T00:00:00.000Z",
+  };
+}
+
+function createMutableStore(initial: SavedRoomConnection[]): {
+  store: ConnectionStore;
+  connections: Map<string, SavedRoomConnection>;
+} {
+  const connections = new Map(initial.map((connection) => [connection.id, { ...connection }]));
+  const list = vi.fn(async () => [...connections.values()]);
+  const store = {
+    list,
+    listActive: vi.fn(async () => [...connections.values()]
+      .filter((connection) => connection.integrationEnabled !== false)),
+    get: vi.fn(async (connectionId: string) => connections.get(connectionId)),
+    readMemberToken: vi.fn(async () => "member-token"),
+    pauseIntegration: vi.fn(async (connectionId: string) => {
+      const current = connections.get(connectionId);
+      if (!current) throw new Error("missing connection");
+      const paused = { ...current, integrationEnabled: false };
+      connections.set(connectionId, paused);
+      return paused;
+    }),
+    setRepositoryIntegrationOwner: vi.fn(async (
+      repositoryPath: string,
+      ownerConnectionId: string | null,
+    ) => {
+      const pausedConnectionIds: string[] = [];
+      let owner: SavedRoomConnection | undefined;
+      for (const [connectionId, current] of connections) {
+        if (current.repositoryPath !== repositoryPath) continue;
+        const enabled = connectionId === ownerConnectionId;
+        if (current.integrationEnabled && !enabled) pausedConnectionIds.push(connectionId);
+        const updated = { ...current, integrationEnabled: enabled };
+        connections.set(connectionId, updated);
+        if (enabled) owner = updated;
+      }
+      return {
+        repositoryIdentity: repositoryPath,
+        owner,
+        pausedConnectionIds: pausedConnectionIds.sort(),
+      };
+    }),
+    normalizeRepositoryIntegrationOwners: vi.fn(async () => []),
+    remove: vi.fn(async (connectionId: string) => {
+      const current = connections.get(connectionId);
+      connections.delete(connectionId);
+      return current;
+    }),
+  } as unknown as ConnectionStore;
+  return { store, connections };
 }
 
 function createPresenceStarter(

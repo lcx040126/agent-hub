@@ -1,6 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { ConnectionStore } from "../desktop/connection-store.js";
+import { canonicalRepositoryIdentity, type ConnectionStore } from "../desktop/connection-store.js";
 import {
   AGENT_HUB_PROTOCOL_VERSION,
   AGENT_HUB_SCHEMA_VERSION,
@@ -21,6 +21,7 @@ export interface CodexSessionHeartbeatScheduler {
 }
 
 interface ConnectionLookup {
+  list?: ConnectionStore["list"];
   get(connectionId: string): ReturnType<ConnectionStore["get"]>;
   readMemberToken(connectionId: string): ReturnType<ConnectionStore["readMemberToken"]>;
 }
@@ -79,9 +80,16 @@ async function heartbeatAll(
 ): Promise<void> {
   const states = await readHookStates(stateStore, options.onError);
   const now = (options.now?.() ?? new Date()).getTime();
+  const activeOwnerIds = options.store.list
+    ? await unambiguousActiveOwnerIds(await options.store.list())
+    : undefined;
   await Promise.all(states.map(async (state) => {
     try {
       if (!shouldHeartbeat(state, now)) {
+        await stateStore.remove(state.codexSessionId);
+        return;
+      }
+      if (activeOwnerIds && !activeOwnerIds.has(state.connectionId)) {
         await stateStore.remove(state.codexSessionId);
         return;
       }
@@ -115,6 +123,24 @@ async function heartbeatAll(
       options.onError?.(toError(error), state);
     }
   }));
+}
+
+async function unambiguousActiveOwnerIds(
+  connections: Awaited<ReturnType<ConnectionStore["list"]>>,
+): Promise<Set<string>> {
+  const byRepository = new Map<string, string[]>();
+  for (const connection of connections) {
+    if (connection.integrationEnabled === false) continue;
+    const identity = await canonicalRepositoryIdentity(connection.repositoryPath);
+    const ids = byRepository.get(identity) ?? [];
+    ids.push(connection.id);
+    byRepository.set(identity, ids);
+  }
+  return new Set(
+    [...byRepository.values()]
+      .filter((ids) => ids.length === 1)
+      .flat(),
+  );
 }
 
 function shouldHeartbeat(state: CodexHookSessionState, now: number): boolean {

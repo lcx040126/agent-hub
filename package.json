@@ -1,6 +1,6 @@
 {
   "name": "agent-hub",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "main": "dist/desktop/main.js",
@@ -26,7 +26,8 @@
     "desktop:run": "electron dist/desktop/main.js",
     "desktop:pack": "pnpm build && electron-builder --win nsis",
     "desktop:pack:ci": "pnpm build && electron-builder --win nsis --publish never",
-    "desktop:dir": "pnpm build && electron-builder --dir"
+    "desktop:dir": "pnpm build && electron-builder --dir",
+    "desktop:verify-recovery": "node scripts/verify-packaged-update-recovery.mjs"
   },
   "dependencies": {
     "@ast-grep/lang-csharp": "0.0.6",

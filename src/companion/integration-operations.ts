@@ -33,6 +33,7 @@ export interface IntegrationOperationTrackerOptions {
 export interface ConnectionOperationTracker {
   run<T>(connectionId: string, operation: () => Promise<T>): Promise<T>;
   drain(connectionId: string, options?: IntegrationOperationDrainOptions): Promise<void>;
+  removeConnectionState(connectionId: string): Promise<void>;
 }
 
 /**
@@ -126,6 +127,11 @@ export class IntegrationOperationTracker implements ConnectionOperationTracker {
       }
       await delay(Math.min(pollIntervalMs, remainingMs));
     }
+  }
+
+  async removeConnectionState(connectionId: string): Promise<void> {
+    const normalizedId = requiredConnectionId(connectionId);
+    await rm(this.connectionDirectory(normalizedId), { recursive: true, force: true });
   }
 
   private async hasActiveMarkers(

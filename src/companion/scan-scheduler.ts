@@ -1,5 +1,8 @@
 import path from "node:path";
-import type { ConnectionStore } from "../desktop/connection-store.js";
+import {
+  canonicalRepositoryIdentity,
+  type ConnectionStore,
+} from "../desktop/connection-store.js";
 import type { SavedRoomConnection } from "../desktop/contracts.js";
 import { AgentHubClient, AgentHubHttpError } from "./hub-client.js";
 import {
@@ -76,6 +79,7 @@ async function runAllScans(
     options.onError?.(asError(error));
     return;
   }
+  connections = await unambiguousRepositoryOwners(connections, options.onError);
   await Promise.all(
     connections.map(async (connection) => {
       try {
@@ -90,6 +94,30 @@ async function runAllScans(
       }
     }),
   );
+}
+
+async function unambiguousRepositoryOwners(
+  connections: SavedRoomConnection[],
+  onError?: (error: Error, connection?: SavedRoomConnection) => void,
+): Promise<SavedRoomConnection[]> {
+  const byRepository = new Map<string, SavedRoomConnection[]>();
+  for (const connection of connections) {
+    const identity = await canonicalRepositoryIdentity(connection.repositoryPath);
+    const matching = byRepository.get(identity) ?? [];
+    matching.push(connection);
+    byRepository.set(identity, matching);
+  }
+  const selected: SavedRoomConnection[] = [];
+  for (const [identity, matching] of byRepository) {
+    if (matching.length === 1) {
+      selected.push(matching[0]!);
+      continue;
+    }
+    onError?.(new Error(
+      `Agent Hub skipped background scanning because repository ${identity} has multiple active room connections.`,
+    ));
+  }
+  return selected;
 }
 
 async function scanConnection(

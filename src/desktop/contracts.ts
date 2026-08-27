@@ -70,6 +70,20 @@ export interface PauseRoomConnectionResult {
   localRoomServerStopped: boolean;
 }
 
+export interface ActivateRoomConnectionResult {
+  connection: SavedRoomConnection;
+  pausedConnectionIds: string[];
+  warnings: string[];
+}
+
+export interface DeleteRoomConnectionResult {
+  deletedConnectionId: string;
+  remoteCleanup: "completed" | "pending" | "skipped";
+  codexConfigChanged: boolean;
+  codexRestartRequired: boolean;
+  warnings: string[];
+}
+
 export interface CodexInstallResult {
   configPath: string;
   backupPath?: string;
@@ -114,10 +128,11 @@ export interface AgentHubDesktopApi {
   chooseRepository(): Promise<string | null>;
   inspectRepository(repositoryPath: string): Promise<RepositorySnapshot>;
   getServerInfo(): Promise<DesktopServerInfo>;
-  saveRoomConnection(input: SaveRoomConnectionInput): Promise<SavedRoomConnection>;
+  saveRoomConnection(input: SaveRoomConnectionInput): Promise<ActivateRoomConnectionResult>;
   listRoomConnections(): Promise<SavedRoomConnection[]>;
   pauseRoomConnection(connectionId: string): Promise<PauseRoomConnectionResult>;
-  activateRoomConnection(connectionId: string): Promise<SavedRoomConnection>;
+  activateRoomConnection(connectionId: string): Promise<ActivateRoomConnectionResult>;
+  deleteRoomConnection(connectionId: string): Promise<DeleteRoomConnectionResult>;
   requestRoomServer(input: RoomServerRequestInput): Promise<RoomServerResponse>;
   installCodexIntegration(connectionId: string): Promise<CodexInstallResult>;
   getDesktopUpdateStatus(): Promise<DesktopUpdateStatus>;
@@ -137,6 +152,7 @@ export const DESKTOP_IPC = {
   listRoomConnections: "agent-hub:list-room-connections",
   pauseRoomConnection: "agent-hub:pause-room-connection",
   activateRoomConnection: "agent-hub:activate-room-connection",
+  deleteRoomConnection: "agent-hub:delete-room-connection",
   requestRoomServer: "agent-hub:request-room-server",
   installCodexIntegration: "agent-hub:install-codex-integration",
   getDesktopUpdateStatus: "agent-hub:get-desktop-update-status",

@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { SavedRoomConnection } from "./contracts.js";
 import {
   activateDesktopRoomConnection,
+  deleteDesktopRoomConnection,
   enterDesktopMaintenance,
   pauseDesktopRoomConnection,
   recoverDesktopMaintenance,
+  saveAndActivateDesktopRoomConnection,
   shouldStartLocalRoomService,
   shutdownDesktopIntegration,
 } from "./integration-lifecycle.js";
@@ -57,6 +59,37 @@ describe("desktop integration lifecycle", () => {
       localServer: { url: "http://127.0.0.1:4173", stop },
     })).resolves.toMatchObject({ queued: false, localRoomServerStopped: false });
     expect(pauseConnection).toHaveBeenCalledWith(connection.id, "leave-room");
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("keeps a local host service running while another active connection still uses it", async () => {
+    let connection = savedConnection(true);
+    const otherConnection = {
+      ...savedConnection(true),
+      id: "connection-b",
+      repositoryPath: "C:\\other-project",
+    };
+    const pauseConnection = vi.fn(async () => {
+      connection = { ...connection, integrationEnabled: false };
+      return {
+        queued: false,
+        requestId: "pause-shared-local-service",
+        response: pauseResponse("host", "pause-shared-local-service"),
+      };
+    });
+    const stop = vi.fn(async () => undefined);
+
+    await expect(pauseDesktopRoomConnection({
+      connectionId: connection.id,
+      controller: { pauseConnection } as never,
+      store: lifecycleStore(
+        () => connection,
+        () => undefined,
+        () => [connection, otherConnection],
+      ),
+      localServer: { url: connection.serverUrl, stop },
+    })).resolves.toMatchObject({ localRoomServerStopped: false });
+
     expect(stop).not.toHaveBeenCalled();
   });
 
@@ -202,19 +235,163 @@ describe("desktop integration lifecycle", () => {
 
   it("restarts the local service before reactivating a saved room", async () => {
     const calls: string[] = [];
-    const connection = savedConnection(true);
+    const connection = savedConnection(false);
+    const activated = {
+      connection: { ...connection, integrationEnabled: true },
+      pausedConnectionIds: ["connection-old"],
+      warnings: ["previous room is offline"],
+    };
     const startServer = vi.fn(async () => { calls.push("server:start"); });
-    const activateConnection = vi.fn(async () => { calls.push("connection:activate"); });
+    const activateExclusiveConnection = vi.fn(async () => {
+      calls.push("connection:activate");
+      return activated;
+    });
     const startController = vi.fn(async () => { calls.push("integration:start"); });
 
-    await activateDesktopRoomConnection({
+    await expect(activateDesktopRoomConnection({
       connectionId: connection.id,
-      controller: { activateConnection, start: startController },
-      store: { get: vi.fn(async () => connection) },
+      controller: { activateExclusiveConnection, start: startController },
       localServer: { start: startServer },
-    });
+    })).resolves.toEqual(activated);
 
     expect(calls).toEqual(["server:start", "connection:activate", "integration:start"]);
+  });
+
+  it("persists a new room paused before activating it exclusively", async () => {
+    const calls: string[] = [];
+    const paused = savedConnection(false);
+    const activated = {
+      connection: { ...paused, integrationEnabled: true },
+      pausedConnectionIds: ["connection-old"],
+      warnings: [],
+    };
+    const save = vi.fn(async (input) => {
+      calls.push(`connection:save:${input.integrationEnabled}`);
+      return paused;
+    });
+    const rememberConnectionState = vi.fn((connectionId: string, enabled: boolean) => {
+      calls.push(`connection:remember:${connectionId}:${enabled}`);
+    });
+    const activateExclusiveConnection = vi.fn(async () => {
+      calls.push("connection:activate");
+      return activated;
+    });
+
+    await expect(saveAndActivateDesktopRoomConnection({
+      input: {
+        serverUrl: paused.serverUrl,
+        memberToken: "member-token",
+        repositoryPath: paused.repositoryPath,
+        integrationEnabled: true,
+      },
+      store: { save } as never,
+      controller: {
+        rememberConnectionState,
+        activateExclusiveConnection,
+        start: vi.fn(async () => { calls.push("integration:start"); }),
+      },
+      localServer: { start: vi.fn(async () => { calls.push("server:start"); }) },
+    })).resolves.toEqual(activated);
+
+    expect(calls).toEqual([
+      "connection:save:false",
+      `connection:remember:${paused.id}:false`,
+      "server:start",
+      "connection:activate",
+      "integration:start",
+    ]);
+  });
+
+  it("deletes one local room without stopping a service used by another active connection", async () => {
+    const selected = savedConnection(true);
+    const remaining = {
+      ...savedConnection(true),
+      id: "connection-b",
+      repositoryPath: "C:\\other-project",
+    };
+    let deleted = false;
+    const uninstallCodexIntegration = vi.fn(async () => ({
+      changed: true,
+      restartRequired: true,
+    }));
+    const deleteConnection = vi.fn(async (_connectionId, cleanup) => {
+      const cleanupResult = await cleanup({ connection: selected, isLastConnection: false });
+      deleted = true;
+      return {
+        deletedConnectionId: selected.id,
+        remoteCleanup: "completed" as const,
+        memberRole: "host" as const,
+        warnings: [],
+        cleanup: cleanupResult,
+      };
+    });
+    const stop = vi.fn(async () => undefined);
+
+    await expect(deleteDesktopRoomConnection({
+      connectionId: selected.id,
+      controller: { deleteConnection } as never,
+      store: {
+        get: vi.fn(async () => selected),
+        list: vi.fn(async () => deleted ? [remaining] : [selected, remaining]),
+      },
+      localServer: { url: selected.serverUrl, stop },
+      uninstallCodexIntegration,
+    })).resolves.toEqual({
+      deletedConnectionId: selected.id,
+      remoteCleanup: "completed",
+      codexConfigChanged: true,
+      codexRestartRequired: true,
+      warnings: [],
+    });
+
+    expect(uninstallCodexIntegration).toHaveBeenCalledWith({
+      connection: selected,
+      isLastConnection: false,
+    });
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("reports a warning when a deleted host room service cannot be stopped", async () => {
+    const selected = savedConnection(true);
+    const uninstallCodexIntegration = vi.fn(async () => ({
+      changed: true,
+      restartRequired: true,
+    }));
+    const deleteConnection = vi.fn(async (_connectionId, cleanup) => ({
+      deletedConnectionId: selected.id,
+      remoteCleanup: "completed" as const,
+      memberRole: "host" as const,
+      warnings: [],
+      cleanup: await cleanup({ connection: selected, isLastConnection: true }),
+    }));
+    const stop = vi.fn(async () => {
+      throw new Error("service did not exit");
+    });
+
+    await expect(deleteDesktopRoomConnection({
+      connectionId: selected.id,
+      controller: { deleteConnection } as never,
+      store: {
+        get: vi.fn(async () => selected),
+        list: vi.fn(async () => []),
+      },
+      localServer: { url: selected.serverUrl, stop },
+      uninstallCodexIntegration,
+    })).resolves.toEqual({
+      deletedConnectionId: selected.id,
+      remoteCleanup: "completed",
+      codexConfigChanged: true,
+      codexRestartRequired: true,
+      warnings: [
+        "The room was removed from this computer, but Agent Hub could not stop the local room service: service did not exit",
+      ],
+    });
+
+    expect(uninstallCodexIntegration).toHaveBeenCalledWith({
+      connection: selected,
+      isLastConnection: true,
+    });
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it("closes the local gate before draining producers and stops the room service last", async () => {
@@ -381,9 +558,11 @@ function savedConnection(
 function lifecycleStore(
   readConnection: () => SavedRoomConnection,
   onPause: (connection: SavedRoomConnection) => void = () => undefined,
+  listConnections: () => SavedRoomConnection[] = () => [readConnection()],
 ) {
   return {
     get: vi.fn(async () => readConnection()),
+    list: vi.fn(async () => listConnections()),
     pauseIntegration: vi.fn(async () => {
       const paused = { ...readConnection(), integrationEnabled: false };
       onPause(paused);

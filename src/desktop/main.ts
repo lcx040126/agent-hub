@@ -36,15 +36,21 @@ import {
 } from "../shared/version.js";
 import { createConsistentSqliteBackup } from "../server/sqlite-backup.js";
 import { DesktopAppUpdater, type ElectronUpdateEngine } from "./app-updater.js";
-import { installCodexMcpConfig, codexServerName } from "./codex-config.js";
+import {
+  installCodexMcpConfig,
+  codexServerName,
+  uninstallCodexMcpConfig,
+} from "./codex-config.js";
 import { CONNECTION_STORE_FILENAME, ConnectionStore } from "./connection-store.js";
 import { DESKTOP_IPC, type SaveRoomConnectionInput, type DesktopServerInfo } from "./contracts.js";
 import { installHeadlessLauncher } from "./headless-launcher.js";
 import {
   activateDesktopRoomConnection,
+  deleteDesktopRoomConnection,
   enterDesktopMaintenance,
   pauseDesktopRoomConnection,
   recoverDesktopMaintenance,
+  saveAndActivateDesktopRoomConnection,
   shouldStartLocalRoomService,
   shutdownDesktopIntegration,
 } from "./integration-lifecycle.js";
@@ -493,19 +499,47 @@ function registerIpc(
     return activateDesktopRoomConnection({
       connectionId: normalizedId,
       controller,
+      localServer,
+    });
+  });
+
+  ipcMain.handle(DESKTOP_IPC.deleteRoomConnection, async (event, connectionId: unknown) => {
+    assertTrustedRenderer(event, serverInfo.localServerUrl);
+    if (typeof connectionId !== "string" || !connectionId.trim()) {
+      throw new Error("A saved room connection is required.");
+    }
+    return deleteDesktopRoomConnection({
+      connectionId: connectionId.trim(),
+      controller,
       store,
       localServer,
+      uninstallCodexIntegration: async ({ connection, isLastConnection }) => {
+        const integration = codexIntegrationDetails(userDataDirectory, connection.id);
+        return uninstallCodexMcpConfig(path.join(homedir(), ".codex", "config.toml"), {
+          connectionId: connection.id,
+          command: process.execPath,
+          args: integration.args,
+          hookCommand: integration.hookCommand,
+          hookArgs: integration.launcherArgs,
+          removeManagedHooksWhenLastServer: isLastConnection,
+        });
+      },
     });
   });
 
   ipcMain.handle(DESKTOP_IPC.saveRoomConnection, async (event, input: SaveRoomConnectionInput) => {
     assertTrustedRenderer(event, serverInfo.localServerUrl);
     requireApprovedRepository(input?.repositoryPath, allowedRepositories);
-    const saved = await store.save(input);
-    controller.rememberConnectionState(saved.id, saved.integrationEnabled !== false);
+    const activated = await saveAndActivateDesktopRoomConnection({
+      input,
+      controller,
+      store,
+      localServer,
+    });
+    const saved = activated.connection;
     allowedRepositories.add(pathKey(saved.repositoryPath));
     await scanScheduler?.scanNow();
-    return saved;
+    return activated;
   });
 
   ipcMain.handle(DESKTOP_IPC.requestRoomServer, async (event, input: unknown) => {
@@ -552,20 +586,37 @@ function registerIpc(
     const connection = await store.get(connectionId.trim());
     if (!connection) throw new Error("The selected room connection does not exist.");
 
-    const launcherPath = await installHeadlessLauncher({
-      launcherPath: path.join(userDataDirectory, "codex", "agent-hub-headless.ps1"),
+    const integration = codexIntegrationDetails(userDataDirectory, connection.id);
+    await installHeadlessLauncher({
+      launcherPath: integration.launcherPath,
       electronExecutable: process.execPath,
-      runnerPath: path.join(electronApp.getAppPath(), "dist", "companion", "headless-runner.js"),
+      runnerPath: integration.runnerPath,
       userDataPath: userDataDirectory,
     });
-    const runnerPath = path.join(
-      electronApp.getAppPath(),
-      "dist",
-      "companion",
-      "headless-runner.js",
-    );
-    const hookCommand = "powershell.exe";
-    const launcherArgs = [
+    return installCodexMcpConfig(path.join(homedir(), ".codex", "config.toml"), {
+      name: codexServerName(connection.id),
+      command: process.execPath,
+      args: integration.args,
+      env: { ELECTRON_RUN_AS_NODE: "1" },
+      hookCommand: integration.hookCommand,
+      hookArgs: integration.launcherArgs,
+    });
+  });
+}
+
+function codexIntegrationDetails(userDataDirectory: string, connectionId: string) {
+  const launcherPath = path.join(userDataDirectory, "codex", "agent-hub-headless.ps1");
+  const runnerPath = path.join(
+    electronApp.getAppPath(),
+    "dist",
+    "companion",
+    "headless-runner.js",
+  );
+  return {
+    launcherPath,
+    runnerPath,
+    hookCommand: "powershell.exe",
+    launcherArgs: [
       "-NoLogo",
       "-NoProfile",
       "-NonInteractive",
@@ -573,24 +624,16 @@ function registerIpc(
       "Bypass",
       "-File",
       launcherPath,
-    ];
-    const args = [
+    ],
+    args: [
       runnerPath,
       "--user-data",
       userDataDirectory,
       "--mcp-bridge",
       "--connection-id",
-      connection.id,
-    ];
-    return installCodexMcpConfig(path.join(homedir(), ".codex", "config.toml"), {
-      name: codexServerName(connection.id),
-      command: process.execPath,
-      args,
-      env: { ELECTRON_RUN_AS_NODE: "1" },
-      hookCommand,
-      hookArgs: launcherArgs,
-    });
-  });
+      connectionId,
+    ],
+  };
 }
 
 function assertTrustedRenderer(event: IpcMainInvokeEvent, localServerUrl: string): void {

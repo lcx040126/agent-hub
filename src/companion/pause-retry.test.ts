@@ -102,6 +102,25 @@ describe("pause retry queue", () => {
     }]);
   });
 
+  it("removes only retries owned by one connection", async () => {
+    const directory = await temporaryDirectory();
+    const queue = new PauseRetryQueue({
+      filePath: path.join(directory, "pause-retry.json"),
+      store: createStore(),
+    });
+    await queue.enqueue(entry({ requestId: "connection-a-request" }));
+    await queue.enqueue({
+      ...entry({ requestId: "connection-b-request" }),
+      connectionId: "connection-b",
+    });
+
+    await expect(queue.removeForConnection("connection-a")).resolves.toBe(1);
+    await expect(queue.list()).resolves.toMatchObject([{
+      connectionId: "connection-b",
+      requestId: "connection-b-request",
+    }]);
+  });
+
   it("returns a fully parsed pause response including the transactional member role", async () => {
     const result = await requestMemberPause(createStore(), "connection-a", "leave-room", {
       requestId: "pause-host",

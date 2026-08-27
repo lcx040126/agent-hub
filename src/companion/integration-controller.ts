@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import type { ConnectionStore } from "../desktop/connection-store.js";
+import {
+  canonicalRepositoryIdentity,
+  type ConnectionStore,
+} from "../desktop/connection-store.js";
+import type { SavedRoomConnection } from "../desktop/contracts.js";
 import { CodexHookStateStore } from "./hook-state.js";
 import {
   IntegrationOperationTracker,
@@ -31,7 +35,27 @@ export interface IntegrationControllerOptions {
   now?: () => Date;
   onError?: (error: Error) => void;
   startPresence?: typeof startRuntimePresence;
-  operationTracker?: Pick<ConnectionOperationTracker, "drain">;
+  operationTracker?: Pick<ConnectionOperationTracker, "drain">
+    & Partial<Pick<ConnectionOperationTracker, "removeConnectionState">>;
+}
+
+export interface ExclusiveConnectionActivationResult {
+  connection: SavedRoomConnection;
+  pausedConnectionIds: string[];
+  warnings: string[];
+}
+
+export interface ConnectionDeletionCleanupContext {
+  connection: SavedRoomConnection;
+  isLastConnection: boolean;
+}
+
+export interface ConnectionDeletionResult<TCleanup> {
+  deletedConnectionId: string;
+  remoteCleanup: "completed" | "pending";
+  memberRole?: "host" | "member";
+  warnings: string[];
+  cleanup: TCleanup;
 }
 
 /** Coordinates the local gate, durable cleanup, and desktop lifecycle states. */
@@ -47,10 +71,13 @@ export class IntegrationController {
   private preparationRetryPromise: Promise<number> | undefined;
   private readonly preparedPauseTasks = new Map<string, Promise<PauseRequestResult>>();
   private readonly connectionLifecycle = new Map<string, Promise<void>>();
+  private readonly repositoryLifecycle = new Map<string, Promise<void>>();
+  private deletionLifecycle: Promise<void> = Promise.resolve();
   private readonly knownActiveConnectionIds = new Set<string>();
   private forcePreparationsOnNextRetry = false;
   private shutdownRequested = false;
-  private readonly operationTracker: Pick<ConnectionOperationTracker, "drain">;
+  private readonly operationTracker: Pick<ConnectionOperationTracker, "drain">
+    & Partial<Pick<ConnectionOperationTracker, "removeConnectionState">>;
 
   constructor(options: IntegrationControllerOptions) {
     this.options = options;
@@ -83,6 +110,14 @@ export class IntegrationController {
   }
 
   private async startInternal(): Promise<void> {
+    const normalizedConnectionIds = await this.options.store.normalizeRepositoryIntegrationOwners();
+    if (normalizedConnectionIds.length > 0) {
+      await new CodexHookStateStore(this.options.userDataPath)
+        .removeForConnections(normalizedConnectionIds);
+      for (const connectionId of normalizedConnectionIds) {
+        this.knownActiveConnectionIds.delete(connectionId);
+      }
+    }
     const activeConnections = await this.options.store.listActive();
     this.replaceKnownActiveConnections(activeConnections.map((connection) => connection.id));
     const startPresence = this.options.startPresence ?? startRuntimePresence;
@@ -101,7 +136,7 @@ export class IntegrationController {
     if (this.shutdownRequested || this.shutdownPromise) {
       throw new Error("Agent Hub cannot pause a room while desktop shutdown is in progress.");
     }
-    return this.withConnectionLifecycle(connectionId, () =>
+    return this.withRepositoryConnectionLifecycle(connectionId, () =>
       this.pauseConnectionInternal(connectionId, reason));
   }
 
@@ -121,6 +156,7 @@ export class IntegrationController {
         queued: false,
         requestId,
         cleanupError: `Agent Hub could not persist cleanup before pausing: ${failure.message}`,
+        failureKind: "local",
       };
     }
 
@@ -169,7 +205,7 @@ export class IntegrationController {
       try {
         await this.pausePreparationQueue.defer(requestId, drainError);
         this.schedulePauseRetry();
-        return { queued: true, requestId, cleanupError: drainError.message };
+        return { queued: true, requestId, cleanupError: drainError.message, failureKind: "local" };
       } catch (queueError) {
         const persistenceError = toError(queueError);
         this.options.onError?.(persistenceError);
@@ -177,6 +213,7 @@ export class IntegrationController {
           queued: false,
           requestId,
           cleanupError: `${drainError.message} Cleanup retry could not be updated: ${persistenceError.message}`,
+          failureKind: "local",
         };
       }
     }
@@ -195,7 +232,7 @@ export class IntegrationController {
       this.options.onError?.(failure);
       await this.pausePreparationQueue.defer(requestId, failure);
       this.schedulePauseRetry();
-      return { queued: true, requestId, cleanupError: failure.message };
+      return { queued: true, requestId, cleanupError: failure.message, failureKind: "local" };
     }
     if (result.cleanupError) this.options.onError?.(new Error(result.cleanupError));
     try {
@@ -210,6 +247,7 @@ export class IntegrationController {
         cleanupError: result.queued
           ? `${result.cleanupError ?? "Remote cleanup is still pending."} Its local preparation record could not be removed: ${failure.message}`
           : `Remote cleanup completed, but its local recovery record could not be removed: ${failure.message}`,
+        failureKind: "local",
         response: result.response,
       };
     }
@@ -224,6 +262,7 @@ export class IntegrationController {
           queued: true,
           requestId,
           cleanupError: `Remote cleanup completed, but its fixed retry record could not be removed: ${failure.message}`,
+          failureKind: "local",
           response: result.response,
         };
       }
@@ -233,28 +272,162 @@ export class IntegrationController {
   }
 
   async activateConnection(connectionId: string): Promise<void> {
-    await this.withConnectionLifecycle(connectionId, async () => {
+    await this.activateExclusiveConnection(connectionId);
+  }
+
+  async activateExclusiveConnection(
+    connectionId: string,
+  ): Promise<ExclusiveConnectionActivationResult> {
+    const selected = await this.requireConnection(connectionId);
+    const repositoryIdentity = await canonicalRepositoryIdentity(selected.repositoryPath);
+    return this.withRepositoryLifecycle(repositoryIdentity, async () => {
       if (this.shutdownRequested || this.shutdownPromise) {
         throw new Error("Agent Hub cannot reactivate a room while desktop shutdown is in progress.");
       }
-      // Keep this connection disabled until any pre-cutoff cleanup intent has
-      // drained and moved to a fixed-cutoff request. The process-wide sentinel
-      // may already be active for other rooms.
-      const pendingPreparations = await this.flushPausePreparations(true, connectionId);
-      if (pendingPreparations > 0) {
-        throw new Error(
-          "Agent Hub cannot reactivate this room while an earlier cleanup is still waiting for operations to drain.",
-        );
+      const target = await this.requireConnection(connectionId);
+      const activeConnections = await this.options.store.listActive();
+      const peers: SavedRoomConnection[] = [];
+      for (const connection of activeConnections) {
+        if (connection.id === target.id) continue;
+        if (await canonicalRepositoryIdentity(connection.repositoryPath) === repositoryIdentity) {
+          peers.push(connection);
+        }
       }
-      await this.flushFixedPauseRetries();
-      if (await hasPendingPauseForConnection(this.options.userDataPath, connectionId)) {
-        throw new Error(
-          "Agent Hub cannot reactivate this room until its previous remote cleanup reaches the room server.",
+
+      const pausedConnectionIds: string[] = [];
+      const warnings: string[] = [];
+      if (target.integrationEnabled !== false && peers.length > 0) {
+        const safetyPause = await this.options.store.setRepositoryIntegrationOwner(
+          target.repositoryPath,
+          null,
         );
+        for (const pausedId of safetyPause.pausedConnectionIds) {
+          this.knownActiveConnectionIds.delete(pausedId);
+        }
+        await this.operationTracker.drain(target.id);
+        await new CodexHookStateStore(this.options.userDataPath).removeForConnection(target.id);
       }
-      await this.options.store.activateIntegration(connectionId);
-      this.knownActiveConnectionIds.add(connectionId);
+      for (const peer of peers) {
+        const result = await this.withConnectionLifecycle(peer.id, () =>
+          this.pauseConnectionInternal(peer.id, "leave-room"));
+        if (result.failureKind === "local") {
+          throw new Error(
+            `Agent Hub paused the previous room locally but could not safely finish its local cleanup: ${result.cleanupError ?? "unknown local cleanup failure"}`,
+          );
+        }
+        if (result.failureKind === "remote") {
+          throw new Error(
+            `Agent Hub paused the previous room locally, but the room rejected cleanup: ${result.cleanupError ?? "unknown remote cleanup failure"}`,
+          );
+        }
+        if (result.failureKind === "transient-remote") {
+          warnings.push(
+            `The previous room is temporarily unreachable. Its remote sessions or leases are still queued for cleanup: ${result.cleanupError ?? "temporary network failure"}`,
+          );
+        }
+        pausedConnectionIds.push(peer.id);
+      }
+
+      const connection = await this.withConnectionLifecycle(target.id, async () => {
+        // Keep this connection disabled until any pre-cutoff cleanup intent has
+        // drained and moved to a fixed-cutoff request. The process-wide sentinel
+        // may already be active for other rooms.
+        const pendingPreparations = await this.flushPausePreparations(true, target.id);
+        if (pendingPreparations > 0) {
+          throw new Error(
+            "Agent Hub cannot reactivate this room while an earlier cleanup is still waiting for operations to drain.",
+          );
+        }
+        await this.flushFixedPauseRetries();
+        if (await hasPendingPauseForConnection(this.options.userDataPath, target.id)) {
+          throw new Error(
+            "Agent Hub cannot reactivate this room until its previous remote cleanup reaches the room server.",
+          );
+        }
+        const ownership = await this.options.store.setRepositoryIntegrationOwner(
+          target.repositoryPath,
+          target.id,
+        );
+        for (const pausedId of ownership.pausedConnectionIds) {
+          this.knownActiveConnectionIds.delete(pausedId);
+          if (!pausedConnectionIds.includes(pausedId)) pausedConnectionIds.push(pausedId);
+        }
+        if (!ownership.owner) throw new Error("Agent Hub could not activate the selected room connection.");
+        this.knownActiveConnectionIds.add(target.id);
+        return ownership.owner;
+      });
+
+      return {
+        connection,
+        pausedConnectionIds: pausedConnectionIds.sort(),
+        warnings,
+      };
     });
+  }
+
+  async deleteConnection<TCleanup>(
+    connectionId: string,
+    cleanupLocalConfiguration: (
+      context: ConnectionDeletionCleanupContext,
+    ) => Promise<TCleanup>,
+  ): Promise<ConnectionDeletionResult<TCleanup>> {
+    const selected = await this.requireConnection(connectionId);
+    const repositoryIdentity = await canonicalRepositoryIdentity(selected.repositoryPath);
+    return this.withDeletionLifecycle(() =>
+      this.withRepositoryLifecycle(repositoryIdentity, () =>
+        this.withConnectionLifecycle(connectionId, async () => {
+        if (this.shutdownRequested || this.shutdownPromise) {
+          throw new Error("Agent Hub cannot remove a room while desktop shutdown is in progress.");
+        }
+        const connection = await this.requireConnection(connectionId);
+        const paused = await this.pauseConnectionInternal(connection.id, "leave-room");
+        if (paused.failureKind === "local") {
+          throw new Error(
+            `Agent Hub kept the room connection paused because local cleanup did not finish safely: ${paused.cleanupError ?? "unknown local cleanup failure"}`,
+          );
+        }
+        if (paused.failureKind === "remote") {
+          throw new Error(
+            `Agent Hub kept the room connection paused because the room rejected member cleanup: ${paused.cleanupError ?? "unknown remote cleanup failure"}`,
+          );
+        }
+
+        const warnings: string[] = [];
+        const remoteCleanup = paused.failureKind === "transient-remote" ? "pending" : "completed";
+        if (remoteCleanup === "pending") {
+          warnings.push(
+            `The room is temporarily unreachable. Local data was removed, but remote sessions or leases may remain until the room reconnects or they expire: ${paused.cleanupError ?? "temporary network failure"}`,
+          );
+        }
+
+        this.clearPauseRetryTimer();
+        if (this.retryPromise) await this.retryPromise;
+        if (this.preparationRetryPromise) await this.preparationRetryPromise;
+        await this.pausePreparationQueue.removeForConnection(connection.id);
+        await this.pauseQueue.removeForConnection(connection.id);
+        await new CodexHookStateStore(this.options.userDataPath).removeForConnection(connection.id);
+        await this.operationTracker.removeConnectionState?.(connection.id);
+
+        const remainingConnections = (await this.options.store.list())
+          .filter((candidate) => candidate.id !== connection.id);
+        const cleanup = await cleanupLocalConfiguration({
+          connection,
+          isLastConnection: remainingConnections.length === 0,
+        });
+        const removed = await this.options.store.remove(connection.id);
+        if (!removed) {
+          throw new Error("The room connection disappeared before Agent Hub could finish removing it.");
+        }
+        this.knownActiveConnectionIds.delete(connection.id);
+        this.schedulePauseRetry();
+        return {
+          deletedConnectionId: connection.id,
+          remoteCleanup,
+          memberRole: paused.response?.memberRole,
+          warnings,
+          cleanup,
+        };
+        })));
   }
 
   /** Keep the shutdown fallback current when the desktop saves a connection. */
@@ -281,7 +454,11 @@ export class IntegrationController {
         .catch((error: unknown) => this.options.onError?.(toError(error)));
       // Finish any room-level pause/activate transition that began before the
       // shutdown flag. New activation is rejected above.
-      await Promise.all([...this.connectionLifecycle.values()]);
+      await Promise.all([
+        this.deletionLifecycle,
+        ...this.repositoryLifecycle.values(),
+        ...this.connectionLifecycle.values(),
+      ]);
       const uncompensatedFailures: Error[] = [];
       let connectionIds: string[];
       try {
@@ -506,6 +683,45 @@ export class IntegrationController {
         this.connectionLifecycle.delete(connectionId);
       }
     }
+  }
+
+  private async withRepositoryConnectionLifecycle<T>(
+    connectionId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const connection = await this.requireConnection(connectionId);
+    const repositoryIdentity = await canonicalRepositoryIdentity(connection.repositoryPath);
+    return this.withRepositoryLifecycle(repositoryIdentity, () =>
+      this.withConnectionLifecycle(connectionId, operation));
+  }
+
+  private async withDeletionLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.deletionLifecycle.then(operation);
+    this.deletionLifecycle = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async withRepositoryLifecycle<T>(
+    repositoryIdentity: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.repositoryLifecycle.get(repositoryIdentity) ?? Promise.resolve();
+    const run = previous.catch(() => undefined).then(operation);
+    const tail = run.then(() => undefined, () => undefined);
+    this.repositoryLifecycle.set(repositoryIdentity, tail);
+    try {
+      return await run;
+    } finally {
+      if (this.repositoryLifecycle.get(repositoryIdentity) === tail) {
+        this.repositoryLifecycle.delete(repositoryIdentity);
+      }
+    }
+  }
+
+  private async requireConnection(connectionId: string): Promise<SavedRoomConnection> {
+    const connection = await this.options.store.get(connectionId);
+    if (!connection) throw new Error("The selected room connection does not exist.");
+    return connection;
   }
 
   private replaceKnownActiveConnections(connectionIds: string[]): void {

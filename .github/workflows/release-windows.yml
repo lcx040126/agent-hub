@@ -63,7 +63,9 @@ jobs:
             "当前为发布说明草稿",
             "待正式发布前填写",
             "已确认，待实现",
-            "（暂无）"
+            "（暂无）",
+            "发布状态：本地候选，尚未发布",
+            "尚未创建正式标签或 Release"
           )
           foreach ($marker in $forbiddenMarkers) {
             if ($releaseNotes.Contains($marker) -or $updateLog.Contains($marker)) {
@@ -109,6 +111,9 @@ jobs:
 
       - name: Build signed-update-compatible NSIS package
         run: pnpm desktop:pack:ci
+
+      - name: Verify packaged update recovery backup
+        run: pnpm desktop:verify-recovery
 
       - name: Create signed update manifest
         shell: pwsh

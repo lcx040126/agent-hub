@@ -1,6 +1,12 @@
 import type { IntegrationController } from "../companion/integration-controller.js";
 import type { ConnectionStore } from "./connection-store.js";
-import type { PauseRoomConnectionResult, SavedRoomConnection } from "./contracts.js";
+import type {
+  ActivateRoomConnectionResult,
+  DeleteRoomConnectionResult,
+  PauseRoomConnectionResult,
+  SaveRoomConnectionInput,
+  SavedRoomConnection,
+} from "./contracts.js";
 import type { ServiceSupervisor } from "./service-supervisor.js";
 
 interface StoppableScheduler {
@@ -10,7 +16,7 @@ interface StoppableScheduler {
 export async function pauseDesktopRoomConnection(options: {
   connectionId: string;
   controller: Pick<IntegrationController, "pauseConnection">;
-  store: Pick<ConnectionStore, "get">;
+  store: Pick<ConnectionStore, "get" | "list">;
   localServer: Pick<ServiceSupervisor, "url" | "stop">;
 }): Promise<PauseRoomConnectionResult> {
   const selected = await requireConnection(options.store, options.connectionId);
@@ -33,7 +39,12 @@ export async function pauseDesktopRoomConnection(options: {
   const canStopLocalRoom = ownsLocalRoom
     && !paused.queued
     && !paused.cleanupError
-    && paused.response?.memberRole === "host";
+    && paused.response?.memberRole === "host"
+    && !(await hasOtherActiveLocalConnection(
+      options.store,
+      selected.id,
+      options.localServer.url,
+    ));
   if (canStopLocalRoom) await options.localServer.stop();
   return {
     connection: pausedConnection,
@@ -46,14 +57,80 @@ export async function pauseDesktopRoomConnection(options: {
 
 export async function activateDesktopRoomConnection(options: {
   connectionId: string;
-  controller: Pick<IntegrationController, "activateConnection" | "start">;
-  store: Pick<ConnectionStore, "get">;
+  controller: Pick<IntegrationController, "activateExclusiveConnection" | "start">;
   localServer: Pick<ServiceSupervisor, "start">;
-}): Promise<SavedRoomConnection> {
+}): Promise<ActivateRoomConnectionResult> {
   await options.localServer.start();
-  await options.controller.activateConnection(options.connectionId);
+  const activated = await options.controller.activateExclusiveConnection(options.connectionId);
   await options.controller.start();
-  return requireConnection(options.store, options.connectionId);
+  return activated;
+}
+
+export async function saveAndActivateDesktopRoomConnection(options: {
+  input: SaveRoomConnectionInput;
+  controller: Pick<
+    IntegrationController,
+    "activateExclusiveConnection" | "rememberConnectionState" | "start"
+  >;
+  store: Pick<ConnectionStore, "save">;
+  localServer: Pick<ServiceSupervisor, "start">;
+}): Promise<ActivateRoomConnectionResult> {
+  const saved = await options.store.save({
+    ...options.input,
+    integrationEnabled: false,
+  });
+  options.controller.rememberConnectionState(saved.id, false);
+  return activateDesktopRoomConnection({
+    connectionId: saved.id,
+    controller: options.controller,
+    localServer: options.localServer,
+  });
+}
+
+export async function deleteDesktopRoomConnection(options: {
+  connectionId: string;
+  controller: Pick<IntegrationController, "deleteConnection">;
+  store: Pick<ConnectionStore, "get" | "list">;
+  localServer: Pick<ServiceSupervisor, "url" | "stop">;
+  uninstallCodexIntegration(context: {
+    connection: SavedRoomConnection;
+    isLastConnection: boolean;
+  }): Promise<{ changed: boolean; restartRequired: boolean }>;
+}): Promise<DeleteRoomConnectionResult> {
+  const selected = await requireConnection(options.store, options.connectionId);
+  const ownsLocalRoom = sameOrigin(selected.serverUrl, options.localServer.url);
+  const deleted = await options.controller.deleteConnection(
+    selected.id,
+    options.uninstallCodexIntegration,
+  );
+  const warnings = [...deleted.warnings];
+  if (
+    ownsLocalRoom
+    && deleted.remoteCleanup === "completed"
+    && deleted.memberRole === "host"
+  ) {
+    try {
+      if (!(await hasOtherActiveLocalConnection(
+        options.store,
+        selected.id,
+        options.localServer.url,
+      ))) {
+        await options.localServer.stop();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      warnings.push(
+        `The room was removed from this computer, but Agent Hub could not stop the local room service: ${message}`,
+      );
+    }
+  }
+  return {
+    deletedConnectionId: deleted.deletedConnectionId,
+    remoteCleanup: deleted.remoteCleanup,
+    codexConfigChanged: deleted.cleanup.changed,
+    codexRestartRequired: deleted.cleanup.restartRequired,
+    warnings,
+  };
 }
 
 export async function shutdownDesktopIntegration(options: {
@@ -158,6 +235,17 @@ async function requireConnection(
   const connection = await store.get(connectionId);
   if (!connection) throw new Error("The selected room connection does not exist.");
   return connection;
+}
+
+async function hasOtherActiveLocalConnection(
+  store: Pick<ConnectionStore, "list">,
+  excludedConnectionId: string,
+  localServerUrl: string,
+): Promise<boolean> {
+  return (await store.list()).some((connection) =>
+    connection.id !== excludedConnectionId
+    && connection.integrationEnabled !== false
+    && sameOrigin(connection.serverUrl, localServerUrl));
 }
 
 async function captureFailure(

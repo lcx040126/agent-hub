@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import * as nodeFs from "node:fs";
 import {
-  cp,
   copyFile,
   mkdir,
   readFile,
@@ -221,7 +220,7 @@ export class FileDesktopUpdateRecovery implements DesktopUpdateRecovery {
         );
       }
       if ((input.backupFiles?.length ?? 0) === 0 && !applicationBackupDirectory && backupDirectory) {
-        await rm(backupDirectory, { recursive: true, force: true });
+        await removeRecoveryBackup(backupDirectory);
         backupDirectory = undefined;
       }
       const preparedAt = this.now().toISOString();
@@ -255,7 +254,7 @@ export class FileDesktopUpdateRecovery implements DesktopUpdateRecovery {
       };
     } catch (error) {
       await rm(targetPackageDirectory, { recursive: true, force: true });
-      await rm(recoveryDirectory, { recursive: true, force: true });
+      await removeRecoveryBackup(recoveryDirectory);
       throw error;
     }
   }
@@ -297,7 +296,7 @@ export class FileDesktopUpdateRecovery implements DesktopUpdateRecovery {
       && previousRecoveryBackup.backupDirectory !== pending.backupDirectory
     ) {
       const backupDirectory = managedPath(previousRecoveryBackup.backupDirectory, this.backupRoot);
-      await rm(backupDirectory, { recursive: true, force: true }).catch(() => undefined);
+      await removeRecoveryBackup(backupDirectory).catch(() => undefined);
     }
   }
 
@@ -323,7 +322,7 @@ export class FileDesktopUpdateRecovery implements DesktopUpdateRecovery {
     await rm(packageDirectory, { recursive: true, force: true }).catch(() => undefined);
     if (pending.backupDirectory) {
       const backupDirectory = managedPath(pending.backupDirectory, this.backupRoot);
-      await rm(backupDirectory, { recursive: true, force: true }).catch(() => undefined);
+      await removeRecoveryBackup(backupDirectory).catch(() => undefined);
     }
   }
 
@@ -455,16 +454,19 @@ async function backupApplication(
   executablePath: string,
   backupDirectory: string,
 ): Promise<void> {
+  const physicalFiles = physicalFileSystem();
   const sourceDirectory = safeApplicationDirectory(applicationDirectory);
   const sourceExecutable = safeApplicationExecutable(executablePath, sourceDirectory);
   const [directoryDetails, executableDetails] = await Promise.all([
-    stat(sourceDirectory),
-    stat(sourceExecutable),
+    physicalFiles.promises.stat(sourceDirectory),
+    physicalFiles.promises.stat(sourceExecutable),
   ]);
   if (!directoryDetails.isDirectory() || !executableDetails.isFile()) {
     throw new Error("The installed Agent Hub application cannot be backed up for recovery.");
   }
-  await cp(sourceDirectory, backupDirectory, {
+  // Electron's patched fs exposes app.asar as a virtual directory. A recursive
+  // copy must use original-fs so the archive is copied as one physical file.
+  await physicalFiles.promises.cp(sourceDirectory, backupDirectory, {
     recursive: true,
     force: false,
     errorOnExist: true,
@@ -472,9 +474,53 @@ async function backupApplication(
   });
   const relativeExecutable = path.relative(sourceDirectory, sourceExecutable);
   const copiedExecutable = path.join(backupDirectory, relativeExecutable);
-  if (!(await stat(copiedExecutable)).isFile()) {
+  if (!(await physicalFiles.promises.stat(copiedExecutable)).isFile()) {
     throw new Error("The Agent Hub recovery backup does not contain the application executable.");
   }
+  await verifyApplicationArchive(
+    physicalFiles,
+    path.join(sourceDirectory, "resources", "app.asar"),
+    path.join(backupDirectory, "resources", "app.asar"),
+  );
+}
+
+function physicalFileSystem(): typeof nodeFs {
+  return (process.getBuiltinModule("original-fs") as typeof nodeFs | undefined) ?? nodeFs;
+}
+
+async function removeRecoveryBackup(backupDirectory: string): Promise<void> {
+  await physicalFileSystem().promises.rm(backupDirectory, { recursive: true, force: true });
+}
+
+async function verifyApplicationArchive(
+  physicalFiles: typeof nodeFs,
+  sourcePath: string,
+  backupPath: string,
+): Promise<void> {
+  try {
+    const [source, backup] = await Promise.all([
+      physicalFiles.promises.stat(sourcePath),
+      physicalFiles.promises.stat(backupPath),
+    ]);
+    if (!source.isFile() || !backup.isFile() || source.size !== backup.size) {
+      throw new Error("archive size mismatch");
+    }
+    const [sourceSha256, backupSha256] = await Promise.all([
+      physicalFileSha256(physicalFiles, sourcePath),
+      physicalFileSha256(physicalFiles, backupPath),
+    ]);
+    if (sourceSha256 !== backupSha256) throw new Error("archive hash mismatch");
+  } catch (error) {
+    throw new Error("The Agent Hub recovery backup does not contain a byte-identical app.asar archive.", {
+      cause: error,
+    });
+  }
+}
+
+async function physicalFileSha256(files: typeof nodeFs, filePath: string): Promise<string> {
+  const digest = createHash("sha256");
+  for await (const chunk of files.createReadStream(filePath)) digest.update(chunk as Buffer);
+  return digest.digest("hex");
 }
 
 function safeApplicationDirectory(value: string): string {
@@ -559,7 +605,7 @@ async function verifyCachedInstaller(
     throw new Error("The cached recovery installer size changed before update preparation.");
   }
   const digest = createHash("sha256");
-  for await (const chunk of createReadStream(installerPath)) digest.update(chunk as Buffer);
+  for await (const chunk of nodeFs.createReadStream(installerPath)) digest.update(chunk as Buffer);
   if (digest.digest("hex") !== expected.sha256) {
     throw new Error("The cached recovery installer hash changed before update preparation.");
   }

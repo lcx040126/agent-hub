@@ -1,6 +1,10 @@
 import path from "node:path";
-import { realpath } from "node:fs/promises";
-import { CONNECTION_STORE_FILENAME, ConnectionStore, type SecretProtector } from "../desktop/connection-store.js";
+import {
+  CONNECTION_STORE_FILENAME,
+  ConnectionStore,
+  canonicalRepositoryIdentity,
+  type SecretProtector,
+} from "../desktop/connection-store.js";
 import type { SavedRoomConnection } from "../desktop/contracts.js";
 import { isPathInside } from "./git-state.js";
 import { WindowsDpapiProtector } from "./windows-dpapi.js";
@@ -14,6 +18,20 @@ export interface ResolvedRoomConnection {
 export interface ResolvedRoomConnectionRecord {
   connection: SavedRoomConnection;
   store: ConnectionStore;
+}
+
+export class AmbiguousRepositoryConnectionError extends Error {
+  readonly code = "AGENT_HUB_AMBIGUOUS_REPOSITORY_CONNECTION";
+
+  constructor(
+    readonly repositoryIdentity: string,
+    readonly connectionIds: string[],
+  ) {
+    super(
+      `Agent Hub found multiple active room connections for repository ${repositoryIdentity}: ${connectionIds.join(", ")}. Pause all but one room before continuing.`,
+    );
+    this.name = "AmbiguousRepositoryConnectionError";
+  }
 }
 
 export async function openConnectionStore(
@@ -69,26 +87,28 @@ export async function resolveConnectionRecordForPath(
   protector?: SecretProtector,
 ): Promise<ResolvedRoomConnectionRecord | undefined> {
   const store = await openConnectionStore(userDataPath, protector);
-  const candidate = await canonicalPath(selectedPath);
+  const candidate = await canonicalRepositoryIdentity(selectedPath);
   const connectionsWithPaths = await Promise.all(
-    (await store.list()).map(async (connection) => ({
-      connection,
-      repositoryPath: await canonicalPath(connection.repositoryPath),
-    })),
+    (await store.list())
+      .filter((connection) => connection.integrationEnabled !== false)
+      .map(async (connection) => ({
+        connection,
+        repositoryIdentity: await canonicalRepositoryIdentity(connection.repositoryPath),
+      })),
   );
-  const connections = connectionsWithPaths
-    .filter((entry) => isPathInside(entry.repositoryPath, candidate))
-    .map((entry) => entry.connection)
-    .sort((left, right) => right.repositoryPath.length - left.repositoryPath.length);
-  const connection = connections[0];
-  if (!connection) return undefined;
-  return { connection, store };
-}
+  const matches = connectionsWithPaths.filter((entry) =>
+    isPathInside(entry.repositoryIdentity, candidate));
+  if (matches.length === 0) return undefined;
 
-async function canonicalPath(value: string): Promise<string> {
-  try {
-    return await realpath(value);
-  } catch {
-    return path.resolve(value);
+  const deepestLength = Math.max(...matches.map((entry) => entry.repositoryIdentity.length));
+  const deepest = matches.filter((entry) => entry.repositoryIdentity.length === deepestLength);
+  const repositoryIdentities = new Set(deepest.map((entry) => entry.repositoryIdentity));
+  if (repositoryIdentities.size !== 1 || deepest.length !== 1) {
+    const identity = [...repositoryIdentities].sort()[0] ?? candidate;
+    throw new AmbiguousRepositoryConnectionError(
+      identity,
+      deepest.map((entry) => entry.connection.id).sort(),
+    );
   }
+  return { connection: deepest[0]!.connection, store };
 }

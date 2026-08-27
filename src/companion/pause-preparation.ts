@@ -71,6 +71,19 @@ export class PausePreparationQueue {
     });
   }
 
+  async removeForConnection(connectionId: string): Promise<number> {
+    const normalizedId = requiredText(connectionId, "connection ID");
+    return this.withWriteLock(async () => {
+      const document = await this.readDocument();
+      const requests = document.requests.filter((entry) => entry.connectionId !== normalizedId);
+      const removed = document.requests.length - requests.length;
+      if (removed > 0) {
+        await this.writeDocument({ version: DOCUMENT_VERSION, requests });
+      }
+      return removed;
+    });
+  }
+
   async defer(requestId: string, error: Error): Promise<void> {
     const normalizedId = requiredText(requestId, "request ID");
     await this.withWriteLock(async () => {

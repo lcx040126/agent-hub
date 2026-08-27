@@ -102,6 +102,8 @@ describe("desktop update recovery state", () => {
 
     await expect(readFile(path.join(prepared.applicationBackupDirectory!, "Agent Hub.exe"), "utf8"))
       .resolves.toBe("application-02");
+    await expect(readFile(path.join(prepared.applicationBackupDirectory!, "resources", "app.asar"), "utf8"))
+      .resolves.toBe("asar-02");
     await expect(recovery.getPendingRecoveryPlan()).resolves.toMatchObject({
       applicationDirectory,
       applicationExecutablePath: executablePath,

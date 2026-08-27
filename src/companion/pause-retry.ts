@@ -31,6 +31,7 @@ export interface PauseRequestResult {
   queued: boolean;
   requestId: string;
   cleanupError?: string;
+  failureKind?: "transient-remote" | "remote" | "local";
   response?: PauseMemberResponse;
 }
 
@@ -103,6 +104,19 @@ export class PauseRetryQueue {
       const requests = document.requests.filter((entry) => entry.requestId !== normalizedId);
       if (requests.length === document.requests.length) return;
       await this.writeDocument({ version: DOCUMENT_VERSION, requests });
+    });
+  }
+
+  async removeForConnection(connectionId: string): Promise<number> {
+    const normalizedId = text(connectionId, "connection ID");
+    return this.withWriteLock(async () => {
+      const document = await this.readDocument();
+      const requests = document.requests.filter((entry) => entry.connectionId !== normalizedId);
+      const removed = document.requests.length - requests.length;
+      if (removed > 0) {
+        await this.writeDocument({ version: DOCUMENT_VERSION, requests });
+      }
+      return removed;
     });
   }
 
@@ -280,6 +294,7 @@ export async function requestMemberPause(
           queued: true,
           requestId: entry.requestId,
           cleanupError: `Remote cleanup completed, but its fixed retry record could not be removed: ${asError(error).message}`,
+          failureKind: "local",
           response,
         };
       }
@@ -299,12 +314,18 @@ export async function requestMemberPause(
           queued: true,
           requestId: entry.requestId,
           cleanupError: `The pause request was already applied, but its fixed retry record could not be removed: ${asError(removeError).message}`,
+          failureKind: "local",
         };
       }
     }
     const failure = asError(error);
     await options.queue.defer(entry.requestId, failure);
-    return { queued: true, requestId: entry.requestId, cleanupError: failure.message };
+    return {
+      queued: true,
+      requestId: entry.requestId,
+      cleanupError: failure.message,
+      failureKind: isTransientPauseFailure(error) ? "transient-remote" : "remote",
+    };
   }
 }
 
@@ -449,6 +470,16 @@ function parseEntry(value: unknown): PauseRetryEntry {
 
 function shouldRetainPauseError(error: unknown): boolean {
   return !(error instanceof AgentHubHttpError && error.code === "pause_request_conflict");
+}
+
+function isTransientPauseFailure(error: unknown): boolean {
+  if (error instanceof AgentHubHttpError) {
+    return error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  if (!(error instanceof Error)) return false;
+  return /(?:fetch failed|failed to fetch|network|socket|econn|etimedout|timed out|did not respond|connection reset|connection refused|aborted)/i.test(
+    error.message,
+  );
 }
 
 function retryDelay(attempts: number): number {

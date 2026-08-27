@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { SaveRoomConnectionInput, SavedRoomConnection } from "./contracts.js";
 
@@ -19,6 +19,12 @@ interface EncryptedRoomConnection extends SavedRoomConnection {
 interface ConnectionStoreDocument {
   version: 1;
   connections: EncryptedRoomConnection[];
+}
+
+export interface RepositoryIntegrationOwnerResult {
+  repositoryIdentity: string;
+  owner?: SavedRoomConnection;
+  pausedConnectionIds: string[];
 }
 
 export class ConnectionStore {
@@ -84,6 +90,19 @@ export class ConnectionStore {
     return connection ? toPublicConnection(connection) : undefined;
   }
 
+  /** Remove the encrypted connection record without requiring token decryption. */
+  async remove(connectionId: string): Promise<SavedRoomConnection | undefined> {
+    const normalizedId = requiredText(connectionId, "connection ID", 128);
+    return this.withWriteLock(async () => {
+      const document = await this.readDocument();
+      const index = document.connections.findIndex((connection) => connection.id === normalizedId);
+      if (index < 0) return undefined;
+      const [removed] = document.connections.splice(index, 1);
+      await this.writeDocument(document);
+      return removed ? toPublicConnection(removed) : undefined;
+    });
+  }
+
   async readMemberToken(connectionId: string): Promise<string> {
     await this.waitForWrites();
     if (!this.protector.isEncryptionAvailable()) {
@@ -120,6 +139,95 @@ export class ConnectionStore {
 
   async activateIntegration(connectionId: string): Promise<SavedRoomConnection> {
     return this.setIntegrationEnabled(connectionId, true);
+  }
+
+  /**
+   * Atomically select one integration owner for a canonical repository. Passing
+   * null pauses every saved connection for that repository.
+   */
+  async setRepositoryIntegrationOwner(
+    repositoryPath: string,
+    ownerConnectionId: string | null,
+  ): Promise<RepositoryIntegrationOwnerResult> {
+    const ownerId = ownerConnectionId === null
+      ? null
+      : requiredText(ownerConnectionId, "connection ID", 128);
+    return this.withWriteLock(async () => {
+      const repositoryIdentity = await canonicalRepositoryIdentity(repositoryPath);
+      const document = await this.readDocument();
+      const identities = await repositoryIdentities(document.connections);
+      const matchingIndices = identities
+        .map((identity, index) => identity === repositoryIdentity ? index : -1)
+        .filter((index) => index >= 0);
+
+      let ownerIndex: number | undefined;
+      if (ownerId !== null) {
+        ownerIndex = matchingIndices.find((index) => document.connections[index]?.id === ownerId);
+        if (ownerIndex === undefined) {
+          if (document.connections.some((connection) => connection.id === ownerId)) {
+            throw new Error("The selected room connection does not belong to this repository.");
+          }
+          throw new Error("The room connection to activate does not exist.");
+        }
+      }
+
+      const updatedAt = new Date().toISOString();
+      const pausedConnectionIds: string[] = [];
+      let changed = false;
+      for (const index of matchingIndices) {
+        const current = document.connections[index];
+        if (!current) continue;
+        const enabled = ownerIndex === index;
+        if (current.integrationEnabled === enabled) continue;
+        if (current.integrationEnabled && !enabled) pausedConnectionIds.push(current.id);
+        document.connections[index] = { ...current, integrationEnabled: enabled, updatedAt };
+        changed = true;
+      }
+      if (changed) await this.writeDocument(document);
+
+      const owner = ownerIndex === undefined ? undefined : document.connections[ownerIndex];
+      return {
+        repositoryIdentity,
+        owner: owner ? toPublicConnection(owner) : undefined,
+        pausedConnectionIds: pausedConnectionIds.sort(),
+      };
+    });
+  }
+
+  /**
+   * Migrate legacy stores conservatively: an ambiguous repository gets no
+   * active owner until the user explicitly chooses a room.
+   */
+  async normalizeRepositoryIntegrationOwners(): Promise<string[]> {
+    return this.withWriteLock(async () => {
+      const document = await this.readDocument();
+      const identities = await repositoryIdentities(document.connections);
+      const activeByRepository = new Map<string, number[]>();
+      for (let index = 0; index < document.connections.length; index += 1) {
+        if (document.connections[index]?.integrationEnabled === false) continue;
+        const identity = identities[index];
+        if (!identity) continue;
+        const active = activeByRepository.get(identity) ?? [];
+        active.push(index);
+        activeByRepository.set(identity, active);
+      }
+
+      const ambiguousIndices = [...activeByRepository.values()]
+        .filter((indices) => indices.length > 1)
+        .flat();
+      if (ambiguousIndices.length === 0) return [];
+
+      const updatedAt = new Date().toISOString();
+      const pausedConnectionIds: string[] = [];
+      for (const index of ambiguousIndices) {
+        const current = document.connections[index];
+        if (!current) continue;
+        pausedConnectionIds.push(current.id);
+        document.connections[index] = { ...current, integrationEnabled: false, updatedAt };
+      }
+      await this.writeDocument(document);
+      return pausedConnectionIds.sort();
+    });
   }
 
   private async waitForWrites(): Promise<void> {
@@ -161,6 +269,25 @@ export class ConnectionStore {
       throw error;
     }
   }
+}
+
+/** Resolve aliases to one repository key shared by desktop and headless routing. */
+export async function canonicalRepositoryIdentity(value: string): Promise<string> {
+  const repositoryPath = path.resolve(requiredText(value, "repository path", 4096));
+  let identity: string;
+  try {
+    identity = await realpath(repositoryPath);
+  } catch {
+    identity = repositoryPath;
+  }
+  const normalized = path.normalize(identity);
+  return process.platform === "win32"
+    ? normalized.toLocaleLowerCase("en-US")
+    : normalized;
+}
+
+async function repositoryIdentities(connections: EncryptedRoomConnection[]): Promise<string[]> {
+  return Promise.all(connections.map((connection) => canonicalRepositoryIdentity(connection.repositoryPath)));
 }
 
 export function parseStoreDocument(raw: string): ConnectionStoreDocument {

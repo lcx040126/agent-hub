@@ -30,6 +30,7 @@ import {
   RefreshCw,
   Server,
   ShieldCheck,
+  Trash2,
   Users,
   X,
   XCircle,
@@ -48,6 +49,7 @@ import {
   createLease,
   createRecord,
   createRoom,
+  deleteSavedConnection,
   downloadDesktopUpdate,
   getDashboard,
   getDesktopUpdateStatus,
@@ -72,11 +74,13 @@ import {
   saveSession,
   secureDesktopSession,
   subscribeDesktopUpdateStatus,
+  type ActivateRoomConnectionResult,
   type Conflict,
   type CreateLeaseInput,
   type CreateRecordInput,
   type Dashboard,
   type DesktopUpdateStatus,
+  type DeleteRoomConnectionResult,
   type Lease,
   type ProjectRecord,
   type RecordKind,
@@ -90,6 +94,10 @@ import {
 type View = "work" | "records" | "connection" | "management";
 type Notice = { tone: "success" | "warning" | "danger"; message: string };
 type RecordModalKind = Exclude<RecordKind, "context">;
+type DeleteConnectionTarget = Pick<
+  SavedRoomConnection,
+  "id" | "roomName" | "memberName" | "serverUrl" | "repositoryPath"
+>;
 
 export type DashboardModal =
   | { type: "claim" }
@@ -109,6 +117,22 @@ export function nextPendingReleaseRequestId(
     && request.holderMemberId === currentMemberId
     && !dismissedRequestIds.has(request.id)
   )?.id;
+}
+
+export function noticeForActivatedConnection(
+  activation: Pick<ActivateRoomConnectionResult, "pausedConnectionIds" | "warnings"> | null | undefined,
+): Notice | null {
+  if (!activation) return null;
+  const messages: string[] = [];
+  if (activation.pausedConnectionIds.length > 0) {
+    messages.push(`已暂停同一项目的 ${activation.pausedConnectionIds.length} 个旧房间连接。`);
+  }
+  if (activation.warnings.length > 0) messages.push(...activation.warnings);
+  if (messages.length === 0) return null;
+  return {
+    tone: activation.warnings.length > 0 ? "warning" : "success",
+    message: messages.join(" "),
+  };
 }
 
 const ACTIVE_STATUSES = new Set(["active", "pending", "working"]);
@@ -264,22 +288,28 @@ function Modal({
   detail,
   children,
   onClose,
+  closeDisabled = false,
 }: {
   title: string;
   detail?: string;
   children: ReactNode;
   onClose: () => void;
+  closeDisabled?: boolean;
 }) {
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape" && !closeDisabled) onClose();
     };
     document.addEventListener("keydown", handleKey);
     return () => document.removeEventListener("keydown", handleKey);
-  }, [onClose]);
+  }, [closeDisabled, onClose]);
 
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={() => { if (!closeDisabled) onClose(); }}
+    >
       <section
         className="modal"
         role="dialog"
@@ -292,13 +322,129 @@ function Modal({
             <h2 id="modal-title">{title}</h2>
             {detail && <p>{detail}</p>}
           </div>
-          <IconButton label="关闭" onClick={onClose}>
+          <IconButton label="关闭" onClick={onClose} disabled={closeDisabled}>
             <X aria-hidden="true" />
           </IconButton>
         </header>
         {children}
       </section>
     </div>
+  );
+}
+
+export function SavedConnectionList({
+  connections,
+  openingConnectionId,
+  deletingConnectionId,
+  notice,
+  onOpen,
+  onDelete,
+}: {
+  connections: SavedRoomConnection[];
+  openingConnectionId?: string;
+  deletingConnectionId?: string;
+  notice?: { connectionId: string; notice: Notice } | null;
+  onOpen: (connection: SavedRoomConnection) => void;
+  onDelete: (connection: SavedRoomConnection) => void;
+}) {
+  return (
+    <div className="saved-connection-list">
+      {connections.map((connection) => {
+        const roomLabel = connection.roomName || "项目协作房间";
+        const opening = openingConnectionId === connection.id;
+        const deleting = deletingConnectionId === connection.id;
+        const rowBusy = opening || deleting;
+        const rowNotice = notice?.connectionId === connection.id ? notice.notice : null;
+        return (
+          <div className="saved-connection-item" key={connection.id}>
+            <div className="saved-connection-row">
+              <button
+                type="button"
+                className="saved-connection-open"
+                onClick={() => onOpen(connection)}
+                disabled={rowBusy}
+                aria-label={`打开${roomLabel}`}
+              >
+                <span><Server aria-hidden="true" /></span>
+                <div>
+                  <strong>{roomLabel}</strong>
+                  <small>{connection.memberName || "已保存成员"} · {connection.integrationEnabled === false ? "接入已暂停，点击恢复" : connection.serverUrl}</small>
+                </div>
+                {opening ? <LoaderCircle className="spin" aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}
+              </button>
+              <IconButton
+                label={`从本机移除${roomLabel}`}
+                className="saved-connection-delete"
+                onClick={() => onDelete(connection)}
+                disabled={rowBusy}
+              >
+                {deleting ? <LoaderCircle className="spin" aria-hidden="true" /> : <Trash2 aria-hidden="true" />}
+              </IconButton>
+            </div>
+            {rowNotice && (
+              <div className={`saved-connection-feedback ${rowNotice.tone}`} role="status">
+                <AlertTriangle aria-hidden="true" />
+                <span>{rowNotice.message}</span>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function DeleteConnectionModal({
+  connection,
+  busy,
+  error,
+  onClose,
+  onConfirm,
+}: {
+  connection: DeleteConnectionTarget;
+  busy: boolean;
+  error?: string;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const roomLabel = connection.roomName || "项目协作房间";
+  return (
+    <Modal
+      title={`从本机移除“${roomLabel}”`}
+      detail="此操作只清理当前电脑保存的连接，不是解散或删除远端房间。"
+      onClose={onClose}
+      closeDisabled={busy}
+    >
+      <form
+        className="modal-form delete-connection-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onConfirm();
+        }}
+      >
+        <div className="delete-connection-summary">
+          <Server aria-hidden="true" />
+          <div>
+            <strong>{roomLabel}</strong>
+            <span>{connection.memberName || "已保存成员"}</span>
+            <code>{connection.repositoryPath || connection.serverUrl}</code>
+          </div>
+        </div>
+        <div className="delete-connection-scope">
+          <p><strong>只从这台电脑移除。</strong>将删除本机保存记录、加密成员凭证、Hook 会话和本地接入数据。</p>
+          <p><strong>不会删除远端房间或团队记录。</strong>共享记录、功能记忆、其他成员数据和房主数据库都会保留。</p>
+          <p>如果房间服务离线，本机删除仍会完成；远端会话或租约可能需要等待房间服务按过期规则自然清理。</p>
+        </div>
+        {error && <div className="form-error" role="alert"><AlertTriangle aria-hidden="true" />{error}</div>}
+        <div className="modal-actions">
+          <button type="button" className="text-button" onClick={onClose} disabled={busy}>取消</button>
+          <button type="submit" className="primary-button danger-action-button" disabled={busy}>
+            {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <Trash2 aria-hidden="true" />}
+            {busy ? "正在移除" : "从本机移除"}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 
@@ -322,9 +468,15 @@ function Field({
 
 export function EntryScreen({
   onConnected,
+  onRequestDelete = () => undefined,
+  deletingConnectionId,
+  connectionsRevision = 0,
   initialNotice = null,
 }: {
-  onConnected: (session: Session) => void;
+  onConnected: (session: Session, notice?: Notice | null) => void;
+  onRequestDelete?: (connection: SavedRoomConnection) => void;
+  deletingConnectionId?: string;
+  connectionsRevision?: number;
   initialNotice?: Notice | null;
 }) {
   const desktop = isDesktopApp();
@@ -335,6 +487,11 @@ export function EntryScreen({
   const [updateNotice, setUpdateNotice] = useState<Notice | null>(initialNotice);
   const [repositoryPath, setRepositoryPath] = useState("");
   const [savedConnections, setSavedConnections] = useState<SavedRoomConnection[]>([]);
+  const [openingConnectionId, setOpeningConnectionId] = useState<string>();
+  const [savedConnectionNotice, setSavedConnectionNotice] = useState<{
+    connectionId: string;
+    notice: Notice;
+  } | null>(null);
   const [createValues, setCreateValues] = useState({
     roomName: "",
     projectName: "",
@@ -353,7 +510,11 @@ export function EntryScreen({
     void listSavedConnections()
       .then(setSavedConnections)
       .catch((caught) => setError(caught instanceof Error ? caught.message : "无法读取已保存的房间。"));
-  }, [desktop]);
+  }, [connectionsRevision, desktop]);
+
+  useEffect(() => {
+    if (initialNotice) setUpdateNotice(initialNotice);
+  }, [initialNotice]);
 
   useEffect(() => {
     if (!updateNotice) return;
@@ -386,9 +547,9 @@ export function EntryScreen({
     }
   };
 
-  const enterSession = (session: Session) => {
+  const enterSession = (session: Session, notice?: Notice | null) => {
     saveSession(session);
-    onConnected(session);
+    onConnected(session, notice);
   };
 
   const submitCreate = async (event: FormEvent) => {
@@ -401,8 +562,13 @@ export function EntryScreen({
     setError("");
     try {
       let session = await createRoom({ ...createValues, agent: "Codex" });
-      if (desktop) session = await secureDesktopSession(session, session.serverUrl!, repositoryPath);
-      enterSession(session);
+      let activationNotice: Notice | null = null;
+      if (desktop) {
+        const secured = await secureDesktopSession(session, session.serverUrl!, repositoryPath);
+        session = secured.session;
+        activationNotice = noticeForActivatedConnection(secured.activation);
+      }
+      enterSession(session, activationNotice);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "房间创建失败，请重试。");
     } finally {
@@ -420,8 +586,13 @@ export function EntryScreen({
     setError("");
     try {
       let session = await joinRoom({ ...joinValues, agent: "Codex" });
-      if (desktop) session = await secureDesktopSession(session, joinValues.serverUrl, repositoryPath);
-      enterSession(session);
+      let activationNotice: Notice | null = null;
+      if (desktop) {
+        const secured = await secureDesktopSession(session, joinValues.serverUrl, repositoryPath);
+        session = secured.session;
+        activationNotice = noticeForActivatedConnection(secured.activation);
+      }
+      enterSession(session, activationNotice);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "加入失败，请检查邀请地址和房间码。");
     } finally {
@@ -430,15 +601,31 @@ export function EntryScreen({
   };
 
   const openSaved = (connection: SavedRoomConnection) => {
-    setBusy(true);
-    setError("");
+    setOpeningConnectionId(connection.id);
+    setSavedConnectionNotice(null);
     void activateSavedConnection(connection.id)
       .then((activated) => {
-        const next = activated ?? connection;
-        enterSession(resumeSavedConnection(next));
+        const next = activated?.connection ?? connection;
+        if (activated) {
+          const paused = new Set(activated.pausedConnectionIds);
+          setSavedConnections((current) => current.map((item) => {
+            if (item.id === next.id) return next;
+            return paused.has(item.id) ? { ...item, integrationEnabled: false } : item;
+          }));
+        }
+        enterSession(
+          resumeSavedConnection(next),
+          noticeForActivatedConnection(activated),
+        );
       })
-      .catch((caught) => setError(caught instanceof Error ? caught.message : "无法恢复房间连接。"))
-      .finally(() => setBusy(false));
+      .catch((caught) => setSavedConnectionNotice({
+        connectionId: connection.id,
+        notice: {
+          tone: "danger",
+          message: caught instanceof Error ? caught.message : "无法恢复房间连接。",
+        },
+      }))
+      .finally(() => setOpeningConnectionId(undefined));
   };
 
   const repositoryPicker = desktop && (
@@ -480,15 +667,14 @@ export function EntryScreen({
           {desktop && savedConnections.length > 0 && (
             <section className="saved-connections" aria-labelledby="saved-title">
               <div><span className="section-kicker">快速返回</span><h2 id="saved-title">已保存的房间</h2></div>
-              <div className="saved-connection-list">
-                {savedConnections.slice(0, 3).map((connection) => (
-                  <button type="button" key={connection.id} onClick={() => openSaved(connection)}>
-                    <span><Server aria-hidden="true" /></span>
-                    <div><strong>{connection.roomName || "项目协作房间"}</strong><small>{connection.memberName || "已保存成员"} · {connection.integrationEnabled === false ? "接入已暂停，点击恢复" : connection.serverUrl}</small></div>
-                    <ChevronRight aria-hidden="true" />
-                  </button>
-                ))}
-              </div>
+              <SavedConnectionList
+                connections={savedConnections}
+                openingConnectionId={openingConnectionId}
+                deletingConnectionId={deletingConnectionId}
+                notice={savedConnectionNotice}
+                onOpen={openSaved}
+                onDelete={onRequestDelete}
+              />
             </section>
           )}
 
@@ -1275,7 +1461,19 @@ function CopyValue({ label, value, secret = false }: { label: string; value: str
   );
 }
 
-function ConnectionView({ dashboard, session, online }: { dashboard: Dashboard; session: Session; online: boolean }) {
+function ConnectionView({
+  dashboard,
+  session,
+  online,
+  deleting,
+  onRemoveLocal,
+}: {
+  dashboard: Dashboard;
+  session: Session;
+  online: boolean;
+  deleting: boolean;
+  onRemoveLocal: () => void;
+}) {
   const currentSessions = dashboard.sessions.filter((item) => item.memberId === dashboard.currentMember.id && item.status === "active" && isVisibleAgentSession(item));
   const latestScan = dashboard.localScans
     .filter((item) => item.memberId === dashboard.currentMember.id)
@@ -1360,6 +1558,26 @@ function ConnectionView({ dashboard, session, online }: { dashboard: Dashboard; 
           </div>
         )}
         {installMessage && <p className="integration-result" role="status">{installMessage}</p>}
+        {session.connectionId && (
+          <div className="local-removal-action">
+            <div>
+              <Trash2 aria-hidden="true" />
+              <span>
+                <strong>移除本机房间数据</strong>
+                <small>删除这台电脑保存的连接、成员凭证和本地接入配置，不影响远端团队数据。</small>
+              </span>
+            </div>
+            <button
+              type="button"
+              className="secondary-button danger-action-button"
+              onClick={onRemoveLocal}
+              disabled={deleting}
+            >
+              {deleting ? <LoaderCircle className="spin" aria-hidden="true" /> : <Trash2 aria-hidden="true" />}
+              从本机移除
+            </button>
+          </div>
+        )}
         <div className="connection-steps">
           <div><span>1</span><div><strong>保持房主服务运行</strong><p>房主电脑关机后房间会暂时离线，重新启动后自动恢复。</p></div></div>
           <div><span>2</span><div><strong>安装并连接本地组件</strong><p>组件只分析本地项目，向房间同步路径、摘要和验证结果。</p></div></div>
@@ -1576,7 +1794,19 @@ function RecordModal({ kind, leases, members, onClose, onSubmit }: { kind: Exclu
   );
 }
 
-function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => Promise<void> }) {
+function DashboardApp({
+  session,
+  initialNotice = null,
+  deletingCurrentConnection,
+  onLeave,
+  onDeleteCurrentConnection,
+}: {
+  session: Session;
+  initialNotice?: Notice | null;
+  deletingCurrentConnection: boolean;
+  onLeave: () => Promise<void>;
+  onDeleteCurrentConnection: () => void;
+}) {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [view, setView] = useState<View>("work");
   const [navOpen, setNavOpen] = useState(false);
@@ -1585,7 +1815,7 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => P
   const [leaving, setLeaving] = useState(false);
   const [online, setOnline] = useState(true);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState<Notice | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(initialNotice);
   const [activeModal, setActiveModal] = useState<DashboardModal | null>(null);
   const [busyLeaseId, setBusyLeaseId] = useState<string>();
   const [transientConflicts, setTransientConflicts] = useState<Conflict[]>([]);
@@ -1638,6 +1868,10 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => P
     const timeout = window.setTimeout(() => setNotice(null), 3500);
     return () => window.clearTimeout(timeout);
   }, [notice]);
+
+  useEffect(() => {
+    if (initialNotice) setNotice(initialNotice);
+  }, [initialNotice]);
 
   const requestLeave = () => {
     if (leaving) return;
@@ -1727,7 +1961,7 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => P
   }
 
   if (!dashboard) {
-    return <main className="fatal-screen"><AlertTriangle aria-hidden="true" /><h1>暂时无法进入房间</h1><p>{error || "房主服务可能尚未启动。"}</p><div><button type="button" className="primary-button" onClick={() => void refresh()} disabled={leaving}><RefreshCw aria-hidden="true" />重新连接</button><button type="button" className="secondary-button" onClick={requestLeave} disabled={leaving}>{leaving ? <LoaderCircle className="spin" aria-hidden="true" /> : <LogOut aria-hidden="true" />}返回登录</button></div></main>;
+    return <main className="fatal-screen"><AlertTriangle aria-hidden="true" /><h1>暂时无法进入房间</h1><p>{error || "房主服务可能尚未启动。"}</p><div><button type="button" className="primary-button" onClick={() => void refresh()} disabled={leaving || deletingCurrentConnection}><RefreshCw aria-hidden="true" />重新连接</button><button type="button" className="secondary-button" onClick={requestLeave} disabled={leaving || deletingCurrentConnection}>{leaving ? <LoaderCircle className="spin" aria-hidden="true" /> : <LogOut aria-hidden="true" />}返回登录</button>{session.connectionId && <button type="button" className="secondary-button danger-action-button" onClick={onDeleteCurrentConnection} disabled={leaving || deletingCurrentConnection}>{deletingCurrentConnection ? <LoaderCircle className="spin" aria-hidden="true" /> : <Trash2 aria-hidden="true" />}从本机移除</button>}</div></main>;
   }
 
   const ownedReleaseRequests = dashboard.releaseRequests.filter((request) => request.status === "pending" && request.holderMemberId === dashboard.currentMember.id);
@@ -1766,7 +2000,7 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => P
           {view === "work" && <WorkView dashboard={dashboard} busyLeaseId={busyLeaseId} transientConflicts={transientConflicts} onClaim={() => openModal({ type: "claim" })} onRenew={handleRenew} onClose={(lease) => openModal({ type: "close", lease })} />}
           {view === "records" && <RecordsView dashboard={dashboard} onAdd={(recordKind) => openModal({ type: "record", recordKind })} />}
           {view === "management" && <ManagementView dashboard={dashboard} session={session} onRefresh={() => refresh(true)} onNotice={(message, tone = "success") => setNotice({ message, tone })} />}
-          {view === "connection" && <ConnectionView dashboard={dashboard} session={session} online={online} />}
+          {view === "connection" && <ConnectionView dashboard={dashboard} session={session} online={online} deleting={deletingCurrentConnection} onRemoveLocal={onDeleteCurrentConnection} />}
         </main>
       </div>
       {activeModal?.type === "claim" && <ClaimLeaseModal settings={dashboard.settings} onClose={() => setActiveModal(null)} onSubmit={handleClaim} />}
@@ -1778,9 +2012,31 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => P
   );
 }
 
+export function noticeForDeletedConnection(result: DeleteRoomConnectionResult): Notice {
+  const warnings = [...result.warnings];
+  if (result.remoteCleanup === "pending") {
+    warnings.unshift("房间服务当前不可用，远端会话或租约可能要等到过期后才会清理。");
+  }
+  if (result.codexRestartRequired) {
+    warnings.push("Codex 接入配置已经更新，请重启 Codex 使变更完全生效。");
+  }
+  return {
+    tone: warnings.length > 0 ? "warning" : "success",
+    message: [
+      "房间已从本机移除，本机保存的成员凭证和接入数据已删除。",
+      ...warnings,
+    ].join(" "),
+  };
+}
+
 export function App() {
   const [session, setSession] = useState<Session | null>(() => loadSession());
   const [entryNotice, setEntryNotice] = useState<Notice | null>(null);
+  const [dashboardNotice, setDashboardNotice] = useState<Notice | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<DeleteConnectionTarget | null>(null);
+  const [deletingConnectionId, setDeletingConnectionId] = useState<string>();
+  const [deleteError, setDeleteError] = useState("");
+  const [connectionsRevision, setConnectionsRevision] = useState(0);
   const leave = async () => {
     const connectionId = session?.connectionId;
     let cleanupError: string | undefined;
@@ -1790,6 +2046,7 @@ export function App() {
     }
     clearSession();
     setSession(null);
+    setDashboardNotice(null);
     setEntryNotice(cleanupError
       ? {
           tone: "warning",
@@ -1797,13 +2054,91 @@ export function App() {
         }
       : null);
   };
-  return session
-    ? <DashboardApp session={session} onLeave={leave} />
-    : <EntryScreen
-        initialNotice={entryNotice}
-        onConnected={(next) => {
-          setEntryNotice(null);
-          setSession(next);
-        }}
-      />;
+
+  const requestDelete = (connection: DeleteConnectionTarget) => {
+    setDeleteError("");
+    setDeleteTarget(connection);
+  };
+
+  const requestDeleteCurrent = () => {
+    if (!session?.connectionId) return;
+    requestDelete({
+      id: session.connectionId,
+      roomName: session.room.name,
+      memberName: session.member.name,
+      serverUrl: session.serverUrl ?? "",
+      repositoryPath: session.repositoryPath ?? "",
+    });
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget || deletingConnectionId) return;
+    const target = deleteTarget;
+    const deletingCurrent = session?.connectionId === target.id;
+    setDeletingConnectionId(target.id);
+    setDeleteError("");
+    try {
+      const result = await deleteSavedConnection(target.id);
+      const notice = noticeForDeletedConnection(result);
+      setDeleteTarget(null);
+      setConnectionsRevision((current) => current + 1);
+      if (deletingCurrent) {
+        clearSession();
+        setSession(null);
+        setDashboardNotice(null);
+        setEntryNotice(notice);
+      } else if (session) {
+        setDashboardNotice(notice);
+      } else {
+        setEntryNotice(notice);
+      }
+    } catch (caught) {
+      setDeleteError(caught instanceof Error ? caught.message : "无法从本机移除房间，请重试。");
+    } finally {
+      setDeletingConnectionId(undefined);
+    }
+  };
+
+  const content = session
+    ? (
+        <DashboardApp
+          session={session}
+          initialNotice={dashboardNotice}
+          deletingCurrentConnection={deletingConnectionId === session.connectionId}
+          onLeave={leave}
+          onDeleteCurrentConnection={requestDeleteCurrent}
+        />
+      )
+    : (
+        <EntryScreen
+          initialNotice={entryNotice}
+          connectionsRevision={connectionsRevision}
+          deletingConnectionId={deletingConnectionId}
+          onRequestDelete={requestDelete}
+          onConnected={(next, notice) => {
+            setEntryNotice(null);
+            setDashboardNotice(notice ?? null);
+            setSession(next);
+          }}
+        />
+      );
+
+  return (
+    <>
+      {content}
+      {deleteTarget && (
+        <DeleteConnectionModal
+          connection={deleteTarget}
+          busy={deletingConnectionId === deleteTarget.id}
+          error={deleteError}
+          onClose={() => {
+            if (deletingConnectionId) return;
+            setDeleteTarget(null);
+            setDeleteError("");
+          }}
+          onConfirm={() => void confirmDelete()}
+        />
+      )}
+    </>
+  );
 }

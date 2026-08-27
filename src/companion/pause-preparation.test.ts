@@ -35,6 +35,29 @@ describe("pause preparation queue", () => {
       lastError: "Try again.",
     }]);
   });
+
+  it("removes only preparations owned by one connection", async () => {
+    const directory = await temporaryDirectory();
+    const queue = new PausePreparationQueue({
+      filePath: path.join(directory, "pause-preparation.json"),
+    });
+    await queue.enqueue({
+      connectionId: "connection-a",
+      reason: "leave-room",
+      requestId: "preparation-a",
+    });
+    await queue.enqueue({
+      connectionId: "connection-b",
+      reason: "leave-room",
+      requestId: "preparation-b",
+    });
+
+    await expect(queue.removeForConnection("connection-a")).resolves.toBe(1);
+    await expect(queue.list()).resolves.toMatchObject([{
+      connectionId: "connection-b",
+      requestId: "preparation-b",
+    }]);
+  });
 });
 
 async function temporaryDirectory(): Promise<string> {

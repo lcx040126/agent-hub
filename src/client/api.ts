@@ -196,6 +196,25 @@ export type SavedRoomConnection = {
   updatedAt: string;
 };
 
+export type ActivateRoomConnectionResult = {
+  connection: SavedRoomConnection;
+  pausedConnectionIds: string[];
+  warnings: string[];
+};
+
+export type SecureDesktopSessionResult = {
+  session: Session;
+  activation: ActivateRoomConnectionResult | null;
+};
+
+export type DeleteRoomConnectionResult = {
+  deletedConnectionId: string;
+  remoteCleanup: "completed" | "pending" | "skipped";
+  codexConfigChanged: boolean;
+  codexRestartRequired: boolean;
+  warnings: string[];
+};
+
 type RepositorySnapshot = {
   repository: {
     root: string;
@@ -225,7 +244,7 @@ type DesktopApi = {
     memberName?: string;
     memberRole?: "host" | "member";
     integrationEnabled?: boolean;
-  }): Promise<SavedRoomConnection>;
+  }): Promise<ActivateRoomConnectionResult>;
   listRoomConnections(): Promise<SavedRoomConnection[]>;
   pauseRoomConnection(connectionId: string): Promise<{
     connection: SavedRoomConnection;
@@ -234,7 +253,8 @@ type DesktopApi = {
     cleanupError?: string;
     localRoomServerStopped: boolean;
   }>;
-  activateRoomConnection(connectionId: string): Promise<SavedRoomConnection>;
+  activateRoomConnection(connectionId: string): Promise<ActivateRoomConnectionResult>;
+  deleteRoomConnection(connectionId: string): Promise<DeleteRoomConnectionResult>;
   requestRoomServer(input: RoomServerRequest): Promise<{ status: number; body: unknown }>;
   installCodexIntegration(connectionId: string): Promise<{
     configPath: string;
@@ -957,6 +977,10 @@ export function clearSession(): void {
   for (const key of LEGACY_SESSION_KEYS) localStorage.removeItem(key);
 }
 
+function clearMatchingSavedConnectionSession(connectionId: string): void {
+  if (loadSession()?.connectionId === connectionId) clearSession();
+}
+
 function normalizeSession(value: unknown): Session {
   const payload = asObject(value);
   const memberToken = asString(payload.memberToken, asString(payload.token));
@@ -1042,11 +1066,28 @@ export async function pauseSavedConnection(
   }
 }
 
-export async function activateSavedConnection(connectionId: string): Promise<SavedRoomConnection | null> {
+export async function activateSavedConnection(connectionId: string): Promise<ActivateRoomConnectionResult | null> {
   const desktop = window.agentHubDesktop;
-  if (!desktop) return null;
+  if (!desktop || typeof desktop.activateRoomConnection !== "function") return null;
   try {
     return await desktop.activateRoomConnection(connectionId);
+  } catch (error) {
+    throw friendlyDesktopError(error);
+  }
+}
+
+export async function deleteSavedConnection(connectionId: string): Promise<DeleteRoomConnectionResult> {
+  const desktop = window.agentHubDesktop;
+  if (!desktop || typeof desktop.deleteRoomConnection !== "function") {
+    throw new Error("仅桌面客户端支持从本机移除已保存的房间连接。");
+  }
+  try {
+    const result = await desktop.deleteRoomConnection(connectionId);
+    if (result.deletedConnectionId !== connectionId) {
+      throw new Error("桌面客户端返回了不匹配的房间连接标识，删除结果未被接受。");
+    }
+    clearMatchingSavedConnectionSession(connectionId);
+    return result;
   } catch (error) {
     throw friendlyDesktopError(error);
   }
@@ -1056,12 +1097,12 @@ export async function secureDesktopSession(
   session: Session,
   serverUrl: string,
   repositoryPath: string,
-): Promise<Session> {
+): Promise<SecureDesktopSessionResult> {
   const desktop = window.agentHubDesktop;
-  if (!desktop) return session;
+  if (!desktop) return { session, activation: null };
   if (!session.memberToken) throw new ApiError("服务没有返回成员凭证，请重新创建或加入房间。", 500);
   try {
-    const saved = await desktop.saveRoomConnection({
+    const activation = await desktop.saveRoomConnection({
       serverUrl,
       memberToken: session.memberToken,
       repositoryPath,
@@ -1071,13 +1112,17 @@ export async function secureDesktopSession(
       memberRole: session.member.role === "host" ? "host" : "member",
       integrationEnabled: session.integrationEnabled,
     });
+    const saved = activation.connection;
     return {
-      ...session,
-      memberToken: undefined,
-      connectionId: saved.id,
-      serverUrl: saved.serverUrl,
-      repositoryPath: saved.repositoryPath,
-      integrationEnabled: saved.integrationEnabled,
+      session: {
+        ...session,
+        memberToken: undefined,
+        connectionId: saved.id,
+        serverUrl: saved.serverUrl,
+        repositoryPath: saved.repositoryPath,
+        integrationEnabled: saved.integrationEnabled,
+      },
+      activation,
     };
   } catch (error) {
     throw friendlyDesktopError(error);

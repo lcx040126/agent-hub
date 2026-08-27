@@ -1,9 +1,10 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ConnectionStore,
+  canonicalRepositoryIdentity,
   normalizeConnectionInput,
   parseStoreDocument,
   type SecretProtector,
@@ -111,6 +112,130 @@ describe("connection store validation", () => {
 
     await expect(store.get(saved.id)).resolves.toMatchObject({ integrationEnabled: false });
     await expect(store.readMemberToken(saved.id)).resolves.toBe("member-token-v2");
+  });
+
+  it("resolves one canonical repository identity with a deterministic fallback", async () => {
+    const directory = await temporaryDirectory();
+    const resolved = path.normalize(await realpath(directory));
+    const expected = process.platform === "win32" ? resolved.toLocaleLowerCase("en-US") : resolved;
+    await expect(canonicalRepositoryIdentity(path.join(directory, "."))).resolves.toBe(expected);
+
+    const missing = path.resolve(directory, "missing", "repository");
+    const expectedMissing = process.platform === "win32"
+      ? missing.toLocaleLowerCase("en-US")
+      : missing;
+    await expect(canonicalRepositoryIdentity(missing)).resolves.toBe(expectedMissing);
+  });
+
+  it("removes encrypted connection data without decrypting the token", async () => {
+    const directory = await temporaryDirectory();
+    const store = new ConnectionStore(path.join(directory, "connections.json"), protector());
+    const saved = await store.save({
+      serverUrl: "http://127.0.0.1:4173",
+      memberToken: "member-token",
+      repositoryPath: directory,
+    });
+    const unavailableProtector: SecretProtector = {
+      isEncryptionAvailable: () => false,
+      encryptString: () => { throw new Error("encryption must not run"); },
+      decryptString: () => { throw new Error("decryption must not run"); },
+    };
+    const reopened = new ConnectionStore(store.filePath, unavailableProtector);
+
+    await expect(reopened.remove(saved.id)).resolves.toMatchObject({ id: saved.id });
+    await expect(reopened.remove(saved.id)).resolves.toBeUndefined();
+    await expect(reopened.list()).resolves.toEqual([]);
+  });
+
+  it("atomically selects one repository owner or pauses the entire repository", async () => {
+    const directory = await temporaryDirectory();
+    const otherRepository = await temporaryDirectory();
+    const store = new ConnectionStore(path.join(directory, "connections.json"), protector());
+    const first = await store.save({
+      serverUrl: "http://127.0.0.1:4173",
+      memberToken: "first-token",
+      repositoryPath: directory,
+    });
+    const second = await store.save({
+      serverUrl: "http://127.0.0.1:4174",
+      memberToken: "second-token",
+      repositoryPath: path.join(directory, "."),
+    });
+    const unrelated = await store.save({
+      serverUrl: "http://127.0.0.1:4175",
+      memberToken: "unrelated-token",
+      repositoryPath: otherRepository,
+    });
+
+    await expect(store.setRepositoryIntegrationOwner(directory, second.id)).resolves.toMatchObject({
+      owner: { id: second.id, integrationEnabled: true },
+      pausedConnectionIds: [first.id],
+    });
+    await expect(store.get(first.id)).resolves.toMatchObject({ integrationEnabled: false });
+    await expect(store.get(second.id)).resolves.toMatchObject({ integrationEnabled: true });
+    await expect(store.get(unrelated.id)).resolves.toMatchObject({ integrationEnabled: true });
+
+    await expect(store.setRepositoryIntegrationOwner(directory, null)).resolves.toMatchObject({
+      owner: undefined,
+      pausedConnectionIds: [second.id],
+    });
+    await expect(store.listActive()).resolves.toEqual([
+      expect.objectContaining({ id: unrelated.id }),
+    ]);
+  });
+
+  it("pauses every legacy active connection when a canonical repository is ambiguous", async () => {
+    const directory = await temporaryDirectory();
+    const otherRepository = await temporaryDirectory();
+    const store = new ConnectionStore(path.join(directory, "connections.json"), protector());
+    const first = await store.save({
+      serverUrl: "http://127.0.0.1:4173",
+      memberToken: "first-token",
+      repositoryPath: directory,
+    });
+    const second = await store.save({
+      serverUrl: "http://127.0.0.1:4174",
+      memberToken: "second-token",
+      repositoryPath: path.join(directory, "."),
+    });
+    const unrelated = await store.save({
+      serverUrl: "http://127.0.0.1:4175",
+      memberToken: "unrelated-token",
+      repositoryPath: otherRepository,
+    });
+
+    await expect(store.normalizeRepositoryIntegrationOwners()).resolves.toEqual(
+      [first.id, second.id].sort(),
+    );
+    await expect(store.normalizeRepositoryIntegrationOwners()).resolves.toEqual([]);
+    const reopened = new ConnectionStore(store.filePath, protector());
+    await expect(reopened.listActive()).resolves.toEqual([
+      expect.objectContaining({ id: unrelated.id }),
+    ]);
+  });
+
+  it("serializes competing repository owner changes without leaving two active rooms", async () => {
+    const directory = await temporaryDirectory();
+    const store = new ConnectionStore(path.join(directory, "connections.json"), protector());
+    const first = await store.save({
+      serverUrl: "http://127.0.0.1:4173",
+      memberToken: "first-token",
+      repositoryPath: directory,
+    });
+    const second = await store.save({
+      serverUrl: "http://127.0.0.1:4174",
+      memberToken: "second-token",
+      repositoryPath: directory,
+    });
+
+    await Promise.all([
+      store.setRepositoryIntegrationOwner(directory, first.id),
+      store.setRepositoryIntegrationOwner(directory, second.id),
+    ]);
+
+    await expect(store.listActive()).resolves.toEqual([
+      expect.objectContaining({ id: second.id }),
+    ]);
   });
 });
 

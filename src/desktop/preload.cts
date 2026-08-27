@@ -14,6 +14,7 @@ const channels = {
   listRoomConnections: "agent-hub:list-room-connections",
   pauseRoomConnection: "agent-hub:pause-room-connection",
   activateRoomConnection: "agent-hub:activate-room-connection",
+  deleteRoomConnection: "agent-hub:delete-room-connection",
   requestRoomServer: "agent-hub:request-room-server",
   installCodexIntegration: "agent-hub:install-codex-integration",
   getDesktopUpdateStatus: "agent-hub:get-desktop-update-status",
@@ -36,6 +37,8 @@ const desktopApi: AgentHubDesktopApi = Object.freeze({
     ipcRenderer.invoke(channels.pauseRoomConnection, connectionId),
   activateRoomConnection: (connectionId: string) =>
     ipcRenderer.invoke(channels.activateRoomConnection, connectionId),
+  deleteRoomConnection: (connectionId: string) =>
+    ipcRenderer.invoke(channels.deleteRoomConnection, connectionId),
   requestRoomServer: (input: RoomServerRequestInput) =>
     ipcRenderer.invoke(channels.requestRoomServer, input),
   installCodexIntegration: (connectionId: string) =>
