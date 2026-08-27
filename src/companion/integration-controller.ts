@@ -6,6 +6,7 @@ import {
 } from "../desktop/connection-store.js";
 import type { SavedRoomConnection } from "../desktop/contracts.js";
 import { CodexHookStateStore } from "./hook-state.js";
+import { SessionEndQueueStore } from "./session-end-queue.js";
 import {
   IntegrationOperationTracker,
   type ConnectionOperationTracker,
@@ -406,6 +407,7 @@ export class IntegrationController {
         await this.pausePreparationQueue.removeForConnection(connection.id);
         await this.pauseQueue.removeForConnection(connection.id);
         await new CodexHookStateStore(this.options.userDataPath).removeForConnection(connection.id);
+        await new SessionEndQueueStore(this.options.userDataPath).removeForConnection(connection.id);
         await this.operationTracker.removeConnectionState?.(connection.id);
 
         const remainingConnections = (await this.options.store.list())

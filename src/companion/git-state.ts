@@ -15,6 +15,8 @@ export interface GitWorkingState {
   changedPathFingerprints: Record<string, string>;
 }
 
+export type GitIdentity = Pick<GitWorkingState, "repositoryRoot" | "branch" | "headCommit">;
+
 export interface GitWorkingStateOptions {
   gitExecutable?: string;
 }
@@ -24,25 +26,83 @@ export async function inspectGitWorkingState(
   options: GitWorkingStateOptions = {},
 ): Promise<GitWorkingState> {
   const git = options.gitExecutable ?? "git";
+  const identity = await inspectGitIdentity(selectedPath, options);
+  return inspectGitWorkingStateFromIdentity(identity, { gitExecutable: git });
+}
+
+export async function inspectGitWorkingStateFromIdentity(
+  identity: GitIdentity,
+  options: GitWorkingStateOptions = {},
+): Promise<GitWorkingState> {
+  const git = options.gitExecutable ?? "git";
+  const [unstaged, staged, untracked] = await Promise.all([
+    safeGit(git, identity.repositoryRoot, ["diff", "--name-only", "-z"]),
+    safeGit(git, identity.repositoryRoot, ["diff", "--cached", "--name-only", "-z"]),
+    safeGit(git, identity.repositoryRoot, ["ls-files", "--others", "--exclude-standard", "-z"]),
+  ]);
+  return buildWorkingState(identity, unstaged, staged, untracked);
+}
+
+export async function inspectGitIdentity(
+  selectedPath: string,
+  options: GitWorkingStateOptions = {},
+): Promise<GitIdentity> {
+  const git = options.gitExecutable ?? "git";
   const cwd = await realpath(selectedPath);
   const root = await runGit(git, cwd, ["rev-parse", "--show-toplevel"]);
   const repositoryRoot = await realpath(root.trim());
-  const [branch, headCommit, unstaged, staged, untracked] = await Promise.all([
+  const [branch, headCommit] = await Promise.all([
     safeGit(git, repositoryRoot, ["branch", "--show-current"]),
     runGit(git, repositoryRoot, ["rev-parse", "HEAD"]),
-    safeGit(git, repositoryRoot, ["diff", "--name-only", "-z"]),
-    safeGit(git, repositoryRoot, ["diff", "--cached", "--name-only", "-z"]),
-    safeGit(git, repositoryRoot, ["ls-files", "--others", "--exclude-standard", "-z"]),
   ]);
+  return {
+    repositoryRoot,
+    branch: branch?.trim() || "(detached)",
+    headCommit: headCommit.trim(),
+  };
+}
+
+export async function inspectGitWorkingPaths(
+  selectedPath: string,
+  repositoryPaths: string[],
+  options: GitWorkingStateOptions = {},
+): Promise<GitWorkingState> {
+  const git = options.gitExecutable ?? "git";
+  const identity = await inspectGitIdentity(selectedPath, options);
+  return inspectGitWorkingPathsFromIdentity(identity, repositoryPaths, { gitExecutable: git });
+}
+
+export async function inspectGitWorkingPathsFromIdentity(
+  identity: GitIdentity,
+  repositoryPaths: string[],
+  options: GitWorkingStateOptions = {},
+): Promise<GitWorkingState> {
+  const git = options.gitExecutable ?? "git";
+  const paths = [...new Set(repositoryPaths.map((value) => value.trim()).filter(Boolean))];
+  if (paths.length === 0) return { ...identity, changedPaths: [], changedPathFingerprints: {} };
+  const pathspec = ["--", ...paths];
+  const [unstaged, staged, untracked] = await Promise.all([
+    safeGit(git, identity.repositoryRoot, ["diff", "--name-only", "-z", ...pathspec]),
+    safeGit(git, identity.repositoryRoot, ["diff", "--cached", "--name-only", "-z", ...pathspec]),
+    safeGit(git, identity.repositoryRoot, ["ls-files", "--others", "--exclude-standard", "-z", ...pathspec]),
+  ]);
+  return buildWorkingState(identity, unstaged, staged, untracked);
+}
+
+async function buildWorkingState(
+  identity: GitIdentity,
+  unstaged: string | null,
+  staged: string | null,
+  untracked: string | null,
+): Promise<GitWorkingState> {
+  const { repositoryRoot } = identity;
 
   const unstagedPaths = uniqueNullSeparated([unstaged]);
   const stagedPaths = uniqueNullSeparated([staged]);
   const untrackedPaths = uniqueNullSeparated([untracked]);
   const changedPaths = uniqueNullSeparated([unstaged, staged, untracked]);
   return {
-    repositoryRoot,
-    branch: branch?.trim() || "(detached)",
-    headCommit: headCommit.trim(),
+    ...identity,
     changedPaths,
     changedPathFingerprints: await fingerprintChangedPaths(repositoryRoot, changedPaths, {
       unstaged: new Set(unstagedPaths.map(pathKey)),

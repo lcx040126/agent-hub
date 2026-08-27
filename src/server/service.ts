@@ -158,6 +158,25 @@ export interface RecordLocalScanInput {
   ruleFiles?: string[];
   systems?: string[];
   metadata?: Record<string, unknown>;
+  finalizationId?: string;
+}
+
+export interface StartSessionFinalizationInput {
+  memberToken: string;
+  sessionId: string;
+  finalizationId: string;
+  summary?: string;
+}
+
+export interface CompleteSessionFinalizationInput extends StartSessionFinalizationInput {
+  evidenceError?: string;
+}
+
+export interface PrepareEditsInput extends CheckEditsInput {
+  title: string;
+  objective?: string;
+  branch?: string;
+  baseCommit?: string;
 }
 
 export interface CloseSessionInput {
@@ -1306,9 +1325,13 @@ export class AgentHubService {
       const requesterSessionId = nullableString(row.requester_session_id);
       if (requesterSessionId) {
         const requesterSession = this.database.connection.prepare(`
-          SELECT status FROM work_sessions WHERE id = ? AND member_id = ?
+          SELECT status, finalizing_at FROM work_sessions WHERE id = ? AND member_id = ?
         `).get(requesterSessionId, asString(row.requester_member_id)) as Row | undefined;
-        if (!requesterSession || asString(requesterSession.status) !== "active") {
+        if (
+          !requesterSession
+          || asString(requesterSession.status) !== "active"
+          || requesterSession.finalizing_at
+        ) {
           this.database.connection.prepare(`
             UPDATE release_requests
             SET status = 'cancelled', decision_member_id = ?, resolved_at = ?
@@ -1632,11 +1655,51 @@ export class AgentHubService {
     };
   }
 
+  prepareEdits(input: PrepareEditsInput): {
+    check: EditCheckResult;
+    claim?: LeaseClaimResult;
+    renewedLeases: Lease[];
+  } {
+    return this.database.transaction(() => {
+      let renewedLeases: Lease[] = [];
+      if (input.sessionId) {
+        this.syncSessionBranch({
+          memberToken: input.memberToken,
+          sessionId: input.sessionId,
+          branch: input.branch,
+          baseCommit: input.baseCommit,
+        });
+        renewedLeases = this.heartbeatSession({
+          memberToken: input.memberToken,
+          sessionId: input.sessionId,
+        }).renewedLeases;
+      }
+      let check = this.checkEdits(input);
+      const onlyUncovered = !check.allowed
+        && check.blockers.length > 0
+        && check.blockers.every((blocker) => blocker.code === "uncovered_path");
+      if (!onlyUncovered) return { check, renewedLeases };
+      const claim = this.claimLease({
+        memberToken: input.memberToken,
+        sessionId: input.sessionId,
+        title: input.title,
+        objective: input.objective,
+        branch: input.branch,
+        baseCommit: input.baseCommit,
+        paths: check.uncoveredPaths.length > 0 ? check.uncoveredPaths : input.paths,
+        mode: "write",
+        autoClaim: true,
+      });
+      if (claim.acquired) check = this.checkEdits(input);
+      return { check, claim, renewedLeases };
+    });
+  }
+
   queryFeatureMemories(input: FeatureMemoryQueryInput): FeatureMemoryQueryResult {
     const auth = this.authenticateMemberToken(input.memberToken);
     if (input.sessionId) {
-      const sessionId = this.activeOwnedSessionId(input.sessionId, auth);
-      if (!sessionId) throw new AgentHubError("feature_session_required", "An active session is required.", 409);
+      const session = this.requireOwnedSession(input.sessionId, auth);
+      this.requireActiveOrFinalizingSession(session, input.finalizationId);
     }
     return this.featureMemoryCall(() => this.featureMemory.query(this.featureActor(auth), input));
   }
@@ -1649,6 +1712,7 @@ export class AgentHubService {
   submitFeatureRevision(input: SubmitFeatureRevisionInput): FeatureRevision {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
+    this.requireActiveOrFinalizingSession(session, input.finalizationId);
     const submittedTargetPaths = uniqueStrings(
       input.targets.map((target) => target.path).filter((path): path is string => Boolean(path)),
     );
@@ -1684,6 +1748,7 @@ export class AgentHubService {
   rollbackFeatureRevision(input: RollbackFeatureRevisionInput): FeatureRevision {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
+    this.requireActiveOrFinalizingSession(session, input.finalizationId);
     const submittedTargetPaths = this.featureRevisionTargetPaths(auth.room.id, input.targetRevisionId);
     const promotionEvidenceVerified = this.featurePromotionEvidenceVerified(session, {
       branch: session.branch,
@@ -1717,6 +1782,9 @@ export class AgentHubService {
   resolveFeatureConfirmation(input: ResolveFeatureConfirmationInput) {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
+    if (session.status !== "active") {
+      throw new AgentHubError("session_not_active", "Feature changes can only be confirmed by an active session.", 409);
+    }
     const confirmation = this.featureMemoryCall(() => this.featureMemory.resolveConfirmation(
       this.featureActor(auth),
       this.featureSession(session),
@@ -2156,6 +2224,7 @@ export class AgentHubService {
     const branch = optionalString(input.branch, "Branch", 255) ?? null;
     const baseCommit = optionalString(input.baseCommit, "Base commit", 255) ?? null;
     if (session.status === "frozen") throw new AgentHubError("session_frozen", session.frozenReason ?? "The session is frozen after a branch change.", 409);
+    if (session.status !== "active") throw new AgentHubError("session_not_active", "The work session is not active.", 409);
     if (session.branch === branch) {
       const now = this.timestamp();
       this.database.connection.prepare("UPDATE work_sessions SET base_commit = ?, last_seen_at = ? WHERE id = ?").run(baseCommit, now, session.id);
@@ -2181,6 +2250,9 @@ export class AgentHubService {
   rebaselineSession(input: RebaselineSessionInput): WorkSession {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
+    if (session.status !== "active" && session.status !== "frozen") {
+      throw new AgentHubError("session_not_active", "The work session cannot be re-baselined.", 409);
+    }
     const branch = optionalString(input.branch, "Branch", 255) ?? null;
     const baseCommit = optionalString(input.baseCommit, "Base commit", 255) ?? null;
     const now = this.timestamp();
@@ -2194,8 +2266,15 @@ export class AgentHubService {
   recordLocalScan(input: RecordLocalScanInput): LocalScan {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
-    if (session.status !== "active") {
-      throw new AgentHubError("session_not_active", "The local session is closed.", 409);
+    this.requireActiveOrFinalizingSession(session, input.finalizationId);
+    const finalizationId = input.finalizationId === undefined
+      ? null
+      : requiredString(input.finalizationId, "Finalization id", 128);
+    if (finalizationId) {
+      const existing = this.database.connection
+        .prepare("SELECT * FROM local_scans WHERE finalization_id = ?")
+        .get(finalizationId) as Row | undefined;
+      if (existing) return mapLocalScan(existing);
     }
     const scan: LocalScan = {
       id: randomUUID(),
@@ -2217,8 +2296,9 @@ export class AgentHubService {
         .prepare(`
           INSERT INTO local_scans (
             id, session_id, room_id, member_id, repository, branch, worktree, base_commit,
-            changed_paths_json, rule_files_json, systems_json, metadata_json, scanned_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            changed_paths_json, rule_files_json, systems_json, metadata_json, scanned_at,
+            finalization_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           scan.id,
@@ -2234,6 +2314,7 @@ export class AgentHubService {
           json(scan.systems),
           json(scan.metadata),
           scan.scannedAt,
+          finalizationId,
         );
       this.database.connection
         .prepare(`
@@ -2260,9 +2341,133 @@ export class AgentHubService {
     return scan;
   }
 
+  startSessionFinalization(input: StartSessionFinalizationInput): WorkSession {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const session = this.requireOwnedSession(input.sessionId, auth);
+    const finalizationId = requiredString(input.finalizationId, "Finalization id", 128);
+    const storedId = this.sessionFinalizationId(session.id);
+    if (session.status === "closed") {
+      if (storedId === finalizationId) return session;
+      throw new AgentHubError("session_already_closed", "The work session is already closed.", 409);
+    }
+    if (session.status === "finalizing") {
+      if (storedId === finalizationId) return session;
+      throw new AgentHubError("finalization_conflict", "Another finalization already owns this session.", 409);
+    }
+    if (session.status !== "active") {
+      throw new AgentHubError("session_not_active", "The work session cannot enter finalization.", 409);
+    }
+
+    const startedAt = this.timestamp();
+    const summary = optionalString(input.summary, "Finalization summary", 4000);
+    this.database.transaction(() => {
+      this.expireLeases(auth.room.id, false);
+      this.featureMemory.expireSessionConfirmations(session.id, startedAt);
+      const leases = this.database.connection.prepare(`
+        SELECT id, title FROM leases
+        WHERE session_id = ? AND status = 'active' AND kind <> 'exclusive'
+      `).all(session.id) as Row[];
+      const cancel = this.database.connection.prepare(`
+        UPDATE leases SET status = 'cancelled', completed_at = ?, updated_at = ?, completion_summary = ?
+        WHERE id = ?
+      `);
+      for (const lease of leases) {
+        const leaseId = asString(lease.id);
+        cancel.run(
+          startedAt,
+          startedAt,
+          summary ?? "The Agent session entered background finalization.",
+          leaseId,
+        );
+        this.insertActivity({
+          roomId: auth.room.id,
+          actorMemberId: auth.member.id,
+          actorName: auth.member.displayName,
+          type: "lease.finalizing",
+          entityType: "lease",
+          entityId: leaseId,
+          summary: `${auth.member.displayName} released ${asString(lease.title)} for background finalization.`,
+          metadata: { status: "cancelled", sessionId: session.id, finalizationId },
+          createdAt: startedAt,
+        });
+      }
+      this.database.connection.prepare(`
+        UPDATE release_requests SET status = 'cancelled', resolved_at = ?
+        WHERE requester_session_id = ? AND status = 'pending'
+      `).run(startedAt, session.id);
+      this.database.connection.prepare(`
+        UPDATE work_sessions
+        SET finalization_id = ?, finalizing_at = ?, finalization_error = NULL, last_seen_at = ?
+        WHERE id = ?
+      `).run(finalizationId, startedAt, startedAt, session.id);
+      this.auditRecord(
+        auth,
+        "session.finalizing",
+        "session",
+        session.id,
+        "Queued final evidence processing and released synchronous write protection.",
+        { finalizationId, releasedLeaseIds: leases.map((lease) => asString(lease.id)), summary },
+      );
+    });
+    return this.requireSessionById(session.id);
+  }
+
+  completeSessionFinalization(input: CompleteSessionFinalizationInput): WorkSession {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const session = this.requireOwnedSession(input.sessionId, auth);
+    const finalizationId = requiredString(input.finalizationId, "Finalization id", 128);
+    const storedId = this.sessionFinalizationId(session.id);
+    if (storedId !== finalizationId) {
+      throw new AgentHubError("finalization_mismatch", "The finalization id does not own this session.", 409);
+    }
+    if (session.status === "closed") return session;
+    if (session.status !== "finalizing") {
+      throw new AgentHubError("session_not_finalizing", "The work session is not finalizing.", 409);
+    }
+    const closedAt = this.timestamp();
+    const summary = optionalString(input.summary, "Finalization summary", 4000);
+    const evidenceError = optionalString(input.evidenceError, "Finalization evidence error", 4000);
+    this.database.transaction(() => {
+      if (evidenceError) {
+        this.database.connection.prepare(`
+          INSERT OR IGNORE INTO records (
+            id, room_id, member_id, kind, title, summary, paths_json, status,
+            evidence_json, commit_hash, created_at
+          ) VALUES (?, ?, ?, 'risk', ?, ?, '[]', 'open', ?, NULL, ?)
+        `).run(
+          `finalization-risk:${finalizationId}`,
+          auth.room.id,
+          auth.member.id,
+          "会话结束证据未完整生成",
+          evidenceError,
+          json([`Agent Hub session ${session.id}`, `Finalization ${finalizationId}`]),
+          closedAt,
+        );
+      }
+      this.database.connection.prepare(`
+        UPDATE work_sessions
+        SET status = 'closed', closed_at = ?, last_seen_at = ?, finalization_error = ?
+        WHERE id = ?
+      `).run(closedAt, closedAt, evidenceError, session.id);
+      this.auditRecord(auth, "session.finalized", "session", session.id, "Completed background session finalization.", {
+        finalizationId,
+        summary,
+        evidenceComplete: evidenceError === null,
+      });
+    });
+    return this.requireSessionById(session.id);
+  }
+
   closeSession(input: CloseSessionInput): WorkSession {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
+    if (session.status === "finalizing") {
+      throw new AgentHubError(
+        "session_finalizing",
+        "The work session is already owned by background finalization.",
+        409,
+      );
+    }
     const closedAt = this.timestamp();
     const summary = optionalString(input.summary, "Session summary", 4000);
     this.database.transaction(() => {
@@ -2619,9 +2824,9 @@ export class AgentHubService {
     const requesterSessionId = nullableString(row.requester_session_id);
     if (requesterSessionId) {
       const session = this.database.connection.prepare(`
-        SELECT status FROM work_sessions WHERE id = ? AND member_id = ?
+        SELECT status, finalizing_at FROM work_sessions WHERE id = ? AND member_id = ?
       `).get(requesterSessionId, requesterMemberId) as Row | undefined;
-      if (!session || asString(session.status) !== "active") return null;
+      if (!session || asString(session.status) !== "active" || session.finalizing_at) return null;
     }
     const settings = this.readRoomSettings(
       asString(row.room_id),
@@ -3280,6 +3485,39 @@ export class AgentHubService {
     return session.id;
   }
 
+  private requireActiveOrFinalizingSession(
+    session: WorkSession,
+    finalizationId?: string,
+  ): void {
+    if (session.status === "active") {
+      if (finalizationId !== undefined) {
+        throw new AgentHubError("session_not_finalizing", "The work session has not entered finalization.", 409);
+      }
+      return;
+    }
+    if (session.status === "finalizing") {
+      const requestedId = finalizationId === undefined
+        ? null
+        : requiredString(finalizationId, "Finalization id", 128);
+      if (!requestedId || this.sessionFinalizationId(session.id) !== requestedId) {
+        throw new AgentHubError(
+          "finalization_required",
+          "This operation requires the session's finalization capability.",
+          409,
+        );
+      }
+      return;
+    }
+    throw new AgentHubError("session_not_active", "The work session is closed.", 409);
+  }
+
+  private sessionFinalizationId(sessionId: string): string | null {
+    const row = this.database.connection
+      .prepare("SELECT finalization_id FROM work_sessions WHERE id = ?")
+      .get(sessionId) as Row | undefined;
+    return row ? nullableString(row.finalization_id) : null;
+  }
+
   private featureActor(auth: AuthenticatedMember): FeatureMemoryActor {
     return {
       roomId: auth.room.id,
@@ -3307,7 +3545,11 @@ export class AgentHubService {
     session: WorkSession,
     claims: FeaturePromotionClaims,
   ): boolean {
-    if (session.status !== "active" || !claims.finalCommit || claims.verifications.length === 0) return false;
+    if (
+      (session.status !== "active" && session.status !== "finalizing")
+      || !claims.finalCommit
+      || claims.verifications.length === 0
+    ) return false;
     if (claims.verifications.some((verification) => verification.result !== "passed")) return false;
 
     const scanRow = this.database.connection.prepare(`
@@ -3628,6 +3870,7 @@ function mapActivity(row: Row): Activity {
 }
 
 function mapSession(row: Row): WorkSession {
+  const persistedStatus = asString(row.status) as WorkSession["status"];
   return {
     id: asString(row.id),
     roomId: asString(row.room_id),
@@ -3639,7 +3882,11 @@ function mapSession(row: Row): WorkSession {
     worktree: nullableString(row.worktree),
     baseCommit: nullableString(row.base_commit),
     task: nullableString(row.task),
-    status: row.frozen_reason ? "frozen" : asString(row.status) as WorkSession["status"],
+    status: persistedStatus === "active" && row.finalizing_at
+      ? "finalizing"
+      : row.frozen_reason
+        ? "frozen"
+        : persistedStatus,
     branchEpoch: Number(row.branch_epoch ?? 1),
     frozenReason: nullableString(row.frozen_reason),
     metadata: parseObject(row.metadata_json),

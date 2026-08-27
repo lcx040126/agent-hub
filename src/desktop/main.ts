@@ -22,6 +22,10 @@ import {
   startCodexSessionHeartbeatScheduler,
   type CodexSessionHeartbeatScheduler,
 } from "../companion/codex-session-heartbeat.js";
+import {
+  startSessionEndFinalizationWorker,
+  type SessionEndFinalizationWorker,
+} from "../companion/session-end-worker.js";
 import { WindowsDpapiProtector } from "../companion/windows-dpapi.js";
 import {
   startRepositoryScanScheduler,
@@ -75,6 +79,7 @@ let tray: Tray | null = null;
 let hostServer: ServiceSupervisor | null = null;
 let scanScheduler: RepositoryScanScheduler | null = null;
 let hookHeartbeatScheduler: CodexSessionHeartbeatScheduler | null = null;
+let sessionEndFinalizationWorker: SessionEndFinalizationWorker | null = null;
 let releaseRequestNotifier: ReleaseRequestNotificationScheduler | null = null;
 let desktopUpdater: DesktopAppUpdater | null = null;
 let integrationController: IntegrationController | null = null;
@@ -175,6 +180,15 @@ async function bootstrap(): Promise<void> {
   });
   await integrationController.start();
   const integrationIsActive = () => integrationController?.getPresence()?.record.status === "active";
+  sessionEndFinalizationWorker = startSessionEndFinalizationWorker({
+    userDataPath: userDataDirectory,
+    store,
+    integrationActive: integrationIsActive,
+    onError(error, job) {
+      const session = job?.hubSessionId ? ` (${job.hubSessionId})` : "";
+      console.error(`Agent Hub background finalization failed${session}: ${error.message}`);
+    },
+  });
   const startScanner = () => startRepositoryScanScheduler({
     store,
     integrationActive: integrationIsActive,
@@ -326,9 +340,15 @@ async function createElectronUpdateEngine(): Promise<ElectronUpdateEngine> {
 async function cleanupBeforeQuit(): Promise<void> {
   // shutdownDesktopIntegration closes the sentinel before waiting on these
   // producers, then drains their operation markers before remote cleanup.
-  const schedulers = [scanScheduler, hookHeartbeatScheduler, releaseRequestNotifier];
+  const schedulers = [
+    scanScheduler,
+    hookHeartbeatScheduler,
+    sessionEndFinalizationWorker,
+    releaseRequestNotifier,
+  ];
   scanScheduler = null;
   hookHeartbeatScheduler = null;
+  sessionEndFinalizationWorker = null;
   releaseRequestNotifier = null;
   unsubscribeUpdateStatus?.();
   unsubscribeUpdateStatus = null;

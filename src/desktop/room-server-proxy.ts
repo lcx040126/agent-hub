@@ -37,6 +37,7 @@ const SAVED_POST_ROUTES = [
   /^\/api\/leases\/[A-Za-z0-9_-]{1,128}\/(?:renew|close)$/,
   /^\/api\/release-requests\/[A-Za-z0-9_-]{1,128}\/resolve$/,
   /^\/api\/edits\/check$/,
+  /^\/api\/edits\/prepare$/,
   /^\/api\/features\/query$/,
   /^\/api\/features\/revisions$/,
   /^\/api\/features\/[A-Za-z0-9_-]{1,128}\/rollback$/,

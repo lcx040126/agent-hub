@@ -379,6 +379,7 @@ export interface FeatureMemoryCard {
 export interface FeatureMemoryQueryInput {
   memberToken: string;
   sessionId?: string;
+  finalizationId?: string;
   level?: "cards" | "detail";
   query?: string;
   featureIds?: string[];
@@ -400,6 +401,7 @@ export interface FeatureMemoryQueryResult {
 export interface SubmitFeatureRevisionInput {
   memberToken: string;
   sessionId: string;
+  finalizationId?: string;
   featureKey: string;
   name: string;
   systemId: string;
@@ -421,6 +423,7 @@ export interface SubmitFeatureRevisionInput {
 export interface RollbackFeatureRevisionInput {
   memberToken: string;
   sessionId: string;
+  finalizationId?: string;
   featureId: string;
   targetRevisionId: string;
   changeSummary: string;
@@ -593,7 +596,7 @@ export interface WorkSession {
   worktree: string | null;
   baseCommit: string | null;
   task: string | null;
-  status: "active" | "frozen" | "closed";
+  status: "active" | "frozen" | "finalizing" | "closed";
   branchEpoch: number;
   frozenReason: string | null;
   metadata: Record<string, unknown>;

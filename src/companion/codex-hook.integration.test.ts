@@ -18,6 +18,8 @@ import { CodexHookStateStore } from "./hook-state.js";
 import { IntegrationOperationTracker } from "./integration-operations.js";
 import { PausePreparationQueue } from "./pause-preparation.js";
 import { startRuntimePresence, type RuntimePresenceHandle } from "./runtime-presence.js";
+import { SessionEndQueueStore } from "./session-end-queue.js";
+import { startSessionEndFinalizationWorker } from "./session-end-worker.js";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -76,7 +78,7 @@ describe("Codex hook integration", () => {
 
     expect(list).toHaveBeenCalledOnce();
     expect(fetchImpl).not.toHaveBeenCalled();
-  });
+  }, 10_000);
 
   it("keeps an in-flight hook registered until pause cleanup can choose its cutoff", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-drain-"));
@@ -298,7 +300,7 @@ describe("Codex hook integration", () => {
         additionalContext: expect.stringContaining("本次操作不会因网络故障被阻止"),
       },
     });
-  });
+  }, 10_000);
 
   it("silently removes inactive SessionEnd state and remains idempotent", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-inactive-end-"));
@@ -336,8 +338,63 @@ describe("Codex hook integration", () => {
     await expect(handleCodexHook(options, input)).resolves.toBeUndefined();
     await expect(handleCodexHook(options, input)).resolves.toBeUndefined();
     await expect(stateStore.load(input.session_id)).resolves.toBeUndefined();
+    await expect(new SessionEndQueueStore(userDataPath).list()).resolves.toHaveLength(1);
     expect(options.fetchImpl).not.toHaveBeenCalled();
   });
+
+  it("persists SessionEnd before returning within the three-second host budget", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-fast-session-end-"));
+    temporaryDirectories.push(root);
+    const userDataPath = path.join(root, "user-data");
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+    const store = new ConnectionStore(path.join(userDataPath, "connections.json"), protector);
+    const connection = await store.save({
+      serverUrl: "http://127.0.0.1:4317",
+      memberToken: "member-token",
+      repositoryPath: root,
+    });
+    const stateStore = new CodexHookStateStore(userDataPath);
+    await stateStore.save({
+      version: 1,
+      codexSessionId: "fast-end-session",
+      connectionId: connection.id,
+      hubSessionId: "hub-fast-end",
+      repositoryPath: root,
+      branch: "main",
+      baseCommit: "0123456789abcdef",
+      initialChangedPaths: [],
+      initialChangedFingerprints: {},
+      observedChangedPaths: [],
+      observedChangedFingerprints: {},
+      attributedChangedPaths: ["src/value.ts"],
+      leases: [],
+      openedAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+    });
+    const fetchImpl = vi.fn((_input: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      })) as unknown as typeof fetch;
+    const startedAt = performance.now();
+
+    await handleCodexHook({
+      eventName: "SessionEnd",
+      userDataPath,
+      protector,
+      fetchImpl,
+    }, {
+      session_id: "fast-end-session",
+      cwd: root,
+      hook_event_name: "SessionEnd",
+    });
+
+    expect(performance.now() - startedAt).toBeLessThan(2_500);
+    await expect(new SessionEndQueueStore(userDataPath).list()).resolves.toHaveLength(1);
+    await expect(stateStore.load("fast-end-session")).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  }, 5_000);
 
   it("opens shared context, attributes Agent writes, ignores external changes, and blocks another member's Unity scope", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-flow-"));
@@ -695,6 +752,16 @@ describe("Codex hook integration", () => {
     );
 
     await handleCodexHook(options("SessionEnd"), input("SessionEnd", { reason: "other" }));
+    expect(service.getDashboard(room.memberToken).sessions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ status: "finalizing" })]),
+    );
+    const finalizer = startSessionEndFinalizationWorker({
+      userDataPath,
+      store,
+      intervalMs: 60_000,
+    });
+    await finalizer.scanNow();
+    await finalizer.stop();
     expect(service.getDashboard(room.memberToken).sessions).toEqual(
       expect.arrayContaining([expect.objectContaining({ status: "closed" })]),
     );

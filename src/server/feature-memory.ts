@@ -47,7 +47,7 @@ export interface FeatureMemorySession {
   memberId: string;
   branch: string | null;
   baseCommit: string | null;
-  status: "active" | "frozen" | "closed";
+  status: "active" | "frozen" | "finalizing" | "closed";
   promotionEvidenceVerified?: boolean;
 }
 
@@ -1434,7 +1434,7 @@ function requireActiveOwnedSession(actor: FeatureMemoryActor, session: FeatureMe
   if (session.memberId !== actor.memberId) {
     throw new FeatureMemoryError("feature_session_forbidden", "The feature session belongs to another member.", 403);
   }
-  if (session.status !== "active") {
+  if (session.status !== "active" && session.status !== "finalizing") {
     throw new FeatureMemoryError("feature_session_not_active", "The feature session is not active.", 409);
   }
 }

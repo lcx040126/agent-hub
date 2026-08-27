@@ -1,5 +1,5 @@
 import type { Readable, Writable } from "node:stream";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { SecretProtector } from "../desktop/connection-store.js";
 import type { SavedRoomConnection } from "../desktop/contracts.js";
@@ -17,6 +17,9 @@ import {
   type ResolvedRoomConnectionRecord,
 } from "./connection-runtime.js";
 import {
+  inspectGitIdentity,
+  inspectGitWorkingPathsFromIdentity,
+  inspectGitWorkingStateFromIdentity,
   inspectGitWorkingState,
   toRepositoryRelativePath,
   type GitWorkingState,
@@ -39,6 +42,10 @@ import {
 } from "./write-attribution.js";
 import { getLocalIntegrationStatus, getRuntimeIntegrationStatus } from "./integration-gate.js";
 import { IntegrationOperationTracker } from "./integration-operations.js";
+import {
+  SessionEndQueueStore,
+  type SessionEndQueueJob,
+} from "./session-end-queue.js";
 
 export type CodexHookEventName =
   | "SessionStart"
@@ -135,14 +142,15 @@ export async function handleCodexHook(
   if (input.hook_event_name && input.hook_event_name !== options.eventName) {
     throw new Error(`Hook event mismatch: expected ${options.eventName}.`);
   }
+  if (options.eventName === "SessionEnd") {
+    await handleSessionEnd(options, input);
+    return undefined;
+  }
   const runtimePresence = await getRuntimeIntegrationStatus(
     options.userDataPath,
     options.runtimePresencePath,
   );
   if (!runtimePresence.active) {
-    if (options.eventName === "SessionEnd") {
-      await new CodexHookStateStore(options.userDataPath).remove(input.session_id);
-    }
     return undefined;
   }
   const record = await resolveTrackedConnectionRecord(options, input);
@@ -154,15 +162,9 @@ export async function handleCodexHook(
     options.runtimePresencePath,
   );
   if (!localStatus.active) {
-    if (options.eventName === "SessionEnd") {
-      await new CodexHookStateStore(options.userDataPath).remove(input.session_id);
-    }
     return undefined;
   }
   if (!localStatus.remoteAllowed) {
-    if (options.eventName === "SessionEnd") {
-      await new CodexHookStateStore(options.userDataPath).remove(input.session_id);
-    }
     return failureOutput(
       options.eventName,
       new HookCleanupPendingError(localStatus.diagnostic),
@@ -182,6 +184,12 @@ export async function handleCodexHook(
   }
 }
 
+interface PrepareEditsResponse {
+  check: EditCheckResponse;
+  claim?: LeaseResponse;
+  renewedLeases?: Array<{ id: string; paths?: string[]; expiresAt: string }>;
+}
+
 async function dispatchCodexHook(
   options: RunCodexHookOptions,
   input: CodexHookInput,
@@ -195,7 +203,6 @@ async function dispatchCodexHook(
     case "PostToolUse":
       return handlePostToolUse(options, input, record);
     case "SessionEnd":
-      await handleSessionEnd(options, input, record);
       return undefined;
   }
 }
@@ -266,27 +273,12 @@ async function handlePreToolUse(
   if (!intent.writes) return undefined;
   const runtime = await findHookRuntime(options, input, record);
   if (!runtime) return undefined;
-  runtime.git = await inspectGitWorkingState(runtime.connection.repositoryPath, { gitExecutable: options.gitExecutable });
-  try {
-    await runtime.client.post(`/api/sessions/${encodeURIComponent(runtime.state.hubSessionId)}/sync`, {
-      branch: runtime.git.branch,
-      baseCommit: runtime.git.headCommit,
-    });
-  } catch (error) {
-    if (error instanceof AgentHubHttpError && (error.code === "branch_changed" || error.code === "session_frozen")) {
-      runtime.state.quarantine = { reason: error.message, paths: [], detectedAt: new Date().toISOString() };
-      await runtime.stateStore.save(runtime.state);
-      return denyOutput(`${error.message} 请确认新分支基线后重新开始 Codex 会话。`);
-    }
-    throw error;
-  }
   if (runtime.state.quarantine) {
     return denyOutput(
       `Agent Hub 已隔离当前会话，因为先前检测到越界写入：${runtime.state.quarantine.reason}`
       + " 请停止新增修改，人工检查现有 Git 差异，并结束当前 Codex 会话后再继续。",
     );
   }
-  await renewExpiringLeases(runtime);
   const paths = normalizeCandidates(
     runtime.git.repositoryRoot,
     mapRepositoryCwd(
@@ -301,6 +293,24 @@ async function handlePreToolUse(
     mapRepositoryCwd(runtime.connection.repositoryPath, runtime.git.repositoryRoot, input.cwd),
     intent,
   );
+
+  if (paths.length > 0) {
+    const targetedBaseline = await inspectGitWorkingPathsFromIdentity(runtime.git, paths, {
+      gitExecutable: options.gitExecutable,
+    });
+    mergeTargetedObservation(runtime.state, paths, targetedBaseline);
+    runtime.git = {
+      ...targetedBaseline,
+      changedPaths: [...runtime.state.observedChangedPaths],
+      changedPathFingerprints: { ...runtime.state.observedChangedFingerprints },
+    };
+  } else if (intent.attributedSideEffects) {
+    runtime.git = await inspectGitWorkingStateFromIdentity(runtime.git, {
+      gitExecutable: options.gitExecutable,
+    });
+    runtime.state.observedChangedPaths = [...runtime.git.changedPaths];
+    runtime.state.observedChangedFingerprints = { ...runtime.git.changedPathFingerprints };
+  }
 
   if (paths.length > MAX_SESSION_FEATURE_PATHS || proposedEdits.length > MAX_SESSION_FEATURE_PATHS) {
     return denyOutput(
@@ -326,44 +336,45 @@ async function handlePreToolUse(
     );
   }
 
-  const existing = await runtime.client.post<EditCheckResponse>("/api/edits/check", {
-    sessionId: runtime.state.hubSessionId,
-    paths,
-    proposedEdits,
-  });
-  if (existing.allowed) {
+  let prepared: PrepareEditsResponse;
+  try {
+    prepared = await runtime.client.post<PrepareEditsResponse>("/api/edits/prepare", {
+      sessionId: runtime.state.hubSessionId,
+      title: `Codex 自动范围 ${shortSessionId(input.session_id)}`,
+      intent: `由 ${input.tool_name ?? "写入工具"} 在实际修改前自动领取`,
+      branch: runtime.git.branch,
+      baseCommit: runtime.git.headCommit,
+      paths,
+      proposedEdits,
+    });
+  } catch (error) {
+    if (error instanceof AgentHubHttpError && (error.code === "branch_changed" || error.code === "session_frozen")) {
+      runtime.state.quarantine = { reason: error.message, paths: [], detectedAt: new Date().toISOString() };
+      await runtime.stateStore.save(runtime.state);
+      return denyOutput(`${error.message} 请确认新分支基线后重新开始 Codex 会话。`);
+    }
+    throw error;
+  }
+  updateRenewedLeases(runtime.state, prepared.renewedLeases ?? []);
+  if (prepared.claim?.acquired && prepared.claim.lease) {
+    upsertLease(runtime.state, {
+      id: prepared.claim.lease.id,
+      paths: prepared.claim.lease.paths?.length ? prepared.claim.lease.paths : paths,
+      expiresAt: prepared.claim.lease.expiresAt,
+    });
+  }
+  if (prepared.check.allowed) {
     setPendingWrite(runtime, input, intent, proposedEdits);
     await runtime.stateStore.save(runtime.state);
-    return allowOutput(formatWarnings(existing.warnings));
+    const claimed = prepared.claim?.acquired
+      ? `Agent Hub 已自动领取写入范围：${paths.join("、")}。`
+      : "";
+    return allowOutput(`${claimed}${formatWarnings(prepared.check.warnings)}`);
   }
-  const onlyUncovered = existing.blockers.every((blocker) => blocker.code === "uncovered_path");
-  if (!onlyUncovered) {
-    return denyOutput(formatEditBlockers(existing.blockers, runtime.state.hubSessionId));
+  if (prepared.claim && !prepared.claim.acquired) {
+    return denyOutput(formatConflicts(prepared.claim.conflicts ?? [], prepared.claim.decision));
   }
-
-  const claim = await runtime.client.post<LeaseResponse>("/api/leases", {
-    title: `Codex 自动范围 ${shortSessionId(input.session_id)}`,
-    sessionId: runtime.state.hubSessionId,
-    intent: `由 ${input.tool_name ?? "写入工具"} 在实际修改前自动领取`,
-    branch: runtime.git.branch,
-    baseCommit: runtime.git.headCommit,
-    paths,
-    mode: "write",
-    autoClaim: true,
-  });
-  if (!claim.acquired || !claim.lease) {
-    return denyOutput(formatConflicts(claim.conflicts ?? [], claim.decision));
-  }
-
-  upsertLease(runtime.state, {
-    id: claim.lease.id,
-    paths: claim.lease.paths?.length ? claim.lease.paths : paths,
-    expiresAt: claim.lease.expiresAt,
-  });
-  setPendingWrite(runtime, input, intent, proposedEdits);
-  await runtime.stateStore.save(runtime.state);
-  const warning = claim.decision === "warn" ? " 当前存在黄色重叠提醒，但不会阻止本次写入。" : "";
-  return allowOutput(`Agent Hub 已自动领取写入范围：${paths.join("、")}。${warning}`);
+  return denyOutput(formatEditBlockers(prepared.check.blockers, runtime.state.hubSessionId));
 }
 
 interface FeatureMemoryCardResponse {
@@ -394,6 +405,12 @@ interface AutomaticFeatureVerification {
   evidence?: string;
 }
 
+interface SessionFinalizationContext {
+  hubSessionId: string;
+  baseCommit: string;
+  leases: HookLeaseState[];
+}
+
 async function handlePostToolUse(
   options: RunCodexHookOptions,
   input: CodexHookInput,
@@ -403,9 +420,6 @@ async function handlePostToolUse(
   if (!intent.writes) return undefined;
   const runtime = await findHookRuntime(options, input, record);
   if (!runtime) return undefined;
-  runtime.git = await inspectGitWorkingState(runtime.connection.repositoryPath, {
-    gitExecutable: options.gitExecutable,
-  });
   const pending = runtime.state.pendingWrite;
   const baseline = pending
     ? {
@@ -421,6 +435,15 @@ async function handlePostToolUse(
     mapRepositoryCwd(runtime.connection.repositoryPath, runtime.git.repositoryRoot, input.cwd),
     intent.pathCandidates,
   );
+  const targetedInspection = !(pending?.attributedSideEffects ?? intent.attributedSideEffects)
+    && repositoryTargets.length > 0;
+  runtime.git = targetedInspection
+    ? await inspectGitWorkingPathsFromIdentity(runtime.git, repositoryTargets, {
+        gitExecutable: options.gitExecutable,
+      })
+    : await inspectGitWorkingStateFromIdentity(runtime.git, {
+        gitExecutable: options.gitExecutable,
+      });
   const changes = attributedChangedPaths(
     baseline,
     runtime.git,
@@ -441,8 +464,11 @@ async function handlePostToolUse(
   runtime.state.attributedPathsTruncated = runtime.state.attributedPathsTruncated === true
     || accumulatedAttributedPaths.length > MAX_SESSION_FEATURE_PATHS;
   runtime.state.attributedChangedPaths = accumulatedAttributedPaths.slice(0, MAX_SESSION_FEATURE_PATHS);
-  runtime.state.observedChangedPaths = [...runtime.git.changedPaths];
-  runtime.state.observedChangedFingerprints = { ...runtime.git.changedPathFingerprints };
+  if (targetedInspection) mergeTargetedObservation(runtime.state, repositoryTargets, runtime.git);
+  else {
+    runtime.state.observedChangedPaths = [...runtime.git.changedPaths];
+    runtime.state.observedChangedFingerprints = { ...runtime.git.changedPathFingerprints };
+  }
   runtime.state.pendingWrite = undefined;
   await runtime.stateStore.save(runtime.state);
   if (newlyObserved.length === 0) return undefined;
@@ -473,39 +499,24 @@ async function handlePostToolUse(
       },
     };
   }
-  let check = await runtime.client.post<EditCheckResponse>("/api/edits/check", {
+  const prepared = await runtime.client.post<PrepareEditsResponse>("/api/edits/prepare", {
     sessionId: runtime.state.hubSessionId,
+    title: `Codex 归因范围 ${shortSessionId(input.session_id)}`,
+    intent: `由 ${input.tool_name ?? "写入工具"} 产生的已识别增量`,
+    branch: runtime.git.branch,
+    baseCommit: runtime.state.baseCommit,
     paths: newlyObserved,
     proposedEdits,
   });
-  const onlyUncovered = !check.allowed
-    && check.blockers.length > 0
-    && check.blockers.every((blocker) => blocker.code === "uncovered_path");
-  if (onlyUncovered) {
-    const uncovered = check.uncoveredPaths.length ? check.uncoveredPaths : newlyObserved;
-    const claim = await runtime.client.post<LeaseResponse>("/api/leases", {
-      title: `Codex 归因范围 ${shortSessionId(input.session_id)}`,
-      sessionId: runtime.state.hubSessionId,
-      intent: `由 ${input.tool_name ?? "写入工具"} 产生的已识别增量`,
-      branch: runtime.git.branch,
-      baseCommit: runtime.state.baseCommit,
-      paths: uncovered,
-      mode: "write",
-      autoClaim: true,
+  const check = prepared.check;
+  updateRenewedLeases(runtime.state, prepared.renewedLeases ?? []);
+  if (prepared.claim?.acquired && prepared.claim.lease) {
+    upsertLease(runtime.state, {
+      id: prepared.claim.lease.id,
+      paths: prepared.claim.lease.paths?.length ? prepared.claim.lease.paths : newlyObserved,
+      expiresAt: prepared.claim.lease.expiresAt,
     });
-    if (claim.acquired && claim.lease) {
-      upsertLease(runtime.state, {
-        id: claim.lease.id,
-        paths: claim.lease.paths?.length ? claim.lease.paths : uncovered,
-        expiresAt: claim.lease.expiresAt,
-      });
-      await runtime.stateStore.save(runtime.state);
-      check = await runtime.client.post<EditCheckResponse>("/api/edits/check", {
-        sessionId: runtime.state.hubSessionId,
-        paths: newlyObserved,
-        proposedEdits,
-      });
-    }
+    await runtime.stateStore.save(runtime.state);
   }
   await uploadLightweightScan(runtime, "PostToolUse", newlyObserved);
   if (check.allowed) {
@@ -542,130 +553,125 @@ async function handlePostToolUse(
 async function handleSessionEnd(
   options: RunCodexHookOptions,
   input: CodexHookInput,
-  record: ResolvedRoomConnectionRecord,
 ): Promise<void> {
   const stateStore = new CodexHookStateStore(options.userDataPath);
   const state = await stateStore.load(input.session_id);
   if (!state) return;
-  if (state.connectionId !== record.connection.id) return;
-  const integration = await getLocalIntegrationStatus(
-    options.userDataPath,
-    record.connection,
-    options.runtimePresencePath,
-  );
-  if (!integration.active) {
-    // A paused/stopped integration must not leave a stale local session that
-    // could be resumed accidentally after the room is reopened.
-    await stateStore.remove(input.session_id);
-    return;
+  if (!state.finalizationId) {
+    state.finalizationId = randomUUID();
+    await stateStore.save(state);
   }
-  const resolved = await hydrateConnectionRecord(record);
-  const client = new AgentHubClient({
-    serverUrl: resolved.connection.serverUrl,
-    memberToken: resolved.memberToken,
-    fetchImpl: createHookGatedFetch(options, resolved.connection.id),
+  const job = await new SessionEndQueueStore(options.userDataPath).enqueue(state, input.reason);
+  await stateStore.remove(input.session_id);
+
+  try {
+    await new IntegrationOperationTracker(options.userDataPath).run(state.connectionId, async () => {
+      const record = await resolveConnectionRecordById(
+        options.userDataPath,
+        state.connectionId,
+        options.protector,
+      );
+      if (!record) return;
+      const integration = await getLocalIntegrationStatus(
+        options.userDataPath,
+        record.connection,
+        options.runtimePresencePath,
+      );
+      if (!integration.active || !integration.remoteAllowed) return;
+      const resolved = await hydrateConnectionRecord(record);
+      const client = new AgentHubClient({
+        serverUrl: resolved.connection.serverUrl,
+        memberToken: resolved.memberToken,
+        fetchImpl: options.fetchImpl,
+        timeoutMs: 1_500,
+      });
+      await client.post(`/api/sessions/${encodeURIComponent(state.hubSessionId)}/finalize/start`, {
+        finalizationId: job.finalizationId,
+        summary: `Codex session ${input.session_id} ended; final evidence was queued locally.`,
+      });
+    });
+  } catch {
+    // The durable desktop worker owns retries. SessionEnd must return inside
+    // Codex's fixed three-second lifecycle even when the room is offline.
+  }
+}
+
+export interface FinalizeQueuedSessionOptions {
+  client: AgentHubClient;
+  gitExecutable?: string;
+}
+
+export async function finalizeQueuedSession(
+  job: SessionEndQueueJob,
+  options: FinalizeQueuedSessionOptions,
+): Promise<void> {
+  const { client } = options;
+  await client.post(`/api/sessions/${encodeURIComponent(job.hubSessionId)}/finalize/start`, {
+    finalizationId: job.finalizationId,
+    summary: `Codex session ${job.codexSessionId} ended; background finalization started.`,
   });
-  const git = await inspectGitWorkingState(resolved.connection.repositoryPath, {
+  const git = await inspectGitWorkingState(job.repositoryPath, {
     gitExecutable: options.gitExecutable,
   });
-  const actualPaths = unique(state.attributedChangedPaths ?? []);
+  const actualPaths = unique(job.attributedPaths);
+  const sessionContext = {
+    hubSessionId: job.hubSessionId,
+    baseCommit: job.baseCommit,
+    leases: job.leases,
+  };
 
   let featureMemorySummary = "未发现可归因给本次 Agent 的代码变化。";
+  let evidenceError: string | undefined;
   let featureEvidence: FeatureGitEvidence | undefined;
   let featureVerifications: AutomaticFeatureVerification[] = [];
-  if (state.attributedPathsTruncated) {
+  if (job.attributedPathsTruncated) {
     featureMemorySummary = `本次 Agent 会话涉及超过 ${MAX_SESSION_FEATURE_PATHS} 个归因路径，自动功能记忆未生成，以免用不完整证据覆盖稳定版本。`;
-    await client.post("/api/records", {
-      kind: "risk",
-      title: "自动功能证据超过单会话上限",
-      summary: featureMemorySummary,
-      paths: actualPaths,
-      status: "open",
-      evidence: [`Codex session ${input.session_id}`],
-    }).catch(() => undefined);
+    evidenceError = featureMemorySummary;
   } else if (actualPaths.length > 0) {
-    try {
-      [featureEvidence, featureVerifications] = await Promise.all([
-        collectFeatureGitEvidence(git.repositoryRoot, state.baseCommit, {
-          gitExecutable: options.gitExecutable,
-          includePaths: actualPaths,
-        }),
-        collectSessionFeatureVerifications(client, state),
-      ]);
-    } catch (error) {
-      featureMemorySummary = `自动功能证据收集失败：${humanError(error)}`;
-      await client.post("/api/records", {
-        kind: "risk",
-        title: "自动功能证据尚未生成",
-        summary: featureMemorySummary,
-        paths: actualPaths,
-        status: "open",
-        evidence: [`Codex session ${input.session_id}`],
-      }).catch(() => undefined);
-    }
+    [featureEvidence, featureVerifications] = await Promise.all([
+      collectFeatureGitEvidence(git.repositoryRoot, job.baseCommit, {
+        gitExecutable: options.gitExecutable,
+        includePaths: actualPaths,
+      }),
+      collectSessionFeatureVerifications(client, sessionContext),
+    ]);
   }
 
-  await client.post(`/api/sessions/${encodeURIComponent(state.hubSessionId)}/scan`, {
+  await client.post(`/api/sessions/${encodeURIComponent(job.hubSessionId)}/scan`, {
     repository: git.repositoryRoot,
     branch: git.branch,
     worktree: git.repositoryRoot,
-    baseCommit: state.baseCommit,
+    baseCommit: job.baseCommit,
     changedPaths: featureEvidence?.changedPaths ?? actualPaths,
     ruleFiles: [],
     systems: featureEvidence?.inferredSystems ?? [],
     metadata: {
       source: "codex-hook",
       event: "SessionEnd",
+      finalizationId: job.finalizationId,
       attributedPathCount: actualPaths.length,
-      attributedPathsTruncated: state.attributedPathsTruncated === true,
+      attributedPathsTruncated: job.attributedPathsTruncated,
       featureEvidence: featureEvidence ? featureEvidenceAttestation(featureEvidence) : undefined,
-      externalChangeCount: state.externalChangeDiagnostics?.reduce(
-        (total, diagnostic) => total + diagnostic.paths.length,
-        0,
-      ) ?? 0,
+      externalChangeCount: job.externalChangeCount,
     },
+    finalizationId: job.finalizationId,
   });
 
   if (featureEvidence) {
-    try {
-      featureMemorySummary = await submitAutomaticFeatureDraft(
-        client,
-        state,
-        featureEvidence,
-        featureVerifications,
-      );
-    } catch (error) {
-      featureMemorySummary = `自动功能记忆生成失败：${humanError(error)}`;
-      await client.post("/api/records", {
-        kind: "risk",
-        title: "自动功能记忆尚未生成",
-        summary: featureMemorySummary,
-        paths: actualPaths,
-        status: "open",
-        evidence: [`Codex session ${input.session_id}`],
-      }).catch(() => undefined);
-    }
+    featureMemorySummary = await submitAutomaticFeatureDraft(
+      client,
+      sessionContext,
+      featureEvidence,
+      featureVerifications,
+      job.finalizationId,
+    );
   }
 
-  for (const lease of state.leases) {
-    const leasePaths = actualPaths.filter((candidate) =>
-      lease.paths.some((scope) => pathScopeCovers(scope, candidate)),
-    );
-    await client.post(`/api/leases/${encodeURIComponent(lease.id)}/close`, {
-      sessionId: state.hubSessionId,
-      status: "completed",
-      summary: "Codex 会话结束，Agent Hub 已自动同步实际变更并释放范围。",
-      changedPaths: leasePaths,
-      validations: [],
-      remainingRisks: [],
-    }).catch((error: unknown) => {
-      if (!shouldDiscardLeaseRenewal(error)) throw error;
-    });
-  }
-  await client.post(`/api/sessions/${encodeURIComponent(state.hubSessionId)}/close`, {
+  await client.post(`/api/sessions/${encodeURIComponent(job.hubSessionId)}/finalize/complete`, {
+    finalizationId: job.finalizationId,
     summary: `Codex session ended with ${actualPaths.length} attributed path(s). ${featureMemorySummary}`,
+    evidenceError,
   });
-  await stateStore.remove(input.session_id);
 }
 
 async function findHookRuntime(
@@ -682,7 +688,26 @@ async function findHookRuntime(
     options.runtimePresencePath,
   )).active) return undefined;
   const resolved = await hydrateConnectionRecord(record);
-  return openHookRuntime(options, input, resolved, false, state);
+  if (!state) return openHookRuntime(options, input, resolved, false, state);
+  const identity = await inspectGitIdentity(resolved.connection.repositoryPath, {
+    gitExecutable: options.gitExecutable,
+  });
+  return {
+    input,
+    connection: resolved.connection,
+    client: new AgentHubClient({
+      serverUrl: resolved.connection.serverUrl,
+      memberToken: resolved.memberToken,
+      fetchImpl: createHookGatedFetch(options, resolved.connection.id),
+    }),
+    git: {
+      ...identity,
+      changedPaths: [...state.observedChangedPaths],
+      changedPathFingerprints: { ...state.observedChangedFingerprints },
+    },
+    state,
+    stateStore,
+  };
 }
 
 async function hydrateConnectionRecord(record: ResolvedRoomConnectionRecord): Promise<ResolvedRoomConnection> {
@@ -730,6 +755,7 @@ async function openHookRuntime(
       codexSessionId: input.session_id,
       connectionId: resolved.connection.id,
       hubSessionId: opened.session.id,
+      finalizationId: randomUUID(),
       repositoryPath: git.repositoryRoot,
       branch: git.branch,
       baseCommit: git.headCommit,
@@ -817,9 +843,10 @@ export function extractWriteIntent(
 
 async function submitAutomaticFeatureDraft(
   client: AgentHubClient,
-  state: CodexHookSessionState,
+  state: SessionFinalizationContext,
   evidence: FeatureGitEvidence,
   verifications: AutomaticFeatureVerification[],
+  finalizationId?: string,
 ): Promise<string> {
   if (evidence.changedPaths.length === 0) return "归因路径没有留下可记录的 Git 差异。";
 
@@ -830,6 +857,7 @@ async function submitAutomaticFeatureDraft(
     || `${humanizeIdentifier(systemId)} / ${humanizeIdentifier(primarySymbol)}`;
   const query = await client.post<FeatureQueryResponse>("/api/features/query", {
     sessionId: state.hubSessionId,
+    finalizationId,
     level: "detail",
     paths: evidence.changedPaths,
     systems: [systemId],
@@ -887,6 +915,7 @@ async function submitAutomaticFeatureDraft(
   ].slice(0, 300);
   await client.post("/api/features/revisions", {
     sessionId: state.hubSessionId,
+    finalizationId,
     featureKey,
     name: name.slice(0, 240),
     systemId,
@@ -921,7 +950,7 @@ async function submitAutomaticFeatureDraft(
 
 async function collectSessionFeatureVerifications(
   client: AgentHubClient,
-  state: CodexHookSessionState,
+  state: SessionFinalizationContext,
 ): Promise<AutomaticFeatureVerification[]> {
   const snapshot = await client.get<RoomSnapshotLike>("/api/snapshot");
   const leaseIds = new Set(state.leases.map((lease) => lease.id));
@@ -1003,6 +1032,37 @@ function setPendingWrite(
     baselineChangedFingerprints: { ...runtime.git.changedPathFingerprints },
     recordedAt: new Date().toISOString(),
   };
+}
+
+function mergeTargetedObservation(
+  state: CodexHookSessionState,
+  repositoryTargets: string[],
+  targeted: GitWorkingState,
+): void {
+  const coversTarget = (candidate: string) => repositoryTargets.some((target) =>
+    pathScopeCovers(target, candidate) || pathScopeCovers(candidate, target));
+  const retainedPaths = state.observedChangedPaths.filter((candidate) => !coversTarget(candidate));
+  const retainedFingerprints = { ...state.observedChangedFingerprints };
+  for (const candidate of state.observedChangedPaths) {
+    if (coversTarget(candidate)) delete retainedFingerprints[pathKey(candidate)];
+  }
+  state.observedChangedPaths = unique([...retainedPaths, ...targeted.changedPaths]);
+  state.observedChangedFingerprints = {
+    ...retainedFingerprints,
+    ...targeted.changedPathFingerprints,
+  };
+}
+
+function updateRenewedLeases(
+  state: CodexHookSessionState,
+  renewedLeases: Array<{ id: string; paths?: string[]; expiresAt: string }>,
+): void {
+  for (const renewed of renewedLeases) {
+    const existing = state.leases.find((lease) => lease.id === renewed.id);
+    if (!existing) continue;
+    existing.paths = renewed.paths?.length ? unique(renewed.paths) : existing.paths;
+    existing.expiresAt = renewed.expiresAt;
+  }
 }
 
 function normalizeCandidates(repositoryRoot: string, cwd: string, candidates: string[]): string[] {

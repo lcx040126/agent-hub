@@ -42,6 +42,7 @@ export interface CodexHookSessionState {
   codexSessionId: string;
   connectionId: string;
   hubSessionId: string;
+  finalizationId?: string;
   repositoryPath: string;
   branch: string;
   baseCommit: string;
@@ -166,6 +167,9 @@ export function parseState(raw: string): CodexHookSessionState {
     codexSessionId: requiredText(value.codexSessionId, "Codex session ID"),
     connectionId: requiredText(value.connectionId, "connection ID"),
     hubSessionId: requiredText(value.hubSessionId, "Agent Hub session ID"),
+    finalizationId: value.finalizationId === undefined
+      ? undefined
+      : requiredIdentifier(value.finalizationId, "finalization ID"),
     repositoryPath: path.resolve(requiredText(value.repositoryPath, "repository path")),
     branch: requiredText(value.branch, "branch"),
     baseCommit: requiredText(value.baseCommit, "base commit"),
@@ -280,6 +284,12 @@ function requiredHash(value: unknown, name: string): string {
   const text = requiredText(value, name);
   if (!/^[a-f0-9]{64}$/i.test(text)) throw new Error(`The ${name} is invalid.`);
   return text.toLocaleLowerCase("en-US");
+}
+
+function requiredIdentifier(value: unknown, name: string): string {
+  const text = requiredText(value, name);
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(text)) throw new Error(`The ${name} is invalid.`);
+  return text;
 }
 
 function isoText(value: unknown, name: string): string {

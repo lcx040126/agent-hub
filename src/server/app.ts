@@ -320,6 +320,32 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
     );
   });
 
+  app.post("/api/edits/prepare", (request, response) => {
+    const body = bodyObject(request);
+    const result = service.prepareEdits({
+      memberToken: bearerToken(request),
+      sessionId: optionalValue(body, "sessionId"),
+      title: value(body, "title"),
+      objective: optionalValue(body, "intent", "objective", "description"),
+      branch: optionalValue(body, "branch"),
+      baseCommit: optionalValue(body, "baseCommit"),
+      paths: stringArrayValue(body.paths),
+      leaseId: optionalValue(body, "leaseId"),
+      proposedEdits: objectArrayValue(body.proposedEdits) as unknown as ProposedFeatureEdit[],
+    });
+    response.json({
+      check: result.check,
+      renewedLeases: result.renewedLeases.map(leaseResponse),
+      claim: result.claim ? {
+        acquired: result.claim.acquired,
+        decision: result.claim.decision,
+        lease: result.claim.acquired ? leaseResponse(result.claim.lease) : undefined,
+        conflicts: result.claim.conflicts.map(conflictResponse),
+        releaseRequests: result.claim.releaseRequests,
+      } : undefined,
+    });
+  });
+
   app.get("/api/release-requests", (request, response) => {
     const rawStatus = typeof request.query.status === "string" ? request.query.status : undefined;
     response.json({
@@ -348,6 +374,7 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
     response.json(service.queryFeatureMemories({
       memberToken: bearerToken(request),
       sessionId: optionalValue(body, "sessionId"),
+      finalizationId: optionalValue(body, "finalizationId"),
       level: body.level === "detail" ? "detail" : "cards",
       query: optionalValue(body, "query"),
       featureIds: stringArrayValue(body.featureIds),
@@ -369,6 +396,7 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
     const revision = service.submitFeatureRevision({
       memberToken: bearerToken(request),
       sessionId: value(body, "sessionId"),
+      finalizationId: optionalValue(body, "finalizationId"),
       featureKey: value(body, "featureKey"),
       name: value(body, "name"),
       systemId: value(body, "systemId"),
@@ -394,6 +422,7 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
     const revision = service.rollbackFeatureRevision({
       memberToken: bearerToken(request),
       sessionId: value(body, "sessionId"),
+      finalizationId: optionalValue(body, "finalizationId"),
       featureId: parameter(request, "id"),
       targetRevisionId: value(body, "targetRevisionId"),
       changeSummary: value(body, "changeSummary"),
@@ -543,6 +572,7 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       ruleFiles: stringArrayValue(body.ruleFiles),
       systems: stringArrayValue(body.systems),
       metadata: objectOrUndefined(body.metadata),
+      finalizationId: optionalValue(body, "finalizationId"),
     });
     response.status(201).json({ scan });
   });
@@ -563,6 +593,29 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       memberToken: bearerToken(request),
       sessionId: parameter(request, "id"),
       summary: optionalValue(body, "summary"),
+    });
+    response.json({ session });
+  });
+
+  app.post("/api/sessions/:id/finalize/start", (request, response) => {
+    const body = bodyObject(request);
+    const session = service.startSessionFinalization({
+      memberToken: bearerToken(request),
+      sessionId: parameter(request, "id"),
+      finalizationId: value(body, "finalizationId"),
+      summary: optionalValue(body, "summary"),
+    });
+    response.json({ session });
+  });
+
+  app.post("/api/sessions/:id/finalize/complete", (request, response) => {
+    const body = bodyObject(request);
+    const session = service.completeSessionFinalization({
+      memberToken: bearerToken(request),
+      sessionId: parameter(request, "id"),
+      finalizationId: value(body, "finalizationId"),
+      summary: optionalValue(body, "summary"),
+      evidenceError: optionalValue(body, "evidenceError"),
     });
     response.json({ session });
   });

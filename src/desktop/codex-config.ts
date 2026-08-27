@@ -67,7 +67,7 @@ const MANAGED_HOOK_DEFINITIONS: HookDefinition[] = [
   { event: "SessionStart", matcher: "^(startup|resume|clear|compact)$", timeout: 10 },
   { event: "PreToolUse", matcher: "^(Bash|apply_patch)$", timeout: 20 },
   { event: "PostToolUse", matcher: "^(Bash|apply_patch)$", timeout: 20 },
-  { event: "SessionEnd", timeout: 60 },
+  { event: "SessionEnd", timeout: 3 },
 ];
 
 export function codexServerName(connectionId: string): string {

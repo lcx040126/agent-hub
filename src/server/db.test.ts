@@ -16,15 +16,30 @@ afterEach(() => {
 });
 
 describe("Agent Hub database migrations", () => {
+  it("rolls nested savepoints back with their outer coordination transaction", () => {
+    const database = new AgentHubDatabase({ path: ":memory:" });
+    database.connection.exec("CREATE TABLE transaction_probe (value TEXT NOT NULL)");
+    expect(() => database.transaction(() => {
+      database.connection.prepare("INSERT INTO transaction_probe (value) VALUES ('outer')").run();
+      database.transaction(() => {
+        database.connection.prepare("INSERT INTO transaction_probe (value) VALUES ('inner')").run();
+      });
+      throw new Error("rollback outer");
+    })).toThrow("rollback outer");
+    expect(database.connection.prepare("SELECT COUNT(*) AS count FROM transaction_probe").get())
+      .toEqual({ count: 0 });
+    database.close();
+  });
+
   it("refuses to open a database created by a newer schema", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-hub-future-db-"));
     temporaryDirectories.push(directory);
     const databasePath = join(directory, "agent-hub.sqlite");
     const future = new DatabaseSync(databasePath);
-    future.exec("PRAGMA user_version = 4");
+    future.exec("PRAGMA user_version = 5");
     future.close();
     expect(() => new AgentHubDatabase({ path: databasePath })).toThrow(
-      /newer than supported schema 3/,
+      /newer than supported schema 4/,
     );
   });
 
@@ -133,7 +148,7 @@ describe("Agent Hub database migrations", () => {
     expect(database.connection
       .prepare("SELECT id, session_id, kind FROM leases WHERE id = 'legacy-lease'")
       .get()).toEqual({ id: "legacy-lease", session_id: null, kind: "standard" });
-    expect(database.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    expect(database.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 4 });
     expect(database.connection.prepare(`
       SELECT blocking_protection_enabled, automatic_lease_ttl_minutes,
         maximum_exclusive_lease_minutes, risk_policy_version

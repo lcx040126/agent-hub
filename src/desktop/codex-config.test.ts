@@ -173,6 +173,7 @@ describe("mergeCodexMcpConfig", () => {
     expect(hooks.PreToolUse.at(-1)?.matcher).toBe("^(Bash|apply_patch)$");
     expect(hooks.PostToolUse.at(-1)?.matcher).toBe("^(Bash|apply_patch)$");
     expect((hooks.PostToolUse.at(-1)?.hooks as Array<Record<string, unknown>>)[0].async).toBeUndefined();
+    expect((hooks.SessionEnd.at(-1)?.hooks as Array<Record<string, unknown>>)[0].timeout).toBe(3);
     expect(twice).not.toContain("member-token");
   });
 });

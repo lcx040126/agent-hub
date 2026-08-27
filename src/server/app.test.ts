@@ -27,11 +27,87 @@ describe("Agent Hub REST API", () => {
     expect(health.body).toMatchObject({
       status: "ok",
       service: "agent-hub",
-      version: "0.2.2",
+      version: "0.2.3",
       protocolVersion: 1,
-      schemaVersion: 3,
-      database: { status: "ok", schemaVersion: 3 },
+      schemaVersion: 4,
+      database: { status: "ok", schemaVersion: 4 },
     });
+  });
+
+  it("finalizes sessions idempotently while rejecting normal work in the background phase", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const opened = await auth(request(app).post("/api/sessions").send({
+      agentName: "Codex",
+      repository: "C:/project",
+      branch: "main",
+      baseCommit: "0123456789abcdef",
+    }), owner.body.token);
+    const sessionId = opened.body.session.id as string;
+    const finalizationId = "finalization_test_001";
+    const lease = await auth(request(app).post("/api/leases").send({
+      sessionId,
+      title: "Finalizing work",
+      paths: ["src/finalizing.ts"],
+      autoClaim: true,
+    }), owner.body.token);
+    expect(lease.body.acquired).toBe(true);
+
+    const started = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/finalize/start`)
+      .send({ finalizationId }), owner.body.token);
+    expect(started.status).toBe(200);
+    expect(started.body.session.status).toBe("finalizing");
+    const repeatedStart = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/finalize/start`)
+      .send({ finalizationId }), owner.body.token);
+    expect(repeatedStart.body.session.status).toBe("finalizing");
+
+    expect((await auth(request(app)
+      .post(`/api/sessions/${sessionId}/heartbeat`).send({}), owner.body.token)).status).toBe(409);
+    expect((await auth(request(app).post("/api/leases").send({
+      sessionId,
+      title: "Late write",
+      paths: ["src/late.ts"],
+      autoClaim: true,
+    }), owner.body.token)).status).toBe(409);
+    expect((await auth(request(app)
+      .post(`/api/sessions/${sessionId}/scan`)
+      .send({ changedPaths: ["src/finalizing.ts"] }), owner.body.token)).status).toBe(409);
+
+    const firstScan = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/scan`)
+      .send({ finalizationId, changedPaths: ["src/finalizing.ts"] }), owner.body.token);
+    const repeatedScan = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/scan`)
+      .send({ finalizationId, changedPaths: ["src/finalizing.ts"] }), owner.body.token);
+    expect(firstScan.status, JSON.stringify(firstScan.body)).toBe(201);
+    expect(repeatedScan.body.scan.id).toBe(firstScan.body.scan.id);
+    expect((await auth(request(app).post("/api/features/query").send({
+      sessionId,
+      level: "cards",
+    }), owner.body.token)).status).toBe(409);
+    expect((await auth(request(app).post("/api/features/query").send({
+      sessionId,
+      finalizationId,
+      level: "cards",
+    }), owner.body.token)).status).toBe(200);
+
+    const completed = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/finalize/complete`)
+      .send({ finalizationId, evidenceError: "Local Git evidence remained unavailable." }), owner.body.token);
+    expect(completed.body.session.status).toBe("closed");
+    const repeatedComplete = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/finalize/complete`)
+      .send({ finalizationId }), owner.body.token);
+    expect(repeatedComplete.body.session.status).toBe("closed");
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: lease.body.lease.id, status: "active" }),
+    ]));
+    expect(dashboard.body.records.filter(
+      (record: { title: string }) => record.title === "会话结束证据未完整生成",
+    )).toHaveLength(1);
   });
 
   it("supports owner transfer, administrator management, room settings, and removal", async () => {

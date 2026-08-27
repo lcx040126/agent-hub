@@ -5,7 +5,7 @@ import { createDefaultRiskPolicy } from "./risk-policy.js";
 
 const DEFAULT_RISK_RULES_JSON = JSON.stringify(createDefaultRiskPolicy().rules);
 const DEFAULT_RISK_RULES_SQL = DEFAULT_RISK_RULES_JSON.replaceAll("'", "''");
-const DATABASE_SCHEMA_VERSION = 3;
+const DATABASE_SCHEMA_VERSION = 4;
 
 export interface AgentHubDatabaseOptions {
   path?: string;
@@ -14,6 +14,8 @@ export interface AgentHubDatabaseOptions {
 
 export class AgentHubDatabase {
   readonly connection: DatabaseSync;
+  private transactionDepth = 0;
+  private savepointSequence = 0;
 
   constructor(options: AgentHubDatabaseOptions = {}) {
     const path = resolveDatabasePath(options);
@@ -36,14 +38,24 @@ export class AgentHubDatabase {
   }
 
   transaction<T>(operation: () => T): T {
-    this.connection.exec("BEGIN IMMEDIATE");
+    const root = this.transactionDepth === 0;
+    const savepoint = root ? null : `agent_hub_nested_${++this.savepointSequence}`;
+    this.connection.exec(root ? "BEGIN IMMEDIATE" : `SAVEPOINT ${savepoint}`);
+    this.transactionDepth += 1;
     try {
       const result = operation();
-      this.connection.exec("COMMIT");
+      this.connection.exec(root ? "COMMIT" : `RELEASE SAVEPOINT ${savepoint}`);
       return result;
     } catch (error) {
-      this.connection.exec("ROLLBACK");
+      if (root) {
+        this.connection.exec("ROLLBACK");
+      } else {
+        this.connection.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        this.connection.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      }
       throw error;
+    } finally {
+      this.transactionDepth -= 1;
     }
   }
 
@@ -262,6 +274,9 @@ export class AgentHubDatabase {
         client_version TEXT,
         protocol_version INTEGER,
         schema_version INTEGER
+        ,finalization_id TEXT
+        ,finalizing_at TEXT
+        ,finalization_error TEXT
       );
       CREATE INDEX IF NOT EXISTS sessions_room_idx ON work_sessions(room_id, status);
 
@@ -313,9 +328,12 @@ export class AgentHubDatabase {
         rule_files_json TEXT NOT NULL,
         systems_json TEXT NOT NULL,
         metadata_json TEXT NOT NULL,
-        scanned_at TEXT NOT NULL
+        scanned_at TEXT NOT NULL,
+        finalization_id TEXT
       );
       CREATE INDEX IF NOT EXISTS scans_session_idx ON local_scans(session_id, scanned_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS scans_finalization_idx
+        ON local_scans(finalization_id) WHERE finalization_id IS NOT NULL;
 
       CREATE TABLE IF NOT EXISTS feature_memories (
         id TEXT PRIMARY KEY,
@@ -447,6 +465,13 @@ export class AgentHubDatabase {
     if (!sessionColumns.some((column) => column.name === "client_version")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN client_version TEXT");
     if (!sessionColumns.some((column) => column.name === "protocol_version")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN protocol_version INTEGER");
     if (!sessionColumns.some((column) => column.name === "schema_version")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN schema_version INTEGER");
+    if (!sessionColumns.some((column) => column.name === "finalization_id")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN finalization_id TEXT");
+    if (!sessionColumns.some((column) => column.name === "finalizing_at")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN finalizing_at TEXT");
+    if (!sessionColumns.some((column) => column.name === "finalization_error")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN finalization_error TEXT");
+
+    const scanColumns = this.connection.prepare("PRAGMA table_info(local_scans)").all() as Array<{ name: string }>;
+    if (!scanColumns.some((column) => column.name === "finalization_id")) this.connection.exec("ALTER TABLE local_scans ADD COLUMN finalization_id TEXT");
+    this.connection.exec("CREATE UNIQUE INDEX IF NOT EXISTS scans_finalization_idx ON local_scans(finalization_id) WHERE finalization_id IS NOT NULL");
 
     const releaseRequestColumns = this.connection.prepare("PRAGMA table_info(release_requests)").all() as Array<{ name: string }>;
     if (!releaseRequestColumns.some((column) => column.name === "transfer_key")) this.connection.exec("ALTER TABLE release_requests ADD COLUMN transfer_key TEXT NOT NULL DEFAULT ''");
