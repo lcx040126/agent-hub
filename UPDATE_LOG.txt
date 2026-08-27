@@ -371,4 +371,12 @@ v0.2.1 已确认功能：退出与后台关闭后的接入隔离
 发布前或发布后的验收缺口
 - 尚未执行真实覆盖安装、托盘退出、房主退出、更新安装、更新失败回退和进程崩溃的桌面端端到端验收。
 - 尚未在两台真实电脑上验证退出后 Codex 写入完全不受影响、重启恢复、断网软失败和远端清理重试。
-- 尚未使用真实 GitHub Release 验证自动更新，也尚未核验 v0.2.1 草稿 Release 的 Setup、blockmap、`latest.yml`、更新清单、签名和 `SHA256SUMS.txt` 六项资产。
+- 尚未从 v0.2.0 Setup 客户端实际点击完成 v0.2.1 下载、安装、重启、篡改拒绝和失败回退。
+
+v0.2.1 正式发布验证（2026-08-27）
+- GitHub Actions `Windows Release` 运行 `33047542145` 成功完成类型检查、300 项测试、Windows 打包、签名清单、校验和与 Draft Release 上传。仓库采用已配置的显式 ungated release override；房间发布 gate 步骤按配置跳过。
+- Draft Release 的标签、标题和更新说明与 `docs/releases/v0.2.1.md` 匹配，Setup、blockmap、`latest.yml`、更新清单、签名和 `SHA256SUMS.txt` 六项资产均为 uploaded。
+- 六项下载资产的实际 SHA-256 均匹配 GitHub 资产摘要；`SHA256SUMS.txt` 中五项内容哈希全部匹配。正式 Setup 为 119,673,770 字节，SHA-256 `375B2F1EEB032B04E88B310B078BC98B0E1A2CB9BFA0C838568C23296DE44C4A`，Authenticode 状态为 `NotSigned`。
+- 客户端内置 Ed25519 公钥成功验证正式 `agent-hub-update.sig`；清单版本、协议、schema、说明、下载 URL、文件大小和 SHA-256 均正确，`latest.yml` 的文件名、大小与 SHA-512 也匹配正式 Setup。
+- 正式发布后，v0.2.0 客户端使用的公开 `/releases/latest/download/` 路径成功返回并验签 v0.2.1 清单。
+- GitHub Release 已于 2026-08-27 15:06（Asia/Shanghai）发布：https://github.com/lcx040126/agent-hub/releases/tag/v0.2.1
