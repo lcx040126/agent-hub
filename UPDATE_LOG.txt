@@ -420,7 +420,18 @@ v0.2.2 已确认功能：同项目房间隔离、本机房间删除与更新恢�
 - 自动化必须在真实 Electron ASAR 语义下调用完整 `FileDesktopUpdateRecovery.prepare()`，并在 Windows 发布包生成后复制真实 `win-unpacked` 目录完成回归；普通 Node 中复制文本伪装的 `app.asar` 不得继续作为唯一证据。
 
 当前状态
-- v0.2.2 发布代码、测试、本地候选和发布说明已经完成；正式 Release 资产由 `v0.2.2` 标签工作流重新构建并在公开前核验。
+- v0.2.2 发布代码、测试、本地候选和发布说明已经完成；正式 Release 资产由 `v0.2.2` 标签工作流重新构建、核验并公开。
 - `pnpm typecheck`、生产构建和 `git diff --check` 通过；全量自动化测试共 50 个文件、347/347 项通过。
 - Windows x64 NSIS 本地候选 `AgentHub-Setup-0.2.2-x64.exe` 为 119,682,910 字节，SHA-256 `98278A2B204B11AFDCDA99D9442FBB3F01F837D3F8356954C5903ABB69F4F2AE`；该候选仅作为本地预发布证据，不替代 GitHub Actions 正式资产。
 - 打包恢复探针验证候选中的 `app.asar` 为 46,418,738 字节，SHA-256 `A718E5F4BD76BBDC7394B28C3743801D21D01B077134C80F090DFD60158A88B9`，并返回 v0.2.2、MCP bridge 与 Codex Hook 均为 `ok`。
+
+v0.2.2 正式发布验证（2026-08-27）
+- Annotated tag `v0.2.2`、`main` 与 `origin/main` 在发布时均落到提交 `951b38e33cc1a3f1b5421cf704aabf5a511c30a1`。
+- GitHub Actions 主分支 CI `33059912420`、标签 CI `33060063878` 和 Windows Release `33060063757` 均成功；Windows Release 的发布 gate 配置检查通过，远端 gate 因未配置而跳过，并成功记录仓库显式启用的 ungated release override。
+- GitHub Release `377714587` 于 `2026-08-27T10:02:07Z`（北京时间 2026-08-27 18:02:07）以 `Agent Hub v0.2.2` 正式公开：`https://github.com/lcx040126/agent-hub/releases/tag/v0.2.2`。Setup、blockmap、`latest.yml`、更新清单、签名和 `SHA256SUMS.txt` 六项资产均为 uploaded。
+- 正式 Setup 为 119,682,857 字节，SHA-256 `3D815A1AF94A2344A39F3506B3884D6E3550A6ABFBC0EF18D8DAA7FF3D736802`；Authenticode 状态为预期的 `NotSigned`。其余正式资产 SHA-256：blockmap `5B6D20725C1FA20A5A58DCDEB432844E8590F4B5F643BE7FE57B84AB60241019`、`latest.yml` `5FC9D5E8FD6179E2D57B4CC63906B4AA086E6DD97CA288382CA122B66F9F382A`、更新清单 `6763110B1003C567B5B287FC0B262B2946576183C4033F9CE7F53E6331031EFE`、签名 `F4D96AD9E491048A9146EA019DCE628B3EDEED27993B65F8AD9B0DF1B583F6D4`、`SHA256SUMS.txt` `C8E086BC66D852A567C7118DFF0655349D038A3AD067FE469CE546FCD029E7D8`。
+- `SHA256SUMS.txt` 按设计列出的五项可自校验资产均与独立下载哈希一致，六项本地下载的大小和 SHA-256 也分别与 GitHub asset digest 一致。
+- Windows Release 中的正式打包恢复探针返回 `status=ok`、`version=0.2.2`、`backupHealth=ok`；正式包 `app.asar` 为 46,418,738 字节，SHA-256 `A718E5F4BD76BBDC7394B28C3743801D21D01B077134C80F090DFD60158A88B9`。
+- `agent-hub-update.json` 的 Ed25519 签名验证通过；清单版本为 0.2.2，协议兼容范围 1..1，schema 兼容范围 2..3，可信下载 URL、Setup 大小、SHA-256 和发布时说明正文均匹配。`latest.yml` 的版本、文件名、119,682,857 字节大小及 Setup SHA-512 `fLTVrJcYHj0lW7bvEXFxhteNcOq39LdCAc7cP2YGyNxjCW0Geys8GNHB6Q60uSyCggISJHSoKuN8SsBHTPGs0w==` 一致。
+- 匿名访问 `/releases/latest/download/agent-hub-update.json` 与对应签名均返回 HTTP 200，下载字节与已审计资产一致并可再次验签为 v0.2.2。签名清单的 notes 与公开时 Release 正文及标签提交中的发布说明一致；本节是公开后的审计追加记录。
+- 真实覆盖安装、真实双房间切换、三个界面入口删除、非默认盘安装及双机协作仍按发布说明列为未完成的实机验收，不因正式发布而改记为通过。
