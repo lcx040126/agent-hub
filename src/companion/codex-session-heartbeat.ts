@@ -14,6 +14,7 @@ import {
 } from "./integration-operations.js";
 import { hasPendingPauseForConnection } from "./pause-retry.js";
 import { hasPendingPausePreparationForConnection } from "./pause-preparation.js";
+import { TurnCompletionQueueStore } from "./turn-completion-queue.js";
 
 export interface CodexSessionHeartbeatScheduler {
   scanNow(): Promise<void>;
@@ -79,6 +80,10 @@ async function heartbeatAll(
   operationTracker: Pick<ConnectionOperationTracker, "run">,
 ): Promise<void> {
   const states = await readHookStates(stateStore, options.onError);
+  const pendingCompletionSessions = new Set(
+    (await new TurnCompletionQueueStore(options.userDataPath).list())
+      .map((job) => job.codexSessionId),
+  );
   const now = (options.now?.() ?? new Date()).getTime();
   const activeOwnerIds = options.store.list
     ? await unambiguousActiveOwnerIds(await options.store.list())
@@ -86,9 +91,9 @@ async function heartbeatAll(
   await Promise.all(states.map(async (state) => {
     try {
       if (!shouldHeartbeat(state, now)) {
-        await stateStore.remove(state.codexSessionId);
         return;
       }
+      if (state.pendingCompletion || pendingCompletionSessions.has(state.codexSessionId)) return;
       if (activeOwnerIds && !activeOwnerIds.has(state.connectionId)) {
         await stateStore.remove(state.codexSessionId);
         return;
@@ -113,13 +118,16 @@ async function heartbeatAll(
           clientVersion: AGENT_HUB_VERSION,
           protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
           schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+          turnId: state.currentTurnId,
+          activityEpoch: state.activityEpoch ?? 0,
         });
       });
     } catch (error) {
-      if (error instanceof AgentHubHttpError && (error.status === 404 || error.status === 409)) {
+      if (error instanceof AgentHubHttpError && error.status === 404) {
         await stateStore.remove(state.codexSessionId);
         return;
       }
+      if (error instanceof AgentHubHttpError && error.status === 409) return;
       options.onError?.(toError(error), state);
     }
   }));

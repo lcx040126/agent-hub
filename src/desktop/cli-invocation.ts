@@ -1,4 +1,4 @@
-export type CodexHookEventName = "SessionStart" | "PreToolUse" | "PostToolUse" | "SessionEnd";
+export type CodexHookEventName = "SessionStart" | "PreToolUse" | "PostToolUse" | "Stop" | "SessionEnd";
 
 export type HeadlessInvocation =
   | { mode: "mcp-bridge"; connectionId: string }
@@ -9,6 +9,7 @@ const HOOK_EVENTS = new Set<CodexHookEventName>([
   "SessionStart",
   "PreToolUse",
   "PostToolUse",
+  "Stop",
   "SessionEnd",
 ]);
 
@@ -34,7 +35,7 @@ export function parseHeadlessInvocation(argv: string[]): HeadlessInvocation | nu
     const eventName = argv[hookIndex + 1] as CodexHookEventName | undefined;
     if (!eventName || !HOOK_EVENTS.has(eventName)) {
       throw new Error(
-        "The Codex hook event must be SessionStart, PreToolUse, PostToolUse, or SessionEnd.",
+        "The Codex hook event must be SessionStart, PreToolUse, PostToolUse, Stop, or SessionEnd.",
       );
     }
     return { mode: "codex-hook", eventName };

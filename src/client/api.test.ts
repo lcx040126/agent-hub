@@ -521,3 +521,88 @@ describe("session persistence", () => {
     expect(runtime.length).toBe(0);
   });
 });
+
+describe("dashboard lease compatibility", () => {
+  it("preserves awaiting_commit and treats missing or unknown phases as working", async () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: {
+          requestRoomServer: vi.fn(async () => ({
+            status: 200,
+            body: {
+              room: {
+                id: "room-1",
+                name: "先锋协作",
+                projectName: "Project Vanguard",
+                repository: "https://github.com/example/project-vanguard.git",
+                defaultBranch: "main",
+              },
+              currentMember: { id: "member-a", name: "成员 A", role: "member" },
+              members: [],
+              leases: [
+                {
+                  id: "lease-awaiting",
+                  title: "等待提交",
+                  memberId: "member-a",
+                  memberName: "成员 A",
+                  paths: ["src/client/App.tsx"],
+                  mode: "write",
+                  kind: "automatic",
+                  phase: "awaiting_commit",
+                  status: "active",
+                  expiresAt: "2026-08-27T08:10:00.000Z",
+                },
+                {
+                  id: "lease-legacy",
+                  title: "旧服务响应",
+                  memberId: "member-a",
+                  memberName: "成员 A",
+                  paths: ["src/client/api.ts"],
+                  mode: "write",
+                  kind: "automatic",
+                  status: "active",
+                  expiresAt: "2026-08-27T08:10:00.000Z",
+                },
+                {
+                  id: "lease-unknown",
+                  title: "未知阶段",
+                  memberId: "member-a",
+                  memberName: "成员 A",
+                  paths: ["src/client/styles.css"],
+                  mode: "write",
+                  kind: "standard",
+                  phase: "future_phase",
+                  status: "active",
+                  expiresAt: "2026-08-27T08:10:00.000Z",
+                },
+              ],
+              conflicts: [],
+              records: [],
+              activity: [],
+              sessions: [{
+                id: "session-stopped",
+                memberId: "member-a",
+                status: "active",
+                lastSeenAt: "2026-08-27T08:00:00.000Z",
+                turnStoppedAt: "2026-08-27T08:00:00.000Z",
+              }],
+              localScans: [],
+              server: { mcpUrl: "http://127.0.0.1:4173/mcp" },
+            },
+          })),
+        },
+      },
+    });
+
+    const result = await getDashboard(desktopSession("connection-1"));
+
+    expect(result.leases.map((item) => [item.id, item.phase])).toEqual([
+      ["lease-awaiting", "awaiting_commit"],
+      ["lease-legacy", "working"],
+      ["lease-unknown", "working"],
+    ]);
+    expect(result.sessions[0]?.turnStoppedAt).toBe("2026-08-27T08:00:00.000Z");
+  });
+});

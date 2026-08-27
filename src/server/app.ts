@@ -332,10 +332,14 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       paths: stringArrayValue(body.paths),
       leaseId: optionalValue(body, "leaseId"),
       proposedEdits: objectArrayValue(body.proposedEdits) as unknown as ProposedFeatureEdit[],
+      operationId: optionalValue(body, "operationId"),
+      turnId: optionalValue(body, "turnId"),
+      activityEpoch: optionalNumber(body.activityEpoch),
     });
     response.json({
       check: result.check,
       renewedLeases: result.renewedLeases.map(leaseResponse),
+      activity: result.activity,
       claim: result.claim ? {
         acquired: result.claim.acquired,
         decision: result.claim.decision,
@@ -540,6 +544,9 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       clientVersion: optionalValue(body, "clientVersion"),
       protocolVersion: optionalNumber(body.protocolVersion),
       schemaVersion: optionalNumber(body.schemaVersion),
+      codexSessionId: optionalValue(body, "codexSessionId"),
+      turnId: optionalValue(body, "turnId"),
+      activityEpoch: optionalNumber(body.activityEpoch),
     });
     response.status(201).json({ session });
   });
@@ -556,6 +563,8 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       clientVersion: optionalValue(body, "clientVersion"),
       protocolVersion: optionalNumber(body.protocolVersion),
       schemaVersion: optionalNumber(body.schemaVersion),
+      turnId: optionalValue(body, "turnId"),
+      activityEpoch: optionalNumber(body.activityEpoch),
     }));
   });
 
@@ -595,6 +604,44 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       summary: optionalValue(body, "summary"),
     });
     response.json({ session });
+  });
+
+  app.post("/api/sessions/:id/stop", (request, response) => {
+    const body = bodyObject(request);
+    response.json(service.stopSessionActivity({
+      memberToken: bearerToken(request),
+      sessionId: parameter(request, "id"),
+      operationId: value(body, "operationId"),
+      turnId: value(body, "turnId"),
+      activityEpoch: optionalNumber(body.activityEpoch) as number,
+    }));
+  });
+
+  app.post("/api/sessions/:id/resume", (request, response) => {
+    const body = bodyObject(request);
+    response.json(service.resumeSessionActivity({
+      memberToken: bearerToken(request),
+      sessionId: parameter(request, "id"),
+      operationId: value(body, "operationId"),
+      turnId: value(body, "turnId"),
+      activityEpoch: optionalNumber(body.activityEpoch) as number,
+    }));
+  });
+
+  app.post("/api/sessions/:id/completion/check", (request, response) => {
+    const body = bodyObject(request);
+    response.json(service.completeSessionActivity({
+      memberToken: bearerToken(request),
+      sessionId: parameter(request, "id"),
+      operationId: value(body, "operationId"),
+      turnId: value(body, "turnId"),
+      activityEpoch: optionalNumber(body.activityEpoch) as number,
+      outcome: value(body, "outcome") as "committed" | "reverted",
+      leaseIds: body.leaseIds === undefined ? undefined : stringArrayValue(body.leaseIds),
+      attributedPaths: stringArrayValue(body.attributedPaths),
+      baseCommit: optionalValue(body, "baseCommit"),
+      headCommit: optionalValue(body, "headCommit", "commitHash"),
+    }));
   });
 
   app.post("/api/sessions/:id/finalize/start", (request, response) => {
@@ -696,6 +743,7 @@ function leaseResponse(lease: ReturnType<AgentHubService["renewLease"]>) {
     pathDetails: lease.paths,
     mode: lease.mode,
     kind: lease.kind,
+    phase: lease.phase,
     status: lease.status === "cancelled" ? "released" : lease.status,
     decision: lease.decision,
     overrideReason: lease.overrideReason ?? undefined,

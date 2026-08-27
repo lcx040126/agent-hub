@@ -212,7 +212,7 @@ describe("Agent Hub MCP session lifecycle", () => {
     })).toThrow(expect.objectContaining({ code: "lease_session_mismatch", status: 409 }));
   });
 
-  it("cancels every remaining lease owned by a closing session only", async () => {
+  it("cancels only automatic work when a session closes", async () => {
     const { service, adapter, context } = setup();
     const first = await adapter.sessionOpen(context, { objective: "First task" }) as OpenResult;
     const second = await adapter.sessionOpen(context, { objective: "Second task" }) as OpenResult;
@@ -231,8 +231,17 @@ describe("Agent Hub MCP session lifecycle", () => {
       title: "Second task",
       paths: ["src/second.ts"],
     });
-    expect(firstLeaseA.acquired && firstLeaseB.acquired && secondLease.acquired).toBe(true);
-    if (!firstLeaseA.acquired || !firstLeaseB.acquired || !secondLease.acquired) {
+    const firstAutomatic = service.claimLease({
+      memberToken: context.memberToken,
+      sessionId: first.session.id,
+      title: "First automatic task",
+      paths: ["src/first-automatic.ts"],
+      kind: "automatic",
+    });
+    expect(
+      firstLeaseA.acquired && firstLeaseB.acquired && secondLease.acquired && firstAutomatic.acquired,
+    ).toBe(true);
+    if (!firstLeaseA.acquired || !firstLeaseB.acquired || !secondLease.acquired || !firstAutomatic.acquired) {
       throw new Error("Expected every independent lease to be acquired.");
     }
 
@@ -245,8 +254,9 @@ describe("Agent Hub MCP session lifecycle", () => {
       .prepare("SELECT id, status FROM leases ORDER BY id")
       .all() as Array<{ id: string; status: string }>;
     const statusById = new Map(rows.map((row) => [row.id, row.status]));
-    expect(statusById.get(firstLeaseA.lease.id)).toBe("cancelled");
-    expect(statusById.get(firstLeaseB.lease.id)).toBe("cancelled");
+    expect(statusById.get(firstLeaseA.lease.id)).toBe("active");
+    expect(statusById.get(firstLeaseB.lease.id)).toBe("active");
+    expect(statusById.get(firstAutomatic.lease.id)).toBe("cancelled");
     expect(statusById.get(secondLease.lease.id)).toBe("active");
   });
 

@@ -29,6 +29,7 @@ export type ConflictSeverity = "warning" | "blocking";
 export type ConflictDecision = "allow" | "warn" | "deny";
 export type LeaseMode = "read" | "write";
 export type LeaseKind = "automatic" | "standard" | "exclusive";
+export type AutomaticLeasePhase = "working" | "awaiting_commit";
 export type ReleaseRequestStatus = "pending" | "approved" | "rejected" | "cancelled";
 export type MemberCompatibility = "compatible" | "incompatible" | "unknown";
 export type RecordKind = "decision" | "validation" | "handoff" | "risk";
@@ -96,6 +97,7 @@ export interface Lease {
   baseCommit: string | null;
   mode: LeaseMode;
   kind: LeaseKind;
+  phase?: AutomaticLeasePhase;
   decision: ConflictDecision;
   overrideReason: string | null;
   status: LeaseStatus;
@@ -606,6 +608,10 @@ export interface WorkSession {
   clientVersion: string | null;
   protocolVersion: number | null;
   schemaVersion: number | null;
+  codexSessionId: string | null;
+  currentTurnId: string | null;
+  activityEpoch: number;
+  turnStoppedAt: string | null;
 }
 
 export interface LocalScan {

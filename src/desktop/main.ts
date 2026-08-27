@@ -26,6 +26,10 @@ import {
   startSessionEndFinalizationWorker,
   type SessionEndFinalizationWorker,
 } from "../companion/session-end-worker.js";
+import {
+  startTurnCompletionWorker,
+  type TurnCompletionWorker,
+} from "../companion/turn-completion-worker.js";
 import { WindowsDpapiProtector } from "../companion/windows-dpapi.js";
 import {
   startRepositoryScanScheduler,
@@ -41,13 +45,13 @@ import {
 import { createConsistentSqliteBackup } from "../server/sqlite-backup.js";
 import { DesktopAppUpdater, type ElectronUpdateEngine } from "./app-updater.js";
 import {
-  installCodexMcpConfig,
-  codexServerName,
-  uninstallCodexMcpConfig,
-} from "./codex-config.js";
+  codexMcpServerSpec,
+  reconcileDesktopCodexIntegrations,
+  reconcileDesktopCodexIntegrationsAtStartup,
+  withDesktopCodexIntegrationLifecycle,
+} from "./codex-integration-reconciler.js";
 import { CONNECTION_STORE_FILENAME, ConnectionStore } from "./connection-store.js";
 import { DESKTOP_IPC, type SaveRoomConnectionInput, type DesktopServerInfo } from "./contracts.js";
-import { installHeadlessLauncher } from "./headless-launcher.js";
 import {
   activateDesktopRoomConnection,
   deleteDesktopRoomConnection,
@@ -80,6 +84,7 @@ let hostServer: ServiceSupervisor | null = null;
 let scanScheduler: RepositoryScanScheduler | null = null;
 let hookHeartbeatScheduler: CodexSessionHeartbeatScheduler | null = null;
 let sessionEndFinalizationWorker: SessionEndFinalizationWorker | null = null;
+let turnCompletionWorker: TurnCompletionWorker | null = null;
 let releaseRequestNotifier: ReleaseRequestNotificationScheduler | null = null;
 let desktopUpdater: DesktopAppUpdater | null = null;
 let integrationController: IntegrationController | null = null;
@@ -179,6 +184,30 @@ async function bootstrap(): Promise<void> {
     },
   });
   await integrationController.start();
+  if (!process.env.PORTABLE_EXECUTABLE_FILE) {
+    // Configuration repair is best effort and must not delay renderer health or
+    // updater rollback confirmation. The lifecycle queue still orders it before
+    // any later manual install, room deletion or desktop update installation.
+    void withDesktopCodexIntegrationLifecycle(() =>
+      reconcileDesktopCodexIntegrationsAtStartup({
+        ...desktopCodexReconciliationOptions(userDataDirectory, store),
+        onChanged() {
+          if (!Notification.isSupported()) return;
+          new Notification({
+            title: "Agent Hub 已更新 Codex 接入",
+            body: "Hook 或 MCP 配置已经校正，请重启 Codex 使变更完全生效。",
+            silent: true,
+          }).show();
+        },
+        onError(error) {
+          console.error(`Agent Hub Codex configuration reconciliation warning: ${error.message}`);
+        },
+      })).catch((error: unknown) => {
+        console.error(
+          `Agent Hub Codex reconciliation queue warning: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+  }
   const integrationIsActive = () => integrationController?.getPresence()?.record.status === "active";
   sessionEndFinalizationWorker = startSessionEndFinalizationWorker({
     userDataPath: userDataDirectory,
@@ -187,6 +216,15 @@ async function bootstrap(): Promise<void> {
     onError(error, job) {
       const session = job?.hubSessionId ? ` (${job.hubSessionId})` : "";
       console.error(`Agent Hub background finalization failed${session}: ${error.message}`);
+    },
+  });
+  turnCompletionWorker = startTurnCompletionWorker({
+    userDataPath: userDataDirectory,
+    store,
+    integrationActive: integrationIsActive,
+    onError(error, job) {
+      const session = job?.hubSessionId ? ` (${job.hubSessionId})` : "";
+      console.error(`Agent Hub turn completion check failed${session}: ${error.message}`);
     },
   });
   const startScanner = () => startRepositoryScanScheduler({
@@ -344,11 +382,13 @@ async function cleanupBeforeQuit(): Promise<void> {
     scanScheduler,
     hookHeartbeatScheduler,
     sessionEndFinalizationWorker,
+    turnCompletionWorker,
     releaseRequestNotifier,
   ];
   scanScheduler = null;
   hookHeartbeatScheduler = null;
   sessionEndFinalizationWorker = null;
+  turnCompletionWorker = null;
   releaseRequestNotifier = null;
   unsubscribeUpdateStatus?.();
   unsubscribeUpdateStatus = null;
@@ -528,22 +568,27 @@ function registerIpc(
     if (typeof connectionId !== "string" || !connectionId.trim()) {
       throw new Error("A saved room connection is required.");
     }
-    return deleteDesktopRoomConnection({
-      connectionId: connectionId.trim(),
-      controller,
-      store,
-      localServer,
-      uninstallCodexIntegration: async ({ connection, isLastConnection }) => {
-        const integration = codexIntegrationDetails(userDataDirectory, connection.id);
-        return uninstallCodexMcpConfig(path.join(homedir(), ".codex", "config.toml"), {
-          connectionId: connection.id,
-          command: process.execPath,
-          args: integration.args,
-          hookCommand: integration.hookCommand,
-          hookArgs: integration.launcherArgs,
-          removeManagedHooksWhenLastServer: isLastConnection,
-        });
-      },
+    return withDesktopCodexIntegrationLifecycle(async () => {
+      assertDesktopUpdateNotInstalling();
+      return deleteDesktopRoomConnection({
+        connectionId: connectionId.trim(),
+        controller,
+        store,
+        localServer,
+        uninstallCodexIntegration: async ({ connection }) => {
+          if (process.env.PORTABLE_EXECUTABLE_FILE) {
+            return { changed: false, restartRequired: false };
+          }
+          const reconciled = await reconcileDesktopCodexIntegrations({
+            ...desktopCodexReconciliationOptions(userDataDirectory, store),
+            removeConnectionId: connection.id,
+          });
+          return {
+            changed: reconciled.changed,
+            restartRequired: reconciled.restartRequired,
+          };
+        },
+      });
     });
   });
 
@@ -585,7 +630,7 @@ function registerIpc(
 
   ipcMain.handle(DESKTOP_IPC.installDesktopUpdate, async (event) => {
     assertTrustedRenderer(event, serverInfo.localServerUrl);
-    return updater.install();
+    return withDesktopCodexIntegrationLifecycle(() => updater.install());
   });
 
   ipcMain.handle(DESKTOP_IPC.applyRoomServerUpdate, async (event) => {
@@ -603,56 +648,52 @@ function registerIpc(
     if (typeof connectionId !== "string" || !connectionId.trim()) {
       throw new Error("A saved room connection is required before installing the Codex integration.");
     }
-    const connection = await store.get(connectionId.trim());
-    if (!connection) throw new Error("The selected room connection does not exist.");
+    return withDesktopCodexIntegrationLifecycle(async () => {
+      assertDesktopUpdateNotInstalling();
+      const normalizedConnectionId = connectionId.trim();
+      const connection = await store.get(normalizedConnectionId);
+      if (!connection) throw new Error("The selected room connection does not exist.");
 
-    const integration = codexIntegrationDetails(userDataDirectory, connection.id);
-    await installHeadlessLauncher({
-      launcherPath: integration.launcherPath,
-      electronExecutable: process.execPath,
-      runnerPath: integration.runnerPath,
-      userDataPath: userDataDirectory,
-    });
-    return installCodexMcpConfig(path.join(homedir(), ".codex", "config.toml"), {
-      name: codexServerName(connection.id),
-      command: process.execPath,
-      args: integration.args,
-      env: { ELECTRON_RUN_AS_NODE: "1" },
-      hookCommand: integration.hookCommand,
-      hookArgs: integration.launcherArgs,
+      const options = desktopCodexReconciliationOptions(userDataDirectory, store);
+      const reconciled = await reconcileDesktopCodexIntegrations({
+        ...options,
+        installConnectionId: normalizedConnectionId,
+      });
+      const server = codexMcpServerSpec(options, normalizedConnectionId);
+      return {
+        configPath: reconciled.configPath,
+        backupPath: reconciled.backupPath,
+        mcpServerName: server.name,
+        command: server.command,
+        args: server.args,
+        env: server.env,
+        restartRequired: reconciled.restartRequired,
+      };
     });
   });
 }
 
-function codexIntegrationDetails(userDataDirectory: string, connectionId: string) {
-  const launcherPath = path.join(userDataDirectory, "codex", "agent-hub-headless.ps1");
-  const runnerPath = path.join(
-    electronApp.getAppPath(),
-    "dist",
-    "companion",
-    "headless-runner.js",
-  );
+function assertDesktopUpdateNotInstalling(): void {
+  if (updateInstallInProgress) {
+    throw new Error("Agent Hub is installing an update and cannot change Codex integrations.");
+  }
+}
+
+function desktopCodexReconciliationOptions(
+  userDataDirectory: string,
+  store: ConnectionStore,
+) {
   return {
-    launcherPath,
-    runnerPath,
-    hookCommand: "powershell.exe",
-    launcherArgs: [
-      "-NoLogo",
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      launcherPath,
-    ],
-    args: [
-      runnerPath,
-      "--user-data",
-      userDataDirectory,
-      "--mcp-bridge",
-      "--connection-id",
-      connectionId,
-    ],
+    store,
+    configPath: path.join(homedir(), ".codex", "config.toml"),
+    userDataPath: userDataDirectory,
+    electronExecutable: process.execPath,
+    runnerPath: path.join(
+      electronApp.getAppPath(),
+      "dist",
+      "companion",
+      "headless-runner.js",
+    ),
   };
 }
 

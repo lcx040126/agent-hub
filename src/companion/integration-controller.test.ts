@@ -20,6 +20,7 @@ import {
   startRuntimePresence,
   type StartRuntimePresenceOptions,
 } from "./runtime-presence.js";
+import { TurnCompletionQueueStore } from "./turn-completion-queue.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -229,6 +230,28 @@ describe("integration controller lifecycle", () => {
     const { store, connections } = createMutableStore([connection]);
     const removeConnectionState = vi.fn(async () => undefined);
     const cleanup = vi.fn(async () => ({ changed: true, restartRequired: true }));
+    const completionQueue = new TurnCompletionQueueStore(userDataPath);
+    await completionQueue.enqueue({
+      operationId: "delete-completion",
+      turnId: "turn-delete",
+      activityEpoch: 0,
+      state: {
+        version: 1,
+        codexSessionId: "codex-delete",
+        connectionId: connection.id,
+        hubSessionId: "hub-delete",
+        repositoryPath: connection.repositoryPath,
+        branch: "main",
+        baseCommit: "0123456789abcdef",
+        initialChangedPaths: [],
+        initialChangedFingerprints: {},
+        observedChangedPaths: [],
+        observedChangedFingerprints: {},
+        leases: [{ id: "lease-delete", paths: ["src/task.ts"], expiresAt: "2099-01-01T00:00:00.000Z" }],
+        openedAt: "2026-08-27T00:00:00.000Z",
+        updatedAt: "2026-08-27T00:00:00.000Z",
+      },
+    });
     const controller = new IntegrationController({
       userDataPath,
       store,
@@ -249,6 +272,7 @@ describe("integration controller lifecycle", () => {
     expect(cleanup).toHaveBeenCalledWith({ connection, isLastConnection: true });
     expect(removeConnectionState).toHaveBeenCalledWith(connection.id);
     expect(connections.has(connection.id)).toBe(false);
+    await expect(completionQueue.list()).resolves.toEqual([]);
   });
 
   it("serializes deletion across repositories so the final connection removes shared hooks", async () => {

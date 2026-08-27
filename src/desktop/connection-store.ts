@@ -71,6 +71,8 @@ export class ConnectionStore {
         memberName: normalized.memberName,
         memberRole: normalized.memberRole ?? existing?.memberRole ?? "member",
         integrationEnabled: normalized.integrationEnabled ?? existing?.integrationEnabled ?? true,
+        codexIntegrationInstalled: normalized.codexIntegrationInstalled
+          ?? (existing ? existing.codexIntegrationInstalled : false),
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
         tokenCiphertext: this.protector.encryptString(normalized.memberToken).toString("base64"),
@@ -139,6 +141,29 @@ export class ConnectionStore {
 
   async activateIntegration(connectionId: string): Promise<SavedRoomConnection> {
     return this.setIntegrationEnabled(connectionId, true);
+  }
+
+  async setCodexIntegrationInstalled(
+    connectionId: string,
+    installed: boolean,
+  ): Promise<SavedRoomConnection> {
+    if (typeof installed !== "boolean") throw new Error("Codex integration installation state must be a boolean.");
+    const normalizedId = requiredText(connectionId, "connection ID", 128);
+    return this.withWriteLock(async () => {
+      const document = await this.readDocument();
+      const index = document.connections.findIndex((connection) => connection.id === normalizedId);
+      if (index < 0) throw new Error("The room connection to update does not exist.");
+      const current = document.connections[index];
+      if (current.codexIntegrationInstalled === installed) return toPublicConnection(current);
+      const updated: EncryptedRoomConnection = {
+        ...current,
+        codexIntegrationInstalled: installed,
+        updatedAt: new Date().toISOString(),
+      };
+      document.connections[index] = updated;
+      await this.writeDocument(document);
+      return toPublicConnection(updated);
+    });
   }
 
   /**
@@ -321,6 +346,10 @@ export function normalizeConnectionInput(input: SaveRoomConnectionInput): SaveRo
     memberName: optionalText(input.memberName, 256),
     memberRole: optionalMemberRole(input.memberRole),
     integrationEnabled: optionalBoolean(input.integrationEnabled, "integrationEnabled"),
+    codexIntegrationInstalled: optionalBoolean(
+      input.codexIntegrationInstalled,
+      "codexIntegrationInstalled",
+    ),
   };
 }
 
@@ -341,6 +370,10 @@ function parseEncryptedConnection(value: unknown): EncryptedRoomConnection {
     memberName: optionalText(value.memberName, 256),
     memberRole: optionalMemberRole(value.memberRole),
     integrationEnabled: optionalBoolean(value.integrationEnabled, "integrationEnabled") ?? true,
+    codexIntegrationInstalled: optionalBoolean(
+      value.codexIntegrationInstalled,
+      "codexIntegrationInstalled",
+    ),
     createdAt: requiredIsoDate(value.createdAt, "createdAt"),
     updatedAt: requiredIsoDate(value.updatedAt, "updatedAt"),
     tokenCiphertext,

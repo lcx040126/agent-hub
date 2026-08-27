@@ -12,6 +12,7 @@ import {
   type AddDecisionInput,
   type AddHandoffInput,
   type AddVerificationInput,
+  type AutomaticLeasePhase,
   type CheckEditsInput,
   type ContextEntry,
   type CreateRoomInput,
@@ -145,6 +146,9 @@ export interface OpenSessionInput {
   clientVersion?: string;
   protocolVersion?: number;
   schemaVersion?: number;
+  codexSessionId?: string;
+  turnId?: string;
+  activityEpoch?: number;
 }
 
 export interface RecordLocalScanInput {
@@ -177,6 +181,39 @@ export interface PrepareEditsInput extends CheckEditsInput {
   objective?: string;
   branch?: string;
   baseCommit?: string;
+  operationId?: string;
+  turnId?: string;
+  activityEpoch?: number;
+}
+
+export type SessionActivityOperationResultKind =
+  | "awaiting_commit"
+  | "resumed"
+  | "released"
+  | "already_applied"
+  | "superseded";
+
+export interface SessionActivityOperationResult {
+  session: WorkSession;
+  result: SessionActivityOperationResultKind;
+  previousResult?: Exclude<SessionActivityOperationResultKind, "already_applied">;
+  releasedLeaseIds: string[];
+}
+
+export interface SessionActivityOperationInput {
+  memberToken: string;
+  sessionId: string;
+  operationId: string;
+  turnId: string;
+  activityEpoch: number;
+}
+
+export interface CompleteSessionActivityInput extends SessionActivityOperationInput {
+  outcome: "committed" | "reverted";
+  leaseIds?: string[];
+  attributedPaths?: string[];
+  baseCommit?: string;
+  headCommit?: string;
 }
 
 export interface CloseSessionInput {
@@ -238,6 +275,8 @@ export interface HeartbeatSessionInput {
   clientVersion?: string;
   protocolVersion?: number;
   schemaVersion?: number;
+  turnId?: string;
+  activityEpoch?: number;
 }
 
 export interface ChangeMemberRoleInput {
@@ -1659,8 +1698,49 @@ export class AgentHubService {
     check: EditCheckResult;
     claim?: LeaseClaimResult;
     renewedLeases: Lease[];
+    activity?: SessionActivityOperationResult;
   } {
     return this.database.transaction(() => {
+      const hasActivityFence = input.turnId !== undefined || input.activityEpoch !== undefined;
+      if (
+        (hasActivityFence || input.operationId !== undefined)
+        && (
+          !input.sessionId
+          || input.turnId === undefined
+          || input.activityEpoch === undefined
+        )
+      ) {
+        throw new AgentHubError(
+          "activity_fence_required",
+          "A fenced prepare requires sessionId, turnId, and activityEpoch.",
+        );
+      }
+      const activity = input.operationId !== undefined
+        ? this.resumeSessionActivity({
+            memberToken: input.memberToken,
+            sessionId: input.sessionId as string,
+            operationId: input.operationId as string,
+            turnId: input.turnId as string,
+            activityEpoch: input.activityEpoch as number,
+          })
+        : undefined;
+      if (activity?.result === "superseded") {
+        throw new AgentHubError(
+          "stale_activity_epoch",
+          "This write belongs to an activity epoch that has already been superseded.",
+          409,
+          { activityEpoch: input.activityEpoch, turnId: input.turnId },
+        );
+      }
+      if (hasActivityFence) {
+        const auth = this.authenticateMemberToken(input.memberToken);
+        this.requireCurrentActivityFence(
+          input.sessionId as string,
+          auth,
+          input.turnId as string,
+          input.activityEpoch as number,
+        );
+      }
       let renewedLeases: Lease[] = [];
       if (input.sessionId) {
         this.syncSessionBranch({
@@ -1678,7 +1758,7 @@ export class AgentHubService {
       const onlyUncovered = !check.allowed
         && check.blockers.length > 0
         && check.blockers.every((blocker) => blocker.code === "uncovered_path");
-      if (!onlyUncovered) return { check, renewedLeases };
+      if (!onlyUncovered) return { check, renewedLeases, activity };
       const claim = this.claimLease({
         memberToken: input.memberToken,
         sessionId: input.sessionId,
@@ -1691,7 +1771,7 @@ export class AgentHubService {
         autoClaim: true,
       });
       if (claim.acquired) check = this.checkEdits(input);
-      return { check, claim, renewedLeases };
+      return { check, claim, renewedLeases, activity };
     });
   }
 
@@ -2094,6 +2174,20 @@ export class AgentHubService {
       input.schemaVersion ?? metadata.schemaVersion,
       "Schema version",
     );
+    const codexSessionId = optionalString(
+      input.codexSessionId ?? metadata.codexSessionId,
+      "Codex session id",
+      200,
+    );
+    const currentTurnId = optionalString(
+      input.turnId ?? metadata.turnId,
+      "Turn id",
+      200,
+    );
+    const requestedActivityEpoch = optionalActivityEpoch(
+      input.activityEpoch ?? metadata.activityEpoch,
+    );
+    const openedAt = this.timestamp();
     const session: WorkSession = {
       id: randomUUID(),
       roomId: auth.room.id,
@@ -2109,21 +2203,100 @@ export class AgentHubService {
       branchEpoch: 1,
       frozenReason: null,
       metadata,
-      openedAt: this.timestamp(),
-      lastSeenAt: this.timestamp(),
+      openedAt,
+      lastSeenAt: openedAt,
       closedAt: null,
       clientVersion,
       protocolVersion,
       schemaVersion,
+      codexSessionId,
+      currentTurnId,
+      activityEpoch: requestedActivityEpoch ?? 0,
+      turnStoppedAt: null,
     };
-    this.database.transaction(() => {
+    return this.database.transaction(() => {
+      if (codexSessionId) {
+        const existing = this.database.connection.prepare(`
+          SELECT id FROM work_sessions
+          WHERE room_id = ? AND member_id = ? AND codex_session_id = ? AND closed_at IS NULL
+          ORDER BY opened_at DESC LIMIT 1
+        `).get(auth.room.id, auth.member.id, codexSessionId) as Row | undefined;
+        if (existing) {
+          const existingSession = this.requireSessionById(asString(existing.id));
+          const advancesActivity = existingSession.status === "active"
+            && requestedActivityEpoch !== null
+            && currentTurnId !== null
+            && requestedActivityEpoch > existingSession.activityEpoch;
+          const establishesInitialActivity = existingSession.status === "active"
+            && existingSession.currentTurnId === null
+            && requestedActivityEpoch !== null
+            && currentTurnId !== null
+            && requestedActivityEpoch >= existingSession.activityEpoch;
+          const updatesActivityIdentity = advancesActivity || establishesInitialActivity;
+          this.database.connection.prepare(`
+            UPDATE work_sessions SET
+              client_name = COALESCE(?, client_name),
+              agent_name = COALESCE(?, agent_name),
+              repository = COALESCE(?, repository),
+              worktree = COALESCE(?, worktree),
+              task = COALESCE(?, task),
+              metadata_json = ?,
+              last_seen_at = ?,
+              client_version = COALESCE(?, client_version),
+              protocol_version = COALESCE(?, protocol_version),
+              schema_version = COALESCE(?, schema_version),
+              current_turn_id = CASE WHEN ? THEN ? ELSE current_turn_id END,
+              activity_epoch = CASE WHEN ? THEN ? ELSE activity_epoch END,
+              turn_stopped_at = CASE WHEN ? THEN NULL ELSE turn_stopped_at END
+            WHERE id = ?
+          `).run(
+            session.clientName,
+            session.agentName,
+            session.repository,
+            session.worktree,
+            session.task,
+            json({ ...existingSession.metadata, ...metadata }),
+            openedAt,
+            clientVersion,
+            protocolVersion,
+            schemaVersion,
+            updatesActivityIdentity ? 1 : 0,
+            currentTurnId,
+            updatesActivityIdentity ? 1 : 0,
+            requestedActivityEpoch,
+            advancesActivity ? 1 : 0,
+            existingSession.id,
+          );
+          if (advancesActivity) {
+            this.database.connection.prepare(`
+              UPDATE leases SET automatic_phase = 'working', updated_at = ?
+              WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+            `).run(openedAt, existingSession.id);
+          }
+          this.database.connection.prepare(`
+            UPDATE members SET
+              client_version = COALESCE(?, client_version),
+              protocol_version = COALESCE(?, protocol_version),
+              schema_version = COALESCE(?, schema_version),
+              last_seen_at = ?
+            WHERE id = ?
+          `).run(clientVersion, protocolVersion, schemaVersion, openedAt, auth.member.id);
+          this.auditRecord(auth, "session.reused", "session", existingSession.id, "Reused the active Codex session.", {
+            codexSessionId,
+            turnId: currentTurnId,
+            activityEpoch: requestedActivityEpoch,
+          });
+          return this.requireSessionById(existingSession.id);
+        }
+      }
       this.database.connection
         .prepare(`
           INSERT INTO work_sessions (
             id, room_id, member_id, client_name, agent_name, repository, branch, worktree,
             base_commit, task, status, metadata_json, opened_at, last_seen_at,
-            client_version, protocol_version, schema_version
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+            client_version, protocol_version, schema_version, codex_session_id,
+            current_turn_id, activity_epoch
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           session.id,
@@ -2142,6 +2315,9 @@ export class AgentHubService {
           session.clientVersion,
           session.protocolVersion,
           session.schemaVersion,
+          session.codexSessionId,
+          session.currentTurnId,
+          session.activityEpoch,
         );
       this.database.connection.prepare(`
         UPDATE members SET
@@ -2156,9 +2332,12 @@ export class AgentHubService {
         agentName: session.agentName,
         branch: session.branch,
         baseCommit: session.baseCommit,
+        codexSessionId: session.codexSessionId,
+        turnId: session.currentTurnId,
+        activityEpoch: session.activityEpoch,
       });
+      return session;
     });
-    return session;
   }
 
   heartbeatSession(input: HeartbeatSessionInput): {
@@ -2167,7 +2346,22 @@ export class AgentHubService {
   } {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
-    if (session.status !== "active") {
+    const hasActivityFence = input.turnId !== undefined || input.activityEpoch !== undefined;
+    if (hasActivityFence && (input.turnId === undefined || input.activityEpoch === undefined)) {
+      throw new AgentHubError(
+        "activity_fence_required",
+        "A fenced heartbeat requires turnId and activityEpoch.",
+      );
+    }
+    if (hasActivityFence) {
+      this.requireCurrentActivityFence(
+        session.id,
+        auth,
+        input.turnId as string,
+        input.activityEpoch as number,
+      );
+    }
+    if (session.status !== "active" || session.turnStoppedAt) {
       throw new AgentHubError("session_not_active", "The work session is not active.", 409);
     }
     const clientVersion = optionalString(input.clientVersion, "Client version", 80);
@@ -2198,7 +2392,7 @@ export class AgentHubService {
         WHERE id = ?
       `).run(heartbeatAt, clientVersion, protocolVersion, schemaVersion, auth.member.id);
       const leases = this.database.connection.prepare(`
-        SELECT id, kind FROM leases
+        SELECT id, kind, automatic_phase FROM leases
         WHERE member_id = ? AND status = 'active'
           AND (session_id = ? OR (session_id IS NULL AND kind = 'standard'))
       `).all(auth.member.id, session.id) as Row[];
@@ -2208,6 +2402,7 @@ export class AgentHubService {
       for (const lease of leases) {
         const kind = asString(lease.kind) as LeaseKind;
         if (!shouldHeartbeatRenew(kind)) continue;
+        if (kind === "automatic" && asString(lease.automatic_phase) !== "working") continue;
         renew.run(expiresAt, heartbeatAt, asString(lease.id));
         renewedLeaseIds.push(asString(lease.id));
       }
@@ -2224,7 +2419,7 @@ export class AgentHubService {
     const branch = optionalString(input.branch, "Branch", 255) ?? null;
     const baseCommit = optionalString(input.baseCommit, "Base commit", 255) ?? null;
     if (session.status === "frozen") throw new AgentHubError("session_frozen", session.frozenReason ?? "The session is frozen after a branch change.", 409);
-    if (session.status !== "active") throw new AgentHubError("session_not_active", "The work session is not active.", 409);
+    if (session.status !== "active" || session.turnStoppedAt) throw new AgentHubError("session_not_active", "The work session is not active.", 409);
     if (session.branch === branch) {
       const now = this.timestamp();
       this.database.connection.prepare("UPDATE work_sessions SET base_commit = ?, last_seen_at = ? WHERE id = ?").run(baseCommit, now, session.id);
@@ -2341,6 +2536,295 @@ export class AgentHubService {
     return scan;
   }
 
+  stopSessionActivity(input: SessionActivityOperationInput): SessionActivityOperationResult {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const operationId = requiredString(input.operationId, "Operation id", 200);
+    const turnId = requiredString(input.turnId, "Turn id", 200);
+    const activityEpoch = requiredActivityEpoch(input.activityEpoch);
+    const payloadHash = operationPayloadHash({ turnId, activityEpoch });
+    const stoppedAt = this.timestamp();
+
+    return this.database.transaction(() => {
+      const session = this.requireOwnedSession(input.sessionId, auth);
+      const repeated = this.repeatedSessionOperation(
+        session,
+        operationId,
+        "stop",
+        payloadHash,
+      );
+      if (repeated) return repeated;
+
+      const matchesCurrentActivity = (
+          session.status === "active"
+          || session.status === "finalizing"
+          || session.status === "closed"
+        )
+        && activityEpoch === session.activityEpoch
+        && session.currentTurnId === turnId;
+      const establishesInitialActivity = session.status === "active"
+        && session.currentTurnId === null
+        && activityEpoch >= session.activityEpoch;
+      if (!matchesCurrentActivity && !establishesInitialActivity) {
+        return this.recordSessionOperation(
+          session,
+          operationId,
+          "stop",
+          turnId,
+          activityEpoch,
+          payloadHash,
+          "superseded",
+          [],
+          stoppedAt,
+        );
+      }
+
+      this.database.connection.prepare(`
+        UPDATE work_sessions SET
+          current_turn_id = ?, activity_epoch = ?,
+          turn_stopped_at = COALESCE(turn_stopped_at, ?), last_seen_at = ?
+        WHERE id = ?
+      `).run(turnId, activityEpoch, stoppedAt, stoppedAt, session.id);
+      this.database.connection.prepare(`
+        UPDATE leases SET automatic_phase = 'awaiting_commit', updated_at = ?
+        WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+          AND automatic_phase <> 'awaiting_commit'
+      `).run(stoppedAt, session.id);
+      this.auditRecord(auth, "session.turn_stopped", "session", session.id, "Stopped a Codex turn while Git completion is checked.", {
+        operationId,
+        turnId,
+        activityEpoch,
+      });
+      return this.recordSessionOperation(
+        this.requireSessionById(session.id),
+        operationId,
+        "stop",
+        turnId,
+        activityEpoch,
+        payloadHash,
+        "awaiting_commit",
+        [],
+        stoppedAt,
+      );
+    });
+  }
+
+  resumeSessionActivity(input: SessionActivityOperationInput): SessionActivityOperationResult {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const operationId = requiredString(input.operationId, "Operation id", 200);
+    const turnId = requiredString(input.turnId, "Turn id", 200);
+    const activityEpoch = requiredActivityEpoch(input.activityEpoch);
+    const payloadHash = operationPayloadHash({ turnId, activityEpoch });
+    const resumedAt = this.timestamp();
+
+    return this.database.transaction(() => {
+      const session = this.requireOwnedSession(input.sessionId, auth);
+      const repeated = this.repeatedSessionOperation(
+        session,
+        operationId,
+        "resume",
+        payloadHash,
+      );
+      if (repeated) return repeated;
+
+      const advancesActivity = session.status === "active"
+        && activityEpoch > session.activityEpoch;
+      if (!advancesActivity) {
+        return this.recordSessionOperation(
+          session,
+          operationId,
+          "resume",
+          turnId,
+          activityEpoch,
+          payloadHash,
+          "superseded",
+          [],
+          resumedAt,
+        );
+      }
+
+      this.database.connection.prepare(`
+        UPDATE work_sessions SET
+          current_turn_id = ?, activity_epoch = ?, turn_stopped_at = NULL, last_seen_at = ?
+        WHERE id = ?
+      `).run(turnId, activityEpoch, resumedAt, session.id);
+      this.database.connection.prepare(`
+        UPDATE leases SET automatic_phase = 'working', updated_at = ?
+        WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+          AND automatic_phase <> 'working'
+      `).run(resumedAt, session.id);
+      this.auditRecord(auth, "session.turn_resumed", "session", session.id, "Resumed Codex work with a new activity fence.", {
+        operationId,
+        turnId,
+        activityEpoch,
+        previousTurnId: session.currentTurnId,
+        previousActivityEpoch: session.activityEpoch,
+      });
+      return this.recordSessionOperation(
+        this.requireSessionById(session.id),
+        operationId,
+        "resume",
+        turnId,
+        activityEpoch,
+        payloadHash,
+        "resumed",
+        [],
+        resumedAt,
+      );
+    });
+  }
+
+  completeSessionActivity(input: CompleteSessionActivityInput): SessionActivityOperationResult {
+    const auth = this.authenticateMemberToken(input.memberToken);
+    const operationId = requiredString(input.operationId, "Operation id", 200);
+    const turnId = requiredString(input.turnId, "Turn id", 200);
+    const activityEpoch = requiredActivityEpoch(input.activityEpoch);
+    if (input.outcome !== "committed" && input.outcome !== "reverted") {
+      throw new AgentHubError(
+        "invalid_completion_outcome",
+        "Completion outcome must be committed or reverted.",
+      );
+    }
+    const leaseIds = input.leaseIds === undefined
+      ? null
+      : uniqueStrings(stringArray(input.leaseIds, "Lease ids", 200, 200));
+    const attributedPaths = normalizePathList(input.attributedPaths ?? [], true)
+      .map((path) => path.path);
+    const baseCommit = optionalString(input.baseCommit, "Base commit", 255);
+    const headCommit = optionalString(input.headCommit, "Head commit", 255);
+    if (input.outcome === "committed" && !headCommit) {
+      throw new AgentHubError(
+        "commit_evidence_required",
+        "A committed completion requires the observed HEAD commit.",
+      );
+    }
+    const payloadHash = operationPayloadHash({
+      turnId,
+      activityEpoch,
+      outcome: input.outcome,
+      leaseIds: leaseIds ? [...leaseIds].sort() : null,
+      attributedPaths: [...attributedPaths].sort(),
+      baseCommit,
+      headCommit,
+    });
+    const completedAt = this.timestamp();
+
+    return this.database.transaction(() => {
+      const session = this.requireOwnedSession(input.sessionId, auth);
+      const repeated = this.repeatedSessionOperation(
+        session,
+        operationId,
+        "completion",
+        payloadHash,
+      );
+      if (repeated) return repeated;
+
+      const matchesStoppedActivity = (
+          session.status === "active"
+          || session.status === "finalizing"
+          || session.status === "closed"
+        )
+        && session.turnStoppedAt !== null
+        && session.currentTurnId === turnId
+        && session.activityEpoch === activityEpoch;
+      if (!matchesStoppedActivity) {
+        return this.recordSessionOperation(
+          session,
+          operationId,
+          "completion",
+          turnId,
+          activityEpoch,
+          payloadHash,
+          "superseded",
+          [],
+          completedAt,
+        );
+      }
+
+      if (
+        input.outcome === "committed"
+        && baseCommit
+        && headCommit
+        && normalizedEvidenceText(baseCommit) === normalizedEvidenceText(headCommit)
+      ) {
+        return this.recordSessionOperation(
+          session,
+          operationId,
+          "completion",
+          turnId,
+          activityEpoch,
+          payloadHash,
+          "awaiting_commit",
+          [],
+          completedAt,
+        );
+      }
+
+      const candidates = this.database.connection.prepare(`
+        SELECT id, title FROM leases
+        WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+          AND automatic_phase = 'awaiting_commit'
+        ORDER BY created_at, id
+      `).all(session.id) as Row[];
+      const requestedLeaseIds = leaseIds ? new Set(leaseIds) : null;
+      const releasable = candidates.filter((lease) =>
+        !requestedLeaseIds || requestedLeaseIds.has(asString(lease.id)),
+      );
+      const completionSummary = input.outcome === "committed"
+        ? `Automatic lease released after Git commit ${headCommit}.`
+        : "Automatic lease released after attributed changes were reverted.";
+      const release = this.database.connection.prepare(`
+        UPDATE leases SET
+          status = 'cancelled', completed_at = ?, updated_at = ?, completion_summary = ?
+        WHERE id = ? AND status = 'active' AND kind = 'automatic'
+          AND automatic_phase = 'awaiting_commit'
+      `);
+      const releasedLeaseIds: string[] = [];
+      for (const lease of releasable) {
+        const leaseId = asString(lease.id);
+        const result = release.run(completedAt, completedAt, completionSummary, leaseId);
+        if (result.changes === 0) continue;
+        releasedLeaseIds.push(leaseId);
+        this.insertActivity({
+          roomId: auth.room.id,
+          actorMemberId: auth.member.id,
+          actorName: auth.member.displayName,
+          type: "lease.git_completed",
+          entityType: "lease",
+          entityId: leaseId,
+          summary: `${auth.member.displayName} released ${asString(lease.title)} after Git completion.`,
+          metadata: {
+            operationId,
+            turnId,
+            activityEpoch,
+            outcome: input.outcome,
+            baseCommit,
+            headCommit,
+            attributedPaths,
+          },
+          createdAt: completedAt,
+        });
+      }
+      this.auditRecord(auth, "session.turn_completed", "session", session.id, "Completed the stopped Codex turn's Git gate.", {
+        operationId,
+        turnId,
+        activityEpoch,
+        outcome: input.outcome,
+        releasedLeaseIds,
+      });
+      return this.recordSessionOperation(
+        session,
+        operationId,
+        "completion",
+        turnId,
+        activityEpoch,
+        payloadHash,
+        "released",
+        releasedLeaseIds,
+        completedAt,
+      );
+    });
+  }
+
   startSessionFinalization(input: StartSessionFinalizationInput): WorkSession {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
@@ -2363,34 +2847,11 @@ export class AgentHubService {
     this.database.transaction(() => {
       this.expireLeases(auth.room.id, false);
       this.featureMemory.expireSessionConfirmations(session.id, startedAt);
-      const leases = this.database.connection.prepare(`
-        SELECT id, title FROM leases
-        WHERE session_id = ? AND status = 'active' AND kind <> 'exclusive'
+      // SessionEnd 可能抢在异步 Stop 前到达；automatic 必须保留到 Git completion 或原 TTL。
+      const protectedAutomaticLeases = this.database.connection.prepare(`
+        SELECT id FROM leases
+        WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
       `).all(session.id) as Row[];
-      const cancel = this.database.connection.prepare(`
-        UPDATE leases SET status = 'cancelled', completed_at = ?, updated_at = ?, completion_summary = ?
-        WHERE id = ?
-      `);
-      for (const lease of leases) {
-        const leaseId = asString(lease.id);
-        cancel.run(
-          startedAt,
-          startedAt,
-          summary ?? "The Agent session entered background finalization.",
-          leaseId,
-        );
-        this.insertActivity({
-          roomId: auth.room.id,
-          actorMemberId: auth.member.id,
-          actorName: auth.member.displayName,
-          type: "lease.finalizing",
-          entityType: "lease",
-          entityId: leaseId,
-          summary: `${auth.member.displayName} released ${asString(lease.title)} for background finalization.`,
-          metadata: { status: "cancelled", sessionId: session.id, finalizationId },
-          createdAt: startedAt,
-        });
-      }
       this.database.connection.prepare(`
         UPDATE release_requests SET status = 'cancelled', resolved_at = ?
         WHERE requester_session_id = ? AND status = 'pending'
@@ -2405,8 +2866,12 @@ export class AgentHubService {
         "session.finalizing",
         "session",
         session.id,
-        "Queued final evidence processing and released synchronous write protection.",
-        { finalizationId, releasedLeaseIds: leases.map((lease) => asString(lease.id)), summary },
+        "Queued final evidence processing while automatic write protection awaits completion or expiry.",
+        {
+          finalizationId,
+          protectedAutomaticLeaseIds: protectedAutomaticLeases.map((lease) => asString(lease.id)),
+          summary,
+        },
       );
     });
     return this.requireSessionById(session.id);
@@ -2477,7 +2942,8 @@ export class AgentHubService {
         .prepare(`
           SELECT id, title
           FROM leases
-          WHERE session_id = ? AND status = 'active' AND kind <> 'exclusive'
+          WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+            AND automatic_phase = 'working'
         `)
         .all(session.id) as Row[];
       const cancellationSummary = summary
@@ -3479,10 +3945,40 @@ export class AgentHubService {
   ): string | null {
     if (value === undefined) return null;
     const session = this.requireOwnedSession(value, auth);
-    if (session.status !== "active") {
+    if (session.status !== "active" || session.turnStoppedAt) {
       throw new AgentHubError("session_not_active", "The work session is closed.", 409);
     }
     return session.id;
+  }
+
+  private requireCurrentActivityFence(
+    sessionId: string,
+    auth: AuthenticatedMember,
+    turnIdValue: string,
+    activityEpochValue: number,
+  ): WorkSession {
+    const turnId = requiredString(turnIdValue, "Turn id", 200);
+    const activityEpoch = requiredActivityEpoch(activityEpochValue);
+    const session = this.requireOwnedSession(sessionId, auth);
+    if (
+      session.status !== "active"
+      || session.turnStoppedAt
+      || session.currentTurnId !== turnId
+      || session.activityEpoch !== activityEpoch
+    ) {
+      throw new AgentHubError(
+        "stale_activity_epoch",
+        "This request belongs to an activity epoch that is no longer current.",
+        409,
+        {
+          turnId,
+          activityEpoch,
+          currentTurnId: session.currentTurnId,
+          currentActivityEpoch: session.activityEpoch,
+        },
+      );
+    }
+    return session;
   }
 
   private requireActiveOrFinalizingSession(
@@ -3490,6 +3986,13 @@ export class AgentHubService {
     finalizationId?: string,
   ): void {
     if (session.status === "active") {
+      if (session.turnStoppedAt) {
+        throw new AgentHubError(
+          "session_not_active",
+          "The stopped work session must resume before normal operations continue.",
+          409,
+        );
+      }
       if (finalizationId !== undefined) {
         throw new AgentHubError("session_not_finalizing", "The work session has not entered finalization.", 409);
       }
@@ -3516,6 +4019,92 @@ export class AgentHubService {
       .prepare("SELECT finalization_id FROM work_sessions WHERE id = ?")
       .get(sessionId) as Row | undefined;
     return row ? nullableString(row.finalization_id) : null;
+  }
+
+  private repeatedSessionOperation(
+    session: WorkSession,
+    operationId: string,
+    operationType: "stop" | "resume" | "completion",
+    payloadHash: string,
+  ): SessionActivityOperationResult | null {
+    const row = this.database.connection.prepare(`
+      SELECT operation_type, turn_id, activity_epoch, payload_hash, result_json
+      FROM session_operations
+      WHERE session_id = ? AND operation_id = ? AND operation_type = ?
+    `).get(session.id, operationId, operationType) as Row | undefined;
+    if (!row) return null;
+    if (asString(row.payload_hash) !== payloadHash) {
+      throw new AgentHubError(
+        "operation_id_conflict",
+        "The operation id was already used with different completion parameters.",
+        409,
+      );
+    }
+    if (
+      session.currentTurnId !== asString(row.turn_id)
+      || session.activityEpoch !== Number(row.activity_epoch)
+      || (
+        operationType === "resume"
+        && (session.status !== "active" || session.turnStoppedAt !== null)
+      )
+    ) {
+      return {
+        session: this.requireSessionById(session.id),
+        result: "superseded",
+        releasedLeaseIds: [],
+      };
+    }
+    const stored = parseObject(row.result_json);
+    const previousResult = asString(stored.result) as Exclude<
+      SessionActivityOperationResultKind,
+      "already_applied"
+    >;
+    if (operationType === "completion" && previousResult === "awaiting_commit") {
+      return {
+        session: this.requireSessionById(session.id),
+        result: "awaiting_commit",
+        releasedLeaseIds: [],
+      };
+    }
+    return {
+      session: this.requireSessionById(session.id),
+      result: "already_applied",
+      previousResult,
+      releasedLeaseIds: stringListValue(stored.releasedLeaseIds) ?? [],
+    };
+  }
+
+  private recordSessionOperation(
+    session: WorkSession,
+    operationId: string,
+    operationType: "stop" | "resume" | "completion",
+    turnId: string,
+    activityEpoch: number,
+    payloadHash: string,
+    result: Exclude<SessionActivityOperationResultKind, "already_applied">,
+    releasedLeaseIds: string[],
+    createdAt: string,
+  ): SessionActivityOperationResult {
+    this.database.connection.prepare(`
+      INSERT INTO session_operations (
+        session_id, operation_id, operation_type, turn_id, activity_epoch,
+        payload_hash, result_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      session.id,
+      operationId,
+      operationType,
+      turnId,
+      activityEpoch,
+      payloadHash,
+      json({ result, releasedLeaseIds }),
+      createdAt,
+    );
+    return {
+      session: this.requireSessionById(session.id),
+      result,
+      releasedLeaseIds,
+    };
   }
 
   private featureActor(auth: AuthenticatedMember): FeatureMemoryActor {
@@ -3709,6 +4298,9 @@ export class AgentHubService {
       baseCommit: nullableString(row.base_commit),
       mode: asString(row.mode) as LeaseMode,
       kind: asString(row.kind ?? "standard") as LeaseKind,
+      phase: asString(row.kind ?? "standard") === "automatic"
+        ? asString(row.automatic_phase ?? "working") as AutomaticLeasePhase
+        : undefined,
       decision: asString(row.decision) as Lease["decision"],
       overrideReason: nullableString(row.override_reason),
       status: asString(row.status) as Lease["status"],
@@ -3896,6 +4488,10 @@ function mapSession(row: Row): WorkSession {
     clientVersion: nullableString(row.client_version),
     protocolVersion: nullableNumber(row.protocol_version),
     schemaVersion: nullableNumber(row.schema_version),
+    codexSessionId: nullableString(row.codex_session_id),
+    currentTurnId: nullableString(row.current_turn_id),
+    activityEpoch: Number(row.activity_epoch ?? 0),
+    turnStoppedAt: nullableString(row.turn_stopped_at),
   };
 }
 
@@ -4027,6 +4623,25 @@ function optionalVersionNumber(value: unknown, label: string): number | null {
     throw new AgentHubError("invalid_input", `${label} must be a positive integer.`);
   }
   return value;
+}
+
+function optionalActivityEpoch(value: unknown): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  return requiredActivityEpoch(value);
+}
+
+function requiredActivityEpoch(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new AgentHubError(
+      "invalid_activity_epoch",
+      "Activity epoch must be a non-negative safe integer.",
+    );
+  }
+  return value;
+}
+
+function operationPayloadHash(value: Record<string, unknown>): string {
+  return createHash("sha256").update(json(value), "utf8").digest("hex");
 }
 
 function stringArray(

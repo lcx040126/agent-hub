@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -48,7 +48,7 @@ describe("connection store validation", () => {
     ).toThrow(/invalid encrypted/i);
   });
 
-  it("defaults v0.2.0 connection documents to integration enabled", () => {
+  it("preserves unknown Codex intent while defaulting v0.2.0 connections to enabled", () => {
     const document = parseStoreDocument(JSON.stringify({
       version: 1,
       connections: [{
@@ -63,7 +63,87 @@ describe("connection store validation", () => {
     }));
 
     expect(document.connections[0]?.integrationEnabled).toBe(true);
+    expect(document.connections[0]?.codexIntegrationInstalled).toBeUndefined();
     expect(document.connections[0]?.memberRole).toBeUndefined();
+  });
+
+  it("keeps legacy Codex intent unknown when unrelated connection details are updated", async () => {
+    const directory = await temporaryDirectory();
+    const filePath = path.join(directory, "connections.json");
+    const legacy = {
+      version: 1,
+      connections: [{
+        id: "legacy-connection",
+        serverUrl: "http://127.0.0.1:4173",
+        repositoryPath: directory,
+        createdAt: "2026-08-26T00:00:00.000Z",
+        updatedAt: "2026-08-26T00:00:00.000Z",
+        tokenCiphertext: Buffer.from("protected:member-token-v1", "utf8").toString("base64"),
+        tokenProtection: "windows-dpapi-v1",
+      }],
+    };
+    await writeFile(filePath, `${JSON.stringify(legacy)}\n`, "utf8");
+    const store = new ConnectionStore(filePath, protector());
+
+    await store.save({
+      id: "legacy-connection",
+      serverUrl: "http://127.0.0.1:4173",
+      memberToken: "member-token-v2",
+      repositoryPath: directory,
+    });
+
+    await expect(store.get("legacy-connection")).resolves.toMatchObject({
+      codexIntegrationInstalled: undefined,
+    });
+  });
+
+  it("preserves the Codex installation state when connection details are updated", async () => {
+    const directory = await temporaryDirectory();
+    const store = new ConnectionStore(path.join(directory, "connections.json"), protector());
+    const saved = await store.save({
+      serverUrl: "http://127.0.0.1:4173",
+      memberToken: "member-token-v1",
+      repositoryPath: directory,
+      codexIntegrationInstalled: true,
+    });
+
+    await store.save({
+      id: saved.id,
+      serverUrl: saved.serverUrl,
+      memberToken: "member-token-v2",
+      repositoryPath: saved.repositoryPath,
+    });
+
+    await expect(store.get(saved.id)).resolves.toMatchObject({
+      codexIntegrationInstalled: true,
+    });
+  });
+
+  it("serializes Codex installation state with concurrent connection updates", async () => {
+    const directory = await temporaryDirectory();
+    const store = new ConnectionStore(path.join(directory, "connections.json"), protector());
+    const saved = await store.save({
+      serverUrl: "http://127.0.0.1:4173",
+      memberToken: "member-token-v1",
+      repositoryPath: directory,
+    });
+
+    expect(saved.codexIntegrationInstalled).toBe(false);
+    await Promise.all([
+      store.setCodexIntegrationInstalled(saved.id, true),
+      store.save({
+        id: saved.id,
+        serverUrl: saved.serverUrl,
+        memberToken: "member-token-v2",
+        repositoryPath: saved.repositoryPath,
+      }),
+    ]);
+
+    const reopened = new ConnectionStore(store.filePath, protector());
+    await expect(reopened.get(saved.id)).resolves.toMatchObject({
+      codexIntegrationInstalled: true,
+    });
+    await expect(reopened.readMemberToken(saved.id)).resolves.toBe("member-token-v2");
   });
 
   it("persists pause and resume without replacing the encrypted token", async () => {

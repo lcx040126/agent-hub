@@ -102,12 +102,156 @@ describe("Agent Hub REST API", () => {
       .send({ finalizationId }), owner.body.token);
     expect(repeatedComplete.body.session.status).toBe("closed");
     const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
-    expect(dashboard.body.leases).not.toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: lease.body.lease.id, status: "active" }),
+    expect(dashboard.body.leases).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: lease.body.lease.id,
+        status: "active",
+        phase: "working",
+        expiresAt: lease.body.lease.expiresAt,
+      }),
     ]));
     expect(dashboard.body.records.filter(
       (record: { title: string }) => record.title === "会话结束证据未完整生成",
     )).toHaveLength(1);
+  });
+
+  it("exposes commit-gated automatic release with retry and activity-epoch fencing", async () => {
+    const { app } = testApp(() => new Date("2026-08-27T12:00:00.000Z"));
+    const owner = await createRoom(app);
+    const opened = await auth(request(app).post("/api/sessions").send({
+      codexSessionId: "codex-rest-session",
+      turnId: "turn-0",
+      activityEpoch: 0,
+      branch: "main",
+      baseCommit: "base-0",
+    }), owner.body.token);
+    const reused = await auth(request(app).post("/api/sessions").send({
+      codexSessionId: "codex-rest-session",
+      turnId: "turn-0",
+      activityEpoch: 0,
+    }), owner.body.token);
+    expect(reused.body.session).toMatchObject({
+      id: opened.body.session.id,
+      codexSessionId: "codex-rest-session",
+      currentTurnId: "turn-0",
+      activityEpoch: 0,
+    });
+    const sessionId = opened.body.session.id as string;
+    const automatic = await auth(request(app).post("/api/leases").send({
+      sessionId,
+      title: "Automatic REST edit",
+      paths: ["src/rest-auto.ts"],
+      kind: "automatic",
+    }), owner.body.token);
+    const standard = await auth(request(app).post("/api/leases").send({
+      sessionId,
+      title: "Manual REST edit",
+      paths: ["src/rest-manual.ts"],
+      kind: "standard",
+    }), owner.body.token);
+    const manualExpiry = standard.body.lease.expiresAt as string;
+
+    const stopped = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/stop`)
+      .send({ operationId: "stop-rest-0", turnId: "turn-0", activityEpoch: 0 }), owner.body.token);
+    expect(stopped.status).toBe(200);
+    expect(stopped.body).toMatchObject({
+      result: "awaiting_commit",
+      session: { currentTurnId: "turn-0", activityEpoch: 0 },
+    });
+    expect(stopped.body.session.turnStoppedAt).toBeTruthy();
+    const duplicateStop = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/stop`)
+      .send({ operationId: "stop-rest-0", turnId: "turn-0", activityEpoch: 0 }), owner.body.token);
+    expect(duplicateStop.body).toMatchObject({
+      result: "already_applied",
+      previousResult: "awaiting_commit",
+    });
+
+    const resumed = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/resume`)
+      .send({ operationId: "resume-rest-1", turnId: "turn-1", activityEpoch: 1 }), owner.body.token);
+    expect(resumed.body).toMatchObject({
+      result: "resumed",
+      session: { currentTurnId: "turn-1", activityEpoch: 1, turnStoppedAt: null },
+    });
+    expect((await auth(request(app)
+      .post(`/api/sessions/${sessionId}/heartbeat`)
+      .send({ turnId: "turn-0", activityEpoch: 0 }), owner.body.token)).status).toBe(409);
+    expect((await auth(request(app)
+      .post(`/api/sessions/${sessionId}/heartbeat`)
+      .send({ turnId: "turn-1", activityEpoch: 1 }), owner.body.token)).status).toBe(200);
+    expect((await auth(request(app).post("/api/edits/prepare").send({
+      sessionId,
+      title: "Stale prepare",
+      branch: "main",
+      baseCommit: "base-0",
+      paths: ["src/rest-auto.ts"],
+      turnId: "turn-0",
+      activityEpoch: 0,
+    }), owner.body.token)).status).toBe(409);
+    const stale = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/completion/check`)
+      .send({
+        operationId: "stop-rest-0",
+        turnId: "turn-0",
+        activityEpoch: 0,
+        outcome: "committed",
+        baseCommit: "base-0",
+        headCommit: "commit-0",
+      }), owner.body.token);
+    expect(stale.status).toBe(200);
+    expect(stale.body).toMatchObject({ result: "superseded", releasedLeaseIds: [] });
+
+    await auth(request(app)
+      .post(`/api/sessions/${sessionId}/stop`)
+      .send({ operationId: "turn-rest-operation-1", turnId: "turn-1", activityEpoch: 1 }), owner.body.token);
+    const unchangedHead = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/completion/check`)
+      .send({
+        operationId: "completion-rest-no-commit",
+        turnId: "turn-1",
+        activityEpoch: 1,
+        outcome: "committed",
+        baseCommit: "base-0",
+        headCommit: "base-0",
+      }), owner.body.token);
+    expect(unchangedHead.body).toMatchObject({ result: "awaiting_commit", releasedLeaseIds: [] });
+    const beforeCommit = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(beforeCommit.body.leases).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: automatic.body.lease.id,
+        status: "active",
+        phase: "awaiting_commit",
+      }),
+    ]));
+
+    const completed = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/completion/check`)
+      .send({
+        operationId: "turn-rest-operation-1",
+        turnId: "turn-1",
+        activityEpoch: 1,
+        outcome: "committed",
+        leaseIds: [automatic.body.lease.id, standard.body.lease.id],
+        attributedPaths: ["src/rest-auto.ts"],
+        baseCommit: "base-0",
+        headCommit: "commit-1",
+      }), owner.body.token);
+    expect(completed.body).toMatchObject({
+      result: "released",
+      releasedLeaseIds: [automatic.body.lease.id],
+    });
+    const afterCommit = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(afterCommit.body.leases.map((lease: { id: string }) => lease.id))
+      .not.toContain(automatic.body.lease.id);
+    expect(afterCommit.body.leases).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: standard.body.lease.id,
+        status: "active",
+        expiresAt: manualExpiry,
+      }),
+    ]));
   });
 
   it("supports owner transfer, administrator management, room settings, and removal", async () => {

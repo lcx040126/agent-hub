@@ -7,6 +7,7 @@ import {
 import type { SavedRoomConnection } from "../desktop/contracts.js";
 import { CodexHookStateStore } from "./hook-state.js";
 import { SessionEndQueueStore } from "./session-end-queue.js";
+import { TurnCompletionQueueStore } from "./turn-completion-queue.js";
 import {
   IntegrationOperationTracker,
   type ConnectionOperationTracker,
@@ -115,6 +116,8 @@ export class IntegrationController {
     if (normalizedConnectionIds.length > 0) {
       await new CodexHookStateStore(this.options.userDataPath)
         .removeForConnections(normalizedConnectionIds);
+      await new TurnCompletionQueueStore(this.options.userDataPath)
+        .removeForConnections(normalizedConnectionIds);
       for (const connectionId of normalizedConnectionIds) {
         this.knownActiveConnectionIds.delete(connectionId);
       }
@@ -172,6 +175,9 @@ export class IntegrationController {
     await new CodexHookStateStore(this.options.userDataPath)
       .removeForConnection(connectionId)
       .catch((error: unknown) => this.options.onError?.(toError(error)));
+    await new TurnCompletionQueueStore(this.options.userDataPath)
+      .removeForConnection(connectionId)
+      .catch((error: unknown) => this.options.onError?.(toError(error)));
     return this.completePreparedPause(connectionId, reason, requestId);
   }
 
@@ -200,6 +206,7 @@ export class IntegrationController {
     try {
       await this.operationTracker.drain(connectionId);
       await new CodexHookStateStore(this.options.userDataPath).removeForConnection(connectionId);
+      await new TurnCompletionQueueStore(this.options.userDataPath).removeForConnection(connectionId);
     } catch (error) {
       const drainError = toError(error);
       this.options.onError?.(drainError);
@@ -307,6 +314,7 @@ export class IntegrationController {
         }
         await this.operationTracker.drain(target.id);
         await new CodexHookStateStore(this.options.userDataPath).removeForConnection(target.id);
+        await new TurnCompletionQueueStore(this.options.userDataPath).removeForConnection(target.id);
       }
       for (const peer of peers) {
         const result = await this.withConnectionLifecycle(peer.id, () =>
@@ -408,6 +416,7 @@ export class IntegrationController {
         await this.pauseQueue.removeForConnection(connection.id);
         await new CodexHookStateStore(this.options.userDataPath).removeForConnection(connection.id);
         await new SessionEndQueueStore(this.options.userDataPath).removeForConnection(connection.id);
+        await new TurnCompletionQueueStore(this.options.userDataPath).removeForConnection(connection.id);
         await this.operationTracker.removeConnectionState?.(connection.id);
 
         const remainingConnections = (await this.options.store.list())
@@ -478,6 +487,9 @@ export class IntegrationController {
         }
       }
       await new CodexHookStateStore(this.options.userDataPath)
+        .removeForConnections(connectionIds)
+        .catch((error: unknown) => this.options.onError?.(toError(error)));
+      await new TurnCompletionQueueStore(this.options.userDataPath)
         .removeForConnections(connectionIds)
         .catch((error: unknown) => this.options.onError?.(toError(error)));
       await Promise.all(connectionIds.map(async (connectionId) => {

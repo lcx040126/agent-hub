@@ -4,13 +4,76 @@ import {
   DeleteConnectionModal,
   EntryScreen,
   SavedConnectionList,
+  WorkItem,
+  WorkView,
+  formatLeaseExpiryCountdown,
+  isRealtimeAgentSession,
+  isValidLease,
   nextPendingReleaseRequestId,
   noticeForActivatedConnection,
   noticeForDeletedConnection,
+  protectedSystemsForDashboard,
+  splitVisibleLeases,
 } from "./App";
-import type { SavedRoomConnection } from "./api";
+import type { Dashboard, Lease, SavedRoomConnection } from "./api";
 
 const originalWindow = globalThis.window;
+const LEASE_NOW = Date.parse("2026-08-27T08:00:00.000Z");
+
+function lease(overrides: Partial<Lease> = {}): Lease {
+  return {
+    id: "lease-a",
+    title: "自动工作范围",
+    memberId: "member-current",
+    memberName: "当前成员",
+    paths: ["src/client/App.tsx"],
+    highRiskPaths: [],
+    mode: "write",
+    kind: "automatic",
+    phase: "working",
+    status: "active",
+    expiresAt: "2026-08-27T08:10:00.000Z",
+    ...overrides,
+  };
+}
+
+function dashboard(overrides: Partial<Dashboard> = {}): Dashboard {
+  const currentMember: Dashboard["currentMember"] = {
+    id: "member-current",
+    name: "当前成员",
+    role: "member",
+    status: "online",
+    compatibility: "compatible",
+  };
+  return {
+    room: {
+      id: "room-a",
+      name: "协作房间",
+      projectName: "Agent Hub",
+      repository: "https://github.com/example/agent-hub.git",
+      defaultBranch: "main",
+    },
+    currentMember,
+    members: [currentMember],
+    leases: [],
+    conflicts: [],
+    records: [],
+    activity: [],
+    sessions: [],
+    localScans: [],
+    settings: {
+      autoLockAfterAutoClaim: true,
+      blockingProtectionEnabled: true,
+      automaticLeaseTtlMinutes: 10,
+      maximumExclusiveLeaseMinutes: 240,
+      riskPolicyVersion: 1,
+      riskRules: [],
+    },
+    releaseRequests: [],
+    server: { mcpUrl: "http://127.0.0.1:4173/mcp" },
+    ...overrides,
+  };
+}
 
 afterEach(() => {
   Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
@@ -51,6 +114,112 @@ describe("dashboard modal coordination", () => {
       "member-current",
       new Set(["request-dismissed"]),
     )).toBeUndefined();
+  });
+});
+
+describe("lease protection presentation", () => {
+  it("uses a strict expiry boundary and renders a second-level countdown", () => {
+    expect(isValidLease(lease({ expiresAt: "2026-08-27T08:00:00.001Z" }), LEASE_NOW)).toBe(true);
+    expect(isValidLease(lease({ expiresAt: "2026-08-27T08:00:00.000Z" }), LEASE_NOW)).toBe(false);
+    expect(isValidLease(lease({ expiresAt: "not-a-date" }), LEASE_NOW)).toBe(false);
+    expect(isValidLease(lease({ status: "working" }), LEASE_NOW)).toBe(false);
+    expect(formatLeaseExpiryCountdown("2026-08-27T08:01:05.000Z", LEASE_NOW)).toBe("1 分 05 秒后到期");
+    expect(formatLeaseExpiryCountdown("2026-08-27T08:01:05.000Z", LEASE_NOW + 1_000)).toBe("1 分 04 秒后到期");
+  });
+
+  it("shows only fresh active sessions whose current turn has not stopped", () => {
+    expect(isRealtimeAgentSession({
+      status: "active",
+      lastSeenAt: "2026-08-27T07:55:00.001Z",
+    }, LEASE_NOW)).toBe(true);
+    expect(isRealtimeAgentSession({
+      status: "active",
+      lastSeenAt: "2026-08-27T07:55:00.000Z",
+    }, LEASE_NOW)).toBe(false);
+    expect(isRealtimeAgentSession({
+      status: "active",
+      lastSeenAt: "2026-08-27T08:00:00.000Z",
+      turnStoppedAt: "2026-08-27T08:00:00.000Z",
+    }, LEASE_NOW)).toBe(false);
+  });
+
+  it("derives protected systems only from valid leases and ignores historical scans", () => {
+    const state = dashboard({
+      leases: [
+        lease({ id: "valid", paths: ["src/client/App.tsx"] }),
+        lease({ id: "expired", paths: ["src/server/history.ts"], expiresAt: "2026-08-27T08:00:00.000Z" }),
+      ],
+      localScans: [{
+        id: "historical-scan",
+        memberId: "member-current",
+        changedPaths: ["Assets/Historical/Old.prefab"],
+        systems: ["Historical"],
+        ruleFiles: [],
+      }],
+    });
+
+    const systems = protectedSystemsForDashboard(state, LEASE_NOW);
+
+    expect(systems.map((system) => system.name)).toEqual(["src"]);
+    expect([...systems[0].paths]).toEqual(["src/client/App.tsx"]);
+  });
+
+  it("keeps valid manual leases in live work and separates automatic commit waiting", () => {
+    const awaiting = lease({ id: "awaiting", title: "等待中的自动范围", phase: "awaiting_commit" });
+    const standard = lease({ id: "standard", title: "普通手动范围", kind: "standard", phase: "awaiting_commit" });
+    const exclusive = lease({ id: "exclusive", title: "独占手动范围", kind: "exclusive", phase: undefined });
+    const expired = lease({ id: "expired", title: "已经过期的手动范围", kind: "standard", expiresAt: "2026-08-27T07:59:59.999Z" });
+    const groups = splitVisibleLeases([awaiting, standard, exclusive, expired], LEASE_NOW);
+
+    expect(groups.awaitingCommit.map((item) => item.id)).toEqual(["awaiting"]);
+    expect(groups.working.map((item) => item.id)).toEqual(["standard", "exclusive"]);
+
+    const markup = renderToStaticMarkup(
+      <WorkView
+        dashboard={dashboard({
+          leases: [awaiting, standard, exclusive, expired],
+          sessions: [{
+            id: "stopped-session",
+            memberId: "member-current",
+            status: "active",
+            lastSeenAt: "2026-08-27T08:00:00.000Z",
+            turnStoppedAt: "2026-08-27T08:00:00.000Z",
+            task: "已经停止的实时任务",
+          }],
+        })}
+        transientConflicts={[]}
+        now={LEASE_NOW}
+        onClaim={() => undefined}
+        onRenew={() => undefined}
+        onClose={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("会话已结束，等待提交");
+    expect(markup).toContain("等待提交的保护范围");
+    expect(markup).toContain("普通手动范围");
+    expect(markup).toContain("独占手动范围");
+    expect(markup).not.toContain("已经过期的手动范围");
+    expect(markup).not.toContain("已经停止的实时任务");
+    expect(markup).not.toContain('aria-label="Agent 实时活动"');
+  });
+
+  it("does not offer live-session actions for an automatic waiting lease", () => {
+    const markup = renderToStaticMarkup(
+      <WorkItem
+        lease={lease({ phase: "awaiting_commit" })}
+        own
+        busy={false}
+        now={LEASE_NOW}
+        onRenew={() => undefined}
+        onClose={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("会话已结束，等待提交");
+    expect(markup).toContain("10 分 00 秒后到期");
+    expect(markup).not.toContain("完成并释放");
+    expect(markup).not.toContain("延长保护时间");
   });
 });
 

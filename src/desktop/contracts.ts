@@ -46,6 +46,8 @@ export interface SaveRoomConnectionInput {
   memberRole?: "host" | "member";
   /** Local gate for Codex hooks and MCP. Omitted values preserve current state on update. */
   integrationEnabled?: boolean;
+  /** Whether Agent Hub has installed this connection into the local Codex config. */
+  codexIntegrationInstalled?: boolean;
 }
 
 export interface SavedRoomConnection {
@@ -58,6 +60,8 @@ export interface SavedRoomConnection {
   /** Missing only for legacy v0.2.0 documents that did not persist the role. */
   memberRole?: "host" | "member";
   integrationEnabled: boolean;
+  /** Undefined only for legacy documents whose Codex installation intent has not been migrated yet. */
+  codexIntegrationInstalled?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -90,7 +94,7 @@ export interface CodexInstallResult {
   mcpServerName: string;
   command: string;
   args: string[];
-  restartRequired: true;
+  restartRequired: boolean;
 }
 
 export type BootstrapRoomServerRequest =

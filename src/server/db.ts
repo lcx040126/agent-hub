@@ -135,6 +135,7 @@ export class AgentHubDatabase {
         validations_json TEXT NOT NULL DEFAULT '[]',
         remaining_risks_json TEXT NOT NULL DEFAULT '[]',
         handoff TEXT
+        ,automatic_phase TEXT NOT NULL DEFAULT 'working' CHECK (automatic_phase IN ('working', 'awaiting_commit'))
       );
       CREATE INDEX IF NOT EXISTS leases_room_status_idx
         ON leases(room_id, status, expires_at);
@@ -277,8 +278,26 @@ export class AgentHubDatabase {
         ,finalization_id TEXT
         ,finalizing_at TEXT
         ,finalization_error TEXT
+        ,codex_session_id TEXT
+        ,current_turn_id TEXT
+        ,activity_epoch INTEGER NOT NULL DEFAULT 0
+        ,turn_stopped_at TEXT
       );
       CREATE INDEX IF NOT EXISTS sessions_room_idx ON work_sessions(room_id, status);
+
+      CREATE TABLE IF NOT EXISTS session_operations (
+        session_id TEXT NOT NULL REFERENCES work_sessions(id) ON DELETE CASCADE,
+        operation_id TEXT NOT NULL,
+        operation_type TEXT NOT NULL CHECK (operation_type IN ('stop', 'resume', 'completion')),
+        turn_id TEXT NOT NULL,
+        activity_epoch INTEGER NOT NULL,
+        payload_hash TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, operation_id, operation_type)
+      );
+      CREATE INDEX IF NOT EXISTS session_operations_session_idx
+        ON session_operations(session_id, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS release_requests (
         id TEXT PRIMARY KEY,
@@ -425,6 +444,40 @@ export class AgentHubDatabase {
       CREATE INDEX IF NOT EXISTS feature_confirmations_session_idx
         ON feature_change_confirmations(session_id, status, expires_at);
     `);
+    const operationColumns = this.connection
+      .prepare("PRAGMA table_info(session_operations)")
+      .all() as Array<{ name: string; pk: number }>;
+    const operationPrimaryKey = operationColumns
+      .filter((column) => column.pk > 0)
+      .sort((left, right) => left.pk - right.pk)
+      .map((column) => column.name);
+    if (operationPrimaryKey.join(",") !== "session_id,operation_id,operation_type") {
+      this.connection.exec(`
+        DROP TABLE IF EXISTS session_operations_schema4_legacy;
+        ALTER TABLE session_operations RENAME TO session_operations_schema4_legacy;
+        CREATE TABLE session_operations (
+          session_id TEXT NOT NULL REFERENCES work_sessions(id) ON DELETE CASCADE,
+          operation_id TEXT NOT NULL,
+          operation_type TEXT NOT NULL CHECK (operation_type IN ('stop', 'resume', 'completion')),
+          turn_id TEXT NOT NULL,
+          activity_epoch INTEGER NOT NULL,
+          payload_hash TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (session_id, operation_id, operation_type)
+        );
+        INSERT OR IGNORE INTO session_operations (
+          session_id, operation_id, operation_type, turn_id, activity_epoch,
+          payload_hash, result_json, created_at
+        )
+        SELECT session_id, operation_id, operation_type, turn_id, activity_epoch,
+          payload_hash, result_json, created_at
+        FROM session_operations_schema4_legacy;
+        DROP TABLE session_operations_schema4_legacy;
+        CREATE INDEX IF NOT EXISTS session_operations_session_idx
+          ON session_operations(session_id, created_at DESC);
+      `);
+    }
     const leaseColumns = this.connection
       .prepare("PRAGMA table_info(leases)")
       .all() as Array<{ name: string }>;
@@ -436,6 +489,11 @@ export class AgentHubDatabase {
     if (!leaseColumns.some((column) => column.name === "kind")) {
       this.connection.exec(
         "ALTER TABLE leases ADD COLUMN kind TEXT NOT NULL DEFAULT 'standard' CHECK (kind IN ('automatic', 'standard', 'exclusive'))",
+      );
+    }
+    if (!leaseColumns.some((column) => column.name === "automatic_phase")) {
+      this.connection.exec(
+        "ALTER TABLE leases ADD COLUMN automatic_phase TEXT NOT NULL DEFAULT 'working' CHECK (automatic_phase IN ('working', 'awaiting_commit'))",
       );
     }
     this.connection.exec("CREATE INDEX IF NOT EXISTS leases_session_idx ON leases(session_id)");
@@ -468,6 +526,69 @@ export class AgentHubDatabase {
     if (!sessionColumns.some((column) => column.name === "finalization_id")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN finalization_id TEXT");
     if (!sessionColumns.some((column) => column.name === "finalizing_at")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN finalizing_at TEXT");
     if (!sessionColumns.some((column) => column.name === "finalization_error")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN finalization_error TEXT");
+    if (!sessionColumns.some((column) => column.name === "codex_session_id")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN codex_session_id TEXT");
+    if (!sessionColumns.some((column) => column.name === "current_turn_id")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN current_turn_id TEXT");
+    if (!sessionColumns.some((column) => column.name === "activity_epoch")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN activity_epoch INTEGER NOT NULL DEFAULT 0");
+    if (!sessionColumns.some((column) => column.name === "turn_stopped_at")) this.connection.exec("ALTER TABLE work_sessions ADD COLUMN turn_stopped_at TEXT");
+    this.connection.exec("DROP INDEX IF EXISTS sessions_codex_identity_idx");
+    const sessionIdentityRows = this.connection.prepare(`
+      SELECT id, metadata_json FROM work_sessions WHERE codex_session_id IS NULL
+    `).all() as Array<{ id: string; metadata_json: string }>;
+    const backfillSessionIdentity = this.connection.prepare(`
+      UPDATE work_sessions SET codex_session_id = ? WHERE id = ?
+    `);
+    for (const row of sessionIdentityRows) {
+      const codexSessionId = codexSessionIdFromMetadata(row.metadata_json);
+      if (codexSessionId) backfillSessionIdentity.run(codexSessionId, row.id);
+    }
+
+    const duplicateSessionRows = this.connection.prepare(`
+      SELECT id, room_id, member_id, codex_session_id, status, finalizing_at,
+        last_seen_at, opened_at
+      FROM work_sessions
+      WHERE codex_session_id IS NOT NULL AND closed_at IS NULL
+      ORDER BY room_id, member_id, codex_session_id,
+        CASE WHEN finalizing_at IS NOT NULL THEN 0 ELSE 1 END,
+        last_seen_at DESC, opened_at DESC, id DESC
+    `).all() as Array<{
+      id: string;
+      room_id: string;
+      member_id: string;
+      codex_session_id: string;
+      status: string;
+      finalizing_at: string | null;
+      last_seen_at: string;
+      opened_at: string;
+    }>;
+    const canonicalSessions = new Set<string>();
+    const closeDuplicateSession = this.connection.prepare(`
+      UPDATE work_sessions SET
+        status = 'closed', closed_at = COALESCE(closed_at, last_seen_at),
+        finalizing_at = NULL,
+        finalization_error = COALESCE(finalization_error, 'Superseded duplicate Codex session during schema 4 migration.')
+      WHERE id = ?
+    `);
+    const cancelDuplicateWorkingLease = this.connection.prepare(`
+      UPDATE leases SET
+        status = 'cancelled', completed_at = COALESCE(completed_at, ?), updated_at = ?,
+        completion_summary = COALESCE(completion_summary, 'Duplicate Codex session was canonicalized during schema 4 migration.')
+      WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+        AND automatic_phase = 'working'
+    `);
+    for (const row of duplicateSessionRows) {
+      const key = `${row.room_id}\u0000${row.member_id}\u0000${row.codex_session_id}`;
+      if (!canonicalSessions.has(key)) {
+        canonicalSessions.add(key);
+        continue;
+      }
+      closeDuplicateSession.run(row.id);
+      cancelDuplicateWorkingLease.run(row.last_seen_at, row.last_seen_at, row.id);
+    }
+    this.connection.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS sessions_codex_identity_idx
+      ON work_sessions(room_id, member_id, codex_session_id)
+      WHERE codex_session_id IS NOT NULL AND closed_at IS NULL
+    `);
 
     const scanColumns = this.connection.prepare("PRAGMA table_info(local_scans)").all() as Array<{ name: string }>;
     if (!scanColumns.some((column) => column.name === "finalization_id")) this.connection.exec("ALTER TABLE local_scans ADD COLUMN finalization_id TEXT");
@@ -502,4 +623,18 @@ function resolveDatabasePath(options: AgentHubDatabaseOptions): string {
   if (options.path) return resolve(options.path);
   const dataDir = options.dataDir ?? process.env.AGENT_HUB_DATA_DIR ?? join(process.cwd(), "data");
   return resolve(dataDir, "agent-hub.sqlite");
+}
+
+function codexSessionIdFromMetadata(value: string): string | null {
+  try {
+    const metadata: unknown = JSON.parse(value);
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
+    const record = metadata as Record<string, unknown>;
+    const candidate = record.codexSessionId ?? record.codex_session_id;
+    if (typeof candidate !== "string") return null;
+    const normalized = candidate.trim();
+    return normalized && normalized.length <= 200 ? normalized : null;
+  } catch {
+    return null;
+  }
 }

@@ -6,6 +6,7 @@ import { startCodexSessionHeartbeatScheduler } from "./codex-session-heartbeat.j
 import { CodexHookStateStore, type CodexHookSessionState } from "./hook-state.js";
 import { IntegrationOperationTracker } from "./integration-operations.js";
 import { PausePreparationQueue } from "./pause-preparation.js";
+import { TurnCompletionQueueStore } from "./turn-completion-queue.js";
 
 const cleanup: string[] = [];
 
@@ -21,9 +22,10 @@ describe("Codex session heartbeat scheduler", () => {
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       expect(String(_url)).toContain(`/api/sessions/${state.hubSessionId}/heartbeat`);
       expect(JSON.parse(String(init?.body))).toMatchObject({
-        clientVersion: "0.2.1",
+        clientVersion: "0.2.3",
         protocolVersion: 1,
-        schemaVersion: 3,
+        schemaVersion: 4,
+        activityEpoch: 0,
       });
       return jsonResponse(200, { session: { id: state.hubSessionId }, renewedLeases: [] });
     }) as typeof fetch;
@@ -38,7 +40,7 @@ describe("Codex session heartbeat scheduler", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  it("removes ordinary Hook state instead of heartbeating after real activity becomes stale", async () => {
+  it("stops heartbeating but preserves ordinary Hook evidence after real activity becomes stale", async () => {
     const userDataPath = await temporaryUserData();
     const stateStore = new CodexHookStateStore(userDataPath);
     await stateStore.save(hookState());
@@ -57,10 +59,10 @@ describe("Codex session heartbeat scheduler", () => {
 
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(store.get).not.toHaveBeenCalled();
-    await expect(stateStore.load(saved.codexSessionId)).resolves.toBeUndefined();
+    await expect(stateStore.load(saved.codexSessionId)).resolves.toBeDefined();
   });
 
-  it("extends a pending write beyond normal freshness but removes it at its hard deadline", async () => {
+  it("extends a pending write beyond normal freshness but only stops heartbeats at its hard deadline", async () => {
     const userDataPath = await temporaryUserData();
     const stateStore = new CodexHookStateStore(userDataPath);
     const state = hookState();
@@ -102,10 +104,10 @@ describe("Codex session heartbeat scheduler", () => {
     await expiredScheduler.scanNow();
     await expiredScheduler.stop();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
-    await expect(stateStore.load(saved.codexSessionId)).resolves.toBeUndefined();
+    await expect(stateStore.load(saved.codexSessionId)).resolves.toBeDefined();
   });
 
-  it("removes stale Hook state when the server rejects an inactive session", async () => {
+  it("preserves Hook evidence when a stopped or stale fence returns 409", async () => {
     const userDataPath = await temporaryUserData();
     const state = hookState();
     const stateStore = new CodexHookStateStore(userDataPath);
@@ -121,7 +123,35 @@ describe("Codex session heartbeat scheduler", () => {
     });
     await scheduler.scanNow();
     await scheduler.stop();
-    await expect(stateStore.load(state.codexSessionId)).resolves.toBeUndefined();
+    await expect(stateStore.load(state.codexSessionId)).resolves.toBeDefined();
+  });
+
+  it("does not renew heartbeats while a durable completion job awaits a commit", async () => {
+    const userDataPath = await temporaryUserData();
+    const state = hookState();
+    state.repositoryPath = userDataPath;
+    state.leases = [{ id: "lease-1", paths: ["src/task.ts"], expiresAt: "2099-01-01T00:00:00.000Z" }];
+    await new CodexHookStateStore(userDataPath).save(state);
+    await new TurnCompletionQueueStore(userDataPath).enqueue({
+      operationId: "completion-heartbeat",
+      turnId: "turn-1",
+      activityEpoch: 0,
+      state,
+    });
+    const store = connectionLookup();
+    const fetchImpl = vi.fn<typeof fetch>();
+    const scheduler = startCodexSessionHeartbeatScheduler({
+      userDataPath,
+      store,
+      fetchImpl,
+      intervalMs: 60_000,
+    });
+    await scheduler.scanNow();
+    await scheduler.stop();
+
+    expect(store.get).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(new CodexHookStateStore(userDataPath).load(state.codexSessionId)).resolves.toBeDefined();
   });
 
   it("does not heartbeat or read credentials while exit cleanup is pending", async () => {

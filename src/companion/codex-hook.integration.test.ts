@@ -20,6 +20,7 @@ import { PausePreparationQueue } from "./pause-preparation.js";
 import { startRuntimePresence, type RuntimePresenceHandle } from "./runtime-presence.js";
 import { SessionEndQueueStore } from "./session-end-queue.js";
 import { startSessionEndFinalizationWorker } from "./session-end-worker.js";
+import { TurnCompletionQueueStore } from "./turn-completion-queue.js";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -78,6 +79,65 @@ describe("Codex hook integration", () => {
 
     expect(list).toHaveBeenCalledOnce();
     expect(fetchImpl).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it("recovers a higher stopped activity epoch when the server reuses a Codex session", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-epoch-recovery-"));
+    temporaryDirectories.push(root);
+    const repository = path.join(root, "repository");
+    const userDataPath = path.join(root, "user-data");
+    await createRepository(repository);
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+    const store = new ConnectionStore(path.join(userDataPath, "connections.json"), protector);
+    await store.save({
+      serverUrl: "http://agent-hub.test:4173",
+      memberToken: "member-token",
+      repositoryPath: repository,
+    });
+    const stoppedAt = "2026-08-27T00:00:00.000Z";
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      const pathname = new URL(String(input)).pathname;
+      if (pathname === "/api/sessions") {
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          codexSessionId: "reused-codex-session",
+          activityEpoch: 0,
+        });
+        return jsonResponse({
+          session: {
+            id: "hub-reused",
+            currentTurnId: "turn-9",
+            activityEpoch: 9,
+            turnStoppedAt: stoppedAt,
+          },
+        });
+      }
+      if (pathname === "/api/snapshot") return jsonResponse({});
+      if (pathname === "/api/features/query") return jsonResponse({ cards: [] });
+      if (pathname.endsWith("/scan")) return jsonResponse({});
+      throw new Error(`Unexpected request: ${pathname}`);
+    });
+
+    await handleCodexHook({
+      eventName: "SessionStart",
+      userDataPath,
+      protector,
+      fetchImpl,
+    }, {
+      session_id: "reused-codex-session",
+      cwd: repository,
+      hook_event_name: "SessionStart",
+      source: "resume",
+    });
+
+    await expect(new CodexHookStateStore(userDataPath).load("reused-codex-session"))
+      .resolves.toMatchObject({
+        hubSessionId: "hub-reused",
+        activityEpoch: 9,
+        currentTurnId: "turn-9",
+        pendingCompletion: { phase: "stopped", activityEpoch: 9, recordedAt: stoppedAt },
+      });
   }, 10_000);
 
   it("keeps an in-flight hook registered until pause cleanup can choose its cutoff", async () => {
@@ -323,6 +383,13 @@ describe("Codex hook integration", () => {
       openedAt: "2026-08-27T00:00:00.000Z",
       updatedAt: "2026-08-27T00:00:00.000Z",
     });
+    const completionQueue = new TurnCompletionQueueStore(userDataPath);
+    await completionQueue.enqueue({
+      operationId: "completion-before-session-end",
+      turnId: "turn-before-end",
+      activityEpoch: 0,
+      state: (await stateStore.load("inactive-session"))!,
+    });
     const options: RunCodexHookOptions = {
       eventName: "SessionEnd",
       userDataPath,
@@ -339,6 +406,7 @@ describe("Codex hook integration", () => {
     await expect(handleCodexHook(options, input)).resolves.toBeUndefined();
     await expect(stateStore.load(input.session_id)).resolves.toBeUndefined();
     await expect(new SessionEndQueueStore(userDataPath).list()).resolves.toHaveLength(1);
+    await expect(completionQueue.list()).resolves.toHaveLength(1);
     expect(options.fetchImpl).not.toHaveBeenCalled();
   });
 

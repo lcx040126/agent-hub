@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { AttributedPathEvidence } from "./turn-completion.js";
 
 export interface HookLeaseState {
   id: string;
@@ -37,6 +38,14 @@ export interface HookExternalChangeDiagnostic {
   detectedAt: string;
 }
 
+export interface HookPendingCompletionState {
+  operationId: string;
+  turnId: string;
+  activityEpoch: number;
+  phase: "awaiting_commit" | "stopped" | "resuming";
+  recordedAt: string;
+}
+
 export interface CodexHookSessionState {
   version: 1;
   codexSessionId: string;
@@ -52,6 +61,10 @@ export interface CodexHookSessionState {
   observedChangedFingerprints: Record<string, string>;
   attributedChangedPaths?: string[];
   attributedPathsTruncated?: boolean;
+  attributedPathEvidence?: AttributedPathEvidence[];
+  activityEpoch?: number;
+  currentTurnId?: string;
+  pendingCompletion?: HookPendingCompletionState;
   leases: HookLeaseState[];
   pendingWrite?: HookPendingWriteState;
   externalChangeDiagnostics?: HookExternalChangeDiagnostic[];
@@ -181,6 +194,18 @@ export function parseState(raw: string): CodexHookSessionState {
       ? undefined
       : stringArray(value.attributedChangedPaths),
     attributedPathsTruncated: value.attributedPathsTruncated === true,
+    attributedPathEvidence: value.attributedPathEvidence === undefined
+      ? undefined
+      : parseAttributedPathEvidence(value.attributedPathEvidence),
+    activityEpoch: value.activityEpoch === undefined
+      ? 0
+      : nonNegativeInteger(value.activityEpoch, "activity epoch"),
+    currentTurnId: value.currentTurnId === undefined
+      ? undefined
+      : requiredText(value.currentTurnId, "current turn ID"),
+    pendingCompletion: value.pendingCompletion === undefined
+      ? undefined
+      : parsePendingCompletion(value.pendingCompletion),
     leases: Array.isArray(value.leases) ? value.leases.map(parseLease) : [],
     pendingWrite: value.pendingWrite === undefined ? undefined : parsePendingWrite(value.pendingWrite),
     externalChangeDiagnostics: value.externalChangeDiagnostics === undefined
@@ -195,6 +220,33 @@ export function parseState(raw: string): CodexHookSessionState {
     quarantine: value.quarantine === undefined ? undefined : parseQuarantine(value.quarantine),
     openedAt: isoText(value.openedAt, "openedAt"),
     updatedAt: isoText(value.updatedAt, "updatedAt"),
+  };
+}
+
+function parseAttributedPathEvidence(value: unknown): AttributedPathEvidence[] {
+  if (!Array.isArray(value)) throw new Error("The Agent Hub hook state contains invalid attributed path evidence.");
+  return value.map((entry) => {
+    if (!isRecord(entry)) throw new Error("The Agent Hub hook state contains invalid attributed path evidence.");
+    return {
+      path: requiredText(entry.path, "attributed evidence path"),
+      baseEntry: nullableGitEntry(entry.baseEntry),
+      attributedEntry: nullableGitEntry(entry.attributedEntry),
+    };
+  });
+}
+
+function parsePendingCompletion(value: unknown): HookPendingCompletionState {
+  if (!isRecord(value)) throw new Error("The Agent Hub hook state contains an invalid pending completion.");
+  const phase = requiredText(value.phase, "pending completion phase");
+  if (phase !== "awaiting_commit" && phase !== "stopped" && phase !== "resuming") {
+    throw new Error("The Agent Hub hook state contains an invalid pending completion phase.");
+  }
+  return {
+    operationId: requiredIdentifier(value.operationId, "completion operation ID"),
+    turnId: requiredText(value.turnId, "completion turn ID"),
+    activityEpoch: nonNegativeInteger(value.activityEpoch, "completion activity epoch"),
+    phase,
+    recordedAt: isoText(value.recordedAt, "pending completion recordedAt"),
   };
 }
 
@@ -273,6 +325,18 @@ function stringMap(value: unknown): Record<string, string> {
     result[key.trim()] = entry.trim();
   }
   return result;
+}
+
+function nullableGitEntry(value: unknown): string | null {
+  if (value === null) return null;
+  const text = requiredText(value, "Git content entry");
+  if (text === "missing" || /^blob:[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(text)) return text;
+  throw new Error("The Agent Hub hook state contains an invalid Git content entry.");
+}
+
+function nonNegativeInteger(value: unknown, name: string): number {
+  if (!Number.isInteger(value) || Number(value) < 0) throw new Error(`The ${name} is invalid.`);
+  return Number(value);
 }
 
 function requiredText(value: unknown, name: string): string {

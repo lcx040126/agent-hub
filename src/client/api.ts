@@ -56,6 +56,7 @@ export type Lease = {
   highRiskPaths: string[];
   mode: "write" | "read";
   kind: "automatic" | "standard" | "exclusive";
+  phase?: "working" | "awaiting_commit";
   status: string;
   createdAt?: string;
   expiresAt?: string;
@@ -112,6 +113,7 @@ export type AgentSession = {
   baseCommit?: string;
   status: string;
   lastSeenAt?: string;
+  turnStoppedAt?: string;
   clientVersion?: string;
   protocolVersion?: number;
   schemaVersion?: number;
@@ -259,7 +261,7 @@ type DesktopApi = {
   installCodexIntegration(connectionId: string): Promise<{
     configPath: string;
     mcpServerName: string;
-    restartRequired: true;
+    restartRequired: boolean;
   }>;
   getDesktopUpdateStatus(): Promise<DesktopUpdateStatus>;
   checkDesktopUpdate(): Promise<DesktopUpdateStatus>;
@@ -478,6 +480,7 @@ function normalizeLease(value: unknown): Lease {
   const member = asObject(lease.member);
   const normalizedPaths = pathValues(lease.paths);
   const detailedPaths = pathValues(lease.pathDetails);
+  const phase = asString(lease.phase);
   return {
     id: asString(lease.id),
     title: asString(lease.title, "未命名工作"),
@@ -492,6 +495,7 @@ function normalizeLease(value: unknown): Lease {
     kind: ["automatic", "standard", "exclusive"].includes(asString(lease.kind))
       ? asString(lease.kind) as Lease["kind"]
       : "standard",
+    phase: phase === "awaiting_commit" ? "awaiting_commit" : "working",
     status: asString(lease.status, "active"),
     createdAt: asString(lease.createdAt) || undefined,
     updatedAt: asString(lease.updatedAt) || undefined,
@@ -697,6 +701,7 @@ function normalizeAgentSession(value: unknown): AgentSession {
     baseCommit: asString(session.baseCommit) || undefined,
     status: asString(session.status, "active"),
     lastSeenAt: asString(session.lastSeenAt) || undefined,
+    turnStoppedAt: asString(session.turnStoppedAt) || undefined,
     clientVersion: asString(session.clientVersion) || undefined,
     protocolVersion: typeof session.protocolVersion === "number" ? session.protocolVersion : undefined,
     schemaVersion: typeof session.schemaVersion === "number" ? session.schemaVersion : undefined,
@@ -1134,7 +1139,9 @@ export async function installCodexConnection(connectionId: string): Promise<stri
   if (!desktop) throw new Error("请在 Agent Hub 桌面客户端中安装 Codex 连接。");
   try {
     const result = await desktop.installCodexIntegration(connectionId);
-    return `${result.mcpServerName} 已安装，重启 Codex 后生效。`;
+    return result.restartRequired
+      ? `${result.mcpServerName} 已安装，重启 Codex 后生效。`
+      : `${result.mcpServerName} 配置已经是最新版本。`;
   } catch (error) {
     throw friendlyDesktopError(error);
   }

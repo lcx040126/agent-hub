@@ -43,6 +43,291 @@ describe("Agent Hub database migrations", () => {
     );
   });
 
+  it("backfills and canonicalizes duplicate Codex sessions in an older schema 4 database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-hub-schema4-session-db-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "agent-hub.sqlite");
+    const memberToken = "ahm_schema4_duplicate_member_token";
+    const tokenHash = createHash("sha256").update(memberToken, "utf8").digest("hex");
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE rooms (
+        id TEXT PRIMARY KEY,
+        code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        name TEXT NOT NULL,
+        project_name TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE members (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('host', 'member')),
+        client_name TEXT,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+      CREATE TABLE work_sessions (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        client_name TEXT,
+        agent_name TEXT,
+        repository TEXT,
+        branch TEXT,
+        worktree TEXT,
+        base_commit TEXT,
+        task TEXT,
+        status TEXT NOT NULL CHECK (status IN ('active', 'frozen', 'closed')),
+        branch_epoch INTEGER NOT NULL DEFAULT 1,
+        frozen_reason TEXT,
+        metadata_json TEXT NOT NULL,
+        opened_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        closed_at TEXT,
+        client_version TEXT,
+        protocol_version INTEGER,
+        schema_version INTEGER,
+        finalization_id TEXT,
+        finalizing_at TEXT,
+        finalization_error TEXT,
+        codex_session_id TEXT,
+        current_turn_id TEXT,
+        activity_epoch INTEGER NOT NULL DEFAULT 0,
+        turn_stopped_at TEXT
+      );
+      CREATE TABLE leases (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        session_id TEXT REFERENCES work_sessions(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        intent TEXT NOT NULL,
+        branch TEXT,
+        base_commit TEXT,
+        mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
+        kind TEXT NOT NULL DEFAULT 'standard' CHECK (kind IN ('automatic', 'standard', 'exclusive')),
+        status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'cancelled', 'expired')),
+        decision TEXT NOT NULL CHECK (decision IN ('allow', 'warn', 'deny')),
+        override_reason TEXT,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        completion_summary TEXT,
+        outcome TEXT,
+        changed_paths_json TEXT NOT NULL DEFAULT '[]',
+        commit_hash TEXT,
+        validations_json TEXT NOT NULL DEFAULT '[]',
+        remaining_risks_json TEXT NOT NULL DEFAULT '[]',
+        handoff TEXT,
+        automatic_phase TEXT NOT NULL DEFAULT 'working' CHECK (automatic_phase IN ('working', 'awaiting_commit'))
+      );
+      INSERT INTO rooms VALUES (
+        'room-1', 'ROOM0001', 'Room', 'Project', 'https://example.invalid/repo.git',
+        'main', '2026-08-27T08:00:00.000Z'
+      );
+      INSERT INTO members VALUES (
+        'member-1', 'room-1', 'Alice', 'host', 'Codex', '${tokenHash}',
+        '2026-08-27T08:00:00.000Z', '2026-08-27T10:00:00.000Z'
+      );
+      INSERT INTO work_sessions (
+        id, room_id, member_id, status, metadata_json, opened_at, last_seen_at,
+        finalization_id, finalizing_at, current_turn_id, activity_epoch, turn_stopped_at
+      ) VALUES
+        (
+          'session-finalizing', 'room-1', 'member-1', 'active',
+          '{"codexSessionId":"codex-duplicate"}',
+          '2026-08-27T08:00:00.000Z', '2026-08-27T09:00:00.000Z',
+          'finalization-1', '2026-08-27T09:00:00.000Z', NULL, 0, NULL
+        ),
+        (
+          'session-newer', 'room-1', 'member-1', 'active',
+          '{"codexSessionId":"codex-duplicate"}',
+          '2026-08-27T08:30:00.000Z', '2026-08-27T10:00:00.000Z',
+          NULL, NULL, 'turn-finalizing-loser', 7, '2026-08-27T10:00:00.000Z'
+        ),
+        (
+          'session-active-newer', 'room-1', 'member-1', 'active',
+          '{"codexSessionId":"codex-active"}',
+          '2026-08-27T09:00:00.000Z', '2026-08-27T11:00:00.000Z',
+          NULL, NULL, NULL, 0, NULL
+        ),
+        (
+          'session-active-older', 'room-1', 'member-1', 'active',
+          '{"codexSessionId":"codex-active"}',
+          '2026-08-27T08:00:00.000Z', '2026-08-27T08:30:00.000Z',
+          NULL, NULL, 'turn-active-loser', 4, '2026-08-27T08:30:00.000Z'
+        );
+      INSERT INTO leases (
+        id, room_id, member_id, session_id, title, intent, mode, kind, status,
+        decision, expires_at, created_at, updated_at, automatic_phase
+      ) VALUES
+        (
+          'canonical-auto', 'room-1', 'member-1', 'session-finalizing',
+          'Canonical automatic', '', 'write', 'automatic', 'active', 'allow',
+          '2026-08-27T12:00:00.000Z', '2026-08-27T08:00:00.000Z', '2026-08-27T08:00:00.000Z',
+          'working'
+        ),
+        (
+          'duplicate-auto', 'room-1', 'member-1', 'session-newer',
+          'Duplicate automatic', '', 'write', 'automatic', 'active', 'allow',
+          '2026-08-27T12:00:00.000Z', '2026-08-27T08:30:00.000Z', '2026-08-27T08:30:00.000Z',
+          'working'
+        ),
+        (
+          'duplicate-finalizing-awaiting', 'room-1', 'member-1', 'session-newer',
+          'Duplicate pending automatic', '', 'write', 'automatic', 'active', 'allow',
+          '2026-08-27T12:00:00.000Z', '2026-08-27T08:30:00.000Z', '2026-08-27T08:30:00.000Z',
+          'awaiting_commit'
+        ),
+        (
+          'duplicate-standard', 'room-1', 'member-1', 'session-newer',
+          'Duplicate manual', '', 'write', 'standard', 'active', 'allow',
+          '2026-08-27T12:00:00.000Z', '2026-08-27T08:30:00.000Z', '2026-08-27T08:30:00.000Z',
+          'working'
+        ),
+        (
+          'preserved-active-awaiting', 'room-1', 'member-1', 'session-active-older',
+          'Preserved pending automatic', '', 'write', 'automatic', 'active', 'allow',
+          '2026-08-27T12:00:00.000Z', '2026-08-27T08:00:00.000Z', '2026-08-27T08:00:00.000Z',
+          'awaiting_commit'
+        );
+      PRAGMA user_version = 4;
+    `);
+    legacy.close();
+
+    const migrated = new AgentHubDatabase({ path: databasePath });
+    expect(migrated.connection.prepare(`
+      SELECT id, codex_session_id, status, closed_at, finalizing_at
+      FROM work_sessions WHERE codex_session_id = 'codex-duplicate' ORDER BY id
+    `).all()).toEqual([
+      {
+        id: "session-finalizing",
+        codex_session_id: "codex-duplicate",
+        status: "active",
+        closed_at: null,
+        finalizing_at: "2026-08-27T09:00:00.000Z",
+      },
+      {
+        id: "session-newer",
+        codex_session_id: "codex-duplicate",
+        status: "closed",
+        closed_at: "2026-08-27T10:00:00.000Z",
+        finalizing_at: null,
+      },
+    ]);
+    expect(migrated.connection.prepare(`
+      SELECT id, codex_session_id, status, closed_at, finalizing_at
+      FROM work_sessions WHERE codex_session_id = 'codex-active' ORDER BY id
+    `).all()).toEqual([
+      {
+        id: "session-active-newer",
+        codex_session_id: "codex-active",
+        status: "active",
+        closed_at: null,
+        finalizing_at: null,
+      },
+      {
+        id: "session-active-older",
+        codex_session_id: "codex-active",
+        status: "closed",
+        closed_at: "2026-08-27T08:30:00.000Z",
+        finalizing_at: null,
+      },
+    ]);
+    expect(migrated.connection.prepare(`
+      SELECT id, session_id, status, automatic_phase, expires_at FROM leases ORDER BY id
+    `).all()).toEqual([
+      { id: "canonical-auto", session_id: "session-finalizing", status: "active", automatic_phase: "working", expires_at: "2026-08-27T12:00:00.000Z" },
+      { id: "duplicate-auto", session_id: "session-newer", status: "cancelled", automatic_phase: "working", expires_at: "2026-08-27T12:00:00.000Z" },
+      { id: "duplicate-finalizing-awaiting", session_id: "session-newer", status: "active", automatic_phase: "awaiting_commit", expires_at: "2026-08-27T12:00:00.000Z" },
+      { id: "duplicate-standard", session_id: "session-newer", status: "active", automatic_phase: "working", expires_at: "2026-08-27T12:00:00.000Z" },
+      { id: "preserved-active-awaiting", session_id: "session-active-older", status: "active", automatic_phase: "awaiting_commit", expires_at: "2026-08-27T12:00:00.000Z" },
+    ]);
+    expect(migrated.connection.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_operations'
+    `).get()).toEqual({ name: "session_operations" });
+    expect(migrated.connection.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'sessions_codex_identity_idx'
+    `).get()).toEqual({ name: "sessions_codex_identity_idx" });
+    expect(migrated.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 4 });
+    expect(migrated.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    migrated.close();
+
+    const reopened = new AgentHubDatabase({ path: databasePath });
+    expect(reopened.connection.prepare(`
+      SELECT COUNT(*) AS count FROM work_sessions
+      WHERE codex_session_id = 'codex-duplicate' AND closed_at IS NULL
+    `).get()).toEqual({ count: 1 });
+    expect(reopened.connection.prepare(`
+      SELECT COUNT(*) AS count FROM work_sessions
+      WHERE codex_session_id = 'codex-active' AND closed_at IS NULL
+    `).get()).toEqual({ count: 1 });
+    expect(reopened.connection.prepare(`
+      SELECT status FROM leases WHERE id = 'duplicate-standard'
+    `).get()).toEqual({ status: "active" });
+    expect(reopened.connection.prepare(`
+      SELECT session_id, status FROM leases WHERE id = 'preserved-active-awaiting'
+    `).get()).toEqual({ session_id: "session-active-older", status: "active" });
+    expect(reopened.connection.prepare(`
+      SELECT session_id, status, automatic_phase, expires_at
+      FROM leases WHERE id = 'duplicate-finalizing-awaiting'
+    `).get()).toEqual({
+      session_id: "session-newer",
+      status: "active",
+      automatic_phase: "awaiting_commit",
+      expires_at: "2026-08-27T12:00:00.000Z",
+    });
+
+    const service = new AgentHubService(reopened, {
+      now: () => new Date("2026-08-27T11:30:00.000Z"),
+    });
+    expect(service.completeSessionActivity({
+      memberToken,
+      sessionId: "session-newer",
+      operationId: "completion-finalizing-loser",
+      turnId: "turn-finalizing-loser",
+      activityEpoch: 7,
+      outcome: "committed",
+      leaseIds: ["duplicate-finalizing-awaiting"],
+      attributedPaths: ["src/finalizing-loser.ts"],
+      baseCommit: "base-finalizing",
+      headCommit: "head-finalizing",
+    })).toMatchObject({
+      result: "released",
+      releasedLeaseIds: ["duplicate-finalizing-awaiting"],
+    });
+    expect(service.completeSessionActivity({
+      memberToken,
+      sessionId: "session-active-older",
+      operationId: "completion-active-loser",
+      turnId: "turn-active-loser",
+      activityEpoch: 4,
+      outcome: "committed",
+      leaseIds: ["preserved-active-awaiting"],
+      attributedPaths: ["src/active-loser.ts"],
+      baseCommit: "base-active",
+      headCommit: "head-active",
+    })).toMatchObject({
+      result: "released",
+      releasedLeaseIds: ["preserved-active-awaiting"],
+    });
+    expect(reopened.connection.prepare(`
+      SELECT id, status FROM leases
+      WHERE id IN ('duplicate-finalizing-awaiting', 'preserved-active-awaiting')
+      ORDER BY id
+    `).all()).toEqual([
+      { id: "duplicate-finalizing-awaiting", status: "cancelled" },
+      { id: "preserved-active-awaiting", status: "cancelled" },
+    ]);
+    reopened.close();
+  });
+
   it("adds lease session ownership to a legacy database without losing data", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-hub-legacy-db-"));
     temporaryDirectories.push(directory);
@@ -145,6 +430,7 @@ describe("Agent Hub database migrations", () => {
       .all() as Array<{ name: string }>;
     expect(columns.filter((column) => column.name === "session_id")).toHaveLength(1);
     expect(columns.filter((column) => column.name === "kind")).toHaveLength(1);
+    expect(columns.filter((column) => column.name === "automatic_phase")).toHaveLength(1);
     expect(database.connection
       .prepare("SELECT id, session_id, kind FROM leases WHERE id = 'legacy-lease'")
       .get()).toEqual({ id: "legacy-lease", session_id: null, kind: "standard" });

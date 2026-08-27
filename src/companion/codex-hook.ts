@@ -46,11 +46,18 @@ import {
   SessionEndQueueStore,
   type SessionEndQueueJob,
 } from "./session-end-queue.js";
+import { TurnCompletionQueueStore, type TurnCompletionJob } from "./turn-completion-queue.js";
+import {
+  processTurnCompletionJob,
+  resumePendingTurnCompletion,
+} from "./turn-completion-worker.js";
+import { collectAttributedPathEvidence, type AttributedPathEvidence } from "./turn-completion.js";
 
 export type CodexHookEventName =
   | "SessionStart"
   | "PreToolUse"
   | "PostToolUse"
+  | "Stop"
   | "SessionEnd";
 
 export interface RunCodexHookOptions {
@@ -74,6 +81,8 @@ export interface CodexHookInput {
   tool_input?: unknown;
   source?: string;
   reason?: string;
+  turn_id?: string;
+  stop_hook_active?: boolean;
 }
 
 interface HookRuntime {
@@ -122,9 +131,9 @@ const MAX_SESSION_FEATURE_PATHS = 100;
 const LEASE_TTL_MINUTES = 10;
 
 export async function runCodexHook(options: RunCodexHookOptions): Promise<number> {
-  const input = parseHookInput(await readHookInput(options.stdin ?? process.stdin));
   const output = options.stdout ?? process.stdout;
   try {
+    const input = parseHookInput(await readHookInput(options.stdin ?? process.stdin));
     const result = await handleCodexHook(options, input);
     if (result !== undefined) output.write(`${JSON.stringify(result)}\n`);
     return 0;
@@ -145,6 +154,14 @@ export async function handleCodexHook(
   if (options.eventName === "SessionEnd") {
     await handleSessionEnd(options, input);
     return undefined;
+  }
+  if (options.eventName === "Stop") {
+    try {
+      await handleStop(options, input);
+    } catch {
+      // Stop 不能延长或阻塞 Codex 回合；持久化失败也由后续写入或租约 TTL 兜底。
+    }
+    return { continue: true };
   }
   const runtimePresence = await getRuntimeIntegrationStatus(
     options.userDataPath,
@@ -202,6 +219,8 @@ async function dispatchCodexHook(
       return handlePreToolUse(options, input, record);
     case "PostToolUse":
       return handlePostToolUse(options, input, record);
+    case "Stop":
+      return { continue: true };
     case "SessionEnd":
       return undefined;
   }
@@ -279,6 +298,18 @@ async function handlePreToolUse(
       + " 请停止新增修改，人工检查现有 Git 差异，并结束当前 Codex 会话后再继续。",
     );
   }
+  await resumePendingTurnCompletion({
+    userDataPath: options.userDataPath,
+    state: runtime.state,
+    stateStore: runtime.stateStore,
+    client: runtime.client,
+    turnId: completionTurnId(input, (runtime.state.activityEpoch ?? 0) + 1),
+  });
+  const currentTurnId = completionTurnId(input, runtime.state.activityEpoch ?? 0);
+  if (runtime.state.currentTurnId !== currentTurnId) {
+    runtime.state.currentTurnId = currentTurnId;
+    await runtime.stateStore.save(runtime.state);
+  }
   const paths = normalizeCandidates(
     runtime.git.repositoryRoot,
     mapRepositoryCwd(
@@ -344,6 +375,8 @@ async function handlePreToolUse(
       intent: `由 ${input.tool_name ?? "写入工具"} 在实际修改前自动领取`,
       branch: runtime.git.branch,
       baseCommit: runtime.git.headCommit,
+      turnId: runtime.state.currentTurnId,
+      activityEpoch: runtime.state.activityEpoch ?? 0,
       paths,
       proposedEdits,
     });
@@ -464,6 +497,16 @@ async function handlePostToolUse(
   runtime.state.attributedPathsTruncated = runtime.state.attributedPathsTruncated === true
     || accumulatedAttributedPaths.length > MAX_SESSION_FEATURE_PATHS;
   runtime.state.attributedChangedPaths = accumulatedAttributedPaths.slice(0, MAX_SESSION_FEATURE_PATHS);
+  const pathEvidence = await collectAttributedPathEvidence(
+    runtime.git.repositoryRoot,
+    runtime.state.baseCommit,
+    newlyObserved,
+    { gitExecutable: options.gitExecutable },
+  );
+  runtime.state.attributedPathEvidence = mergeAttributedPathEvidence(
+    runtime.state.attributedPathEvidence ?? [],
+    pathEvidence,
+  );
   if (targetedInspection) mergeTargetedObservation(runtime.state, repositoryTargets, runtime.git);
   else {
     runtime.state.observedChangedPaths = [...runtime.git.changedPaths];
@@ -505,6 +548,8 @@ async function handlePostToolUse(
     intent: `由 ${input.tool_name ?? "写入工具"} 产生的已识别增量`,
     branch: runtime.git.branch,
     baseCommit: runtime.state.baseCommit,
+    turnId: runtime.state.currentTurnId,
+    activityEpoch: runtime.state.activityEpoch ?? 0,
     paths: newlyObserved,
     proposedEdits,
   });
@@ -548,6 +593,77 @@ async function handlePostToolUse(
         `${reason}\n写入已经发生，Agent 必须停止继续修改并保留现有差异；人工、IDE 或 Unity 的无关变化没有被上传为风险。`,
     },
   };
+}
+
+async function handleStop(
+  options: RunCodexHookOptions,
+  input: CodexHookInput,
+): Promise<void> {
+  const stateStore = new CodexHookStateStore(options.userDataPath);
+  const state = await stateStore.load(input.session_id);
+  if (!state || (state.pendingCompletion && state.pendingCompletion.phase !== "awaiting_commit")) return;
+
+  const queue = new TurnCompletionQueueStore(options.userDataPath);
+  const activityEpoch = state.activityEpoch ?? 0;
+  const existingJobs = await queue.listForSession(state.codexSessionId);
+  let job = existingJobs.find((candidate) =>
+    candidate.activityEpoch === activityEpoch
+    && candidate.operationId === state.pendingCompletion?.operationId);
+  if (!job) {
+    const operationId = state.pendingCompletion?.activityEpoch === activityEpoch
+      ? state.pendingCompletion.operationId
+      : randomUUID();
+    const turnId = state.pendingCompletion?.activityEpoch === activityEpoch
+      ? state.pendingCompletion.turnId
+      : completionTurnId(input, activityEpoch);
+    // 持久化队列是 Stop 的第一项不可逆动作；Git 和网络检查只能发生在它之后。
+    job = await queue.enqueue({ operationId, turnId, activityEpoch, state });
+  }
+  state.pendingCompletion = {
+    operationId: job.operationId,
+    turnId: job.turnId,
+    activityEpoch: job.activityEpoch,
+    phase: "awaiting_commit",
+    recordedAt: job.createdAt,
+  };
+  state.currentTurnId = job.turnId;
+  await stateStore.save(state);
+
+  try {
+    await new IntegrationOperationTracker(options.userDataPath).run(state.connectionId, async () => {
+      const record = await resolveConnectionRecordById(
+        options.userDataPath,
+        state.connectionId,
+        options.protector,
+      );
+      if (!record) return;
+      const integration = await getLocalIntegrationStatus(
+        options.userDataPath,
+        record.connection,
+        options.runtimePresencePath,
+      );
+      if (!integration.active || !integration.remoteAllowed) return;
+      const resolved = await hydrateConnectionRecord(record);
+      const client = new AgentHubClient({
+        serverUrl: resolved.connection.serverUrl,
+        memberToken: resolved.memberToken,
+        fetchImpl: options.fetchImpl,
+        timeoutMs: 500,
+      });
+      await queue.runExclusive(job!.operationId, async () => {
+        const pending = await processTurnCompletionJob(job!, {
+          userDataPath: options.userDataPath,
+          client,
+          gitExecutable: options.gitExecutable,
+          gitTimeoutMs: 350,
+        });
+        if (pending) await queue.recordRetry(job!, pending.error);
+        else await queue.remove(job!.operationId);
+      });
+    });
+  } catch {
+    // 15 秒后台 worker 继续使用同一 operationId 重试；Stop 始终允许 Codex 结束本回合。
+  }
 }
 
 async function handleSessionEnd(
@@ -735,7 +851,13 @@ async function openHookRuntime(
   });
   let state = existingState ?? (await stateStore.load(input.session_id));
   if (!state || refreshInitial) {
-    const opened = await client.post<{ session: { id: string } }>("/api/sessions", {
+    let activityEpoch = state?.activityEpoch ?? 0;
+    const opened = await client.post<{ session: {
+      id: string;
+      currentTurnId?: string | null;
+      activityEpoch?: number;
+      turnStoppedAt?: string | null;
+    } }>("/api/sessions", {
       clientName: "Agent Hub Codex hook",
       agentName: "Codex",
       repository: git.repositoryRoot,
@@ -743,12 +865,18 @@ async function openHookRuntime(
       worktree: git.repositoryRoot,
       baseCommit: git.headCommit,
       task: `Codex session ${input.session_id}`,
+      codexSessionId: input.session_id,
+      turnId: completionTurnId(input, activityEpoch),
+      activityEpoch,
       metadata: {
         source: "codex-hook",
         codexSessionId: input.session_id,
         startSource: input.source,
       },
     });
+    activityEpoch = Math.max(activityEpoch, opened.session.activityEpoch ?? 0);
+    const currentTurnId = opened.session.currentTurnId
+      ?? completionTurnId(input, activityEpoch);
     const now = new Date().toISOString();
     state = {
       version: 1,
@@ -763,6 +891,15 @@ async function openHookRuntime(
       initialChangedFingerprints: { ...git.changedPathFingerprints },
       observedChangedPaths: git.changedPaths,
       observedChangedFingerprints: { ...git.changedPathFingerprints },
+      activityEpoch,
+      currentTurnId,
+      pendingCompletion: opened.session.turnStoppedAt ? {
+        operationId: randomUUID(),
+        turnId: currentTurnId,
+        activityEpoch,
+        phase: "stopped",
+        recordedAt: opened.session.turnStoppedAt,
+      } : undefined,
       leases: [],
       openedAt: now,
       updatedAt: now,
@@ -1276,6 +1413,7 @@ function contextOutput(additionalContext: string): Record<string, unknown> {
 }
 
 function failureOutput(event: CodexHookEventName, error: unknown): Record<string, unknown> | undefined {
+  if (event === "Stop") return { continue: true };
   const message = humanError(error);
   if (isSoftIntegrationFailure(error)) {
     const warning = error instanceof AmbiguousRepositoryConnectionError
@@ -1394,6 +1532,8 @@ function parseHookInput(raw: string): CodexHookInput {
     tool_input: value.tool_input,
     source: textField(value, "source"),
     reason: textField(value, "reason"),
+    turn_id: textField(value, "turn_id"),
+    stop_hook_active: typeof value.stop_hook_active === "boolean" ? value.stop_hook_active : undefined,
   };
 }
 
@@ -1427,6 +1567,19 @@ function pathKey(value: string): string {
 
 function shortSessionId(value: string): string {
   return value.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 12) || "session";
+}
+
+function completionTurnId(input: CodexHookInput, activityEpoch: number): string {
+  return input.turn_id?.trim() || `${shortSessionId(input.session_id)}-${activityEpoch}`;
+}
+
+function mergeAttributedPathEvidence(
+  existing: AttributedPathEvidence[],
+  updates: AttributedPathEvidence[],
+): AttributedPathEvidence[] {
+  const merged = new Map(existing.map((evidence) => [pathKey(evidence.path), evidence]));
+  for (const evidence of updates) merged.set(pathKey(evidence.path), evidence);
+  return [...merged.values()];
 }
 
 function unique(values: string[]): string[] {
