@@ -107,6 +107,7 @@ describe("Codex hook integration", () => {
         return jsonResponse({
           session: {
             id: "hub-reused",
+            reused: true,
             currentTurnId: "turn-9",
             activityEpoch: 9,
             turnStoppedAt: stoppedAt,
@@ -134,11 +135,75 @@ describe("Codex hook integration", () => {
     await expect(new CodexHookStateStore(userDataPath).load("reused-codex-session"))
       .resolves.toMatchObject({
         hubSessionId: "hub-reused",
+        leaseAttributionComplete: false,
         activityEpoch: 9,
         currentTurnId: "turn-9",
         pendingCompletion: { phase: "stopped", activityEpoch: 9, recordedAt: stoppedAt },
-      });
+    });
   }, 10_000);
+
+  it("returns Stop within budget and keeps incomplete local evidence when the session lock is busy", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-stop-lock-budget-"));
+    temporaryDirectories.push(root);
+    const userDataPath = path.join(root, "user-data");
+    const stateStore = new CodexHookStateStore(userDataPath);
+    await stateStore.save({
+      version: 1,
+      codexSessionId: "locked-stop-session",
+      connectionId: "locked-stop-connection",
+      hubSessionId: "locked-stop-hub",
+      repositoryPath: root,
+      branch: "main",
+      baseCommit: "0123456789abcdef",
+      initialChangedPaths: [],
+      initialChangedFingerprints: {},
+      observedChangedPaths: ["src/value.ts"],
+      observedChangedFingerprints: { "src/value.ts": "fingerprint" },
+      attributedChangedPaths: ["src/value.ts"],
+      activityEpoch: 3,
+      currentTurnId: "turn-3",
+      leases: [],
+      openedAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+    });
+    let signalEntered!: () => void;
+    let releaseLock!: () => void;
+    const entered = new Promise<void>((resolve) => { signalEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const held = stateStore.runExclusive("locked-stop-session", async () => {
+      signalEntered();
+      await release;
+    });
+    await entered;
+    const startedAt = performance.now();
+
+    await expect(handleCodexHook({
+      eventName: "Stop",
+      userDataPath,
+    }, {
+      session_id: "locked-stop-session",
+      cwd: root,
+      hook_event_name: "Stop",
+      turn_id: "turn-3",
+    })).resolves.toEqual({ continue: true });
+    expect(performance.now() - startedAt).toBeLessThan(2_500);
+    releaseLock();
+    await held;
+
+    const [job] = await new TurnCompletionQueueStore(userDataPath).listForSession("locked-stop-session");
+    expect(job).toMatchObject({
+      activityEpoch: 3,
+      turnId: "turn-3",
+      attributedPaths: ["src/value.ts"],
+      attributedPathsTruncated: true,
+      attributionComplete: false,
+    });
+    expect((await stateStore.load("locked-stop-session"))?.pendingCompletion).toBeUndefined();
+    await expect(new IntegrationOperationTracker(userDataPath).drain("locked-stop-connection", {
+      pollIntervalMs: 5,
+      timeoutMs: 200,
+    })).resolves.toBeUndefined();
+  }, 5_000);
 
   it("keeps an in-flight hook registered until pause cleanup can choose its cutoff", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-drain-"));
@@ -362,6 +427,288 @@ describe("Codex hook integration", () => {
     });
   }, 10_000);
 
+  it("denies a new write until resume is confirmed and preserves a following Stop", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-resume-unconfirmed-"));
+    temporaryDirectories.push(root);
+    const repository = path.join(root, "repository");
+    const userDataPath = path.join(root, "user-data");
+    await createRepository(repository);
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+    const connectionStore = new ConnectionStore(path.join(userDataPath, "connections.json"), protector);
+    const connection = await connectionStore.save({
+      serverUrl: "http://agent-hub.test:4173",
+      memberToken: "member-token",
+      repositoryPath: repository,
+    });
+    const baseCommit = (await outputGit(repository, ["rev-parse", "HEAD"])).trim();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    await stateStore.save({
+      version: 1,
+      codexSessionId: "resume-unconfirmed-session",
+      connectionId: connection.id,
+      hubSessionId: "hub-resume-unconfirmed",
+      repositoryPath: repository,
+      branch: "main",
+      baseCommit,
+      initialChangedPaths: [],
+      initialChangedFingerprints: {},
+      observedChangedPaths: [],
+      observedChangedFingerprints: {},
+      activityEpoch: 0,
+      currentTurnId: "turn-old",
+      pendingCompletion: {
+        operationId: "old-stop-operation",
+        turnId: "turn-old",
+        activityEpoch: 0,
+        phase: "stopped",
+        recordedAt: "2026-08-27T00:00:00.000Z",
+      },
+      leases: [],
+      openedAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+    });
+    const fetchImpl = vi.fn<typeof fetch>(async () => { throw new TypeError("fetch failed"); });
+    const sharedOptions = { userDataPath, protector, fetchImpl };
+    const pre = await handleCodexHook({
+      ...sharedOptions,
+      eventName: "PreToolUse",
+    }, {
+      session_id: "resume-unconfirmed-session",
+      cwd: repository,
+      hook_event_name: "PreToolUse",
+      turn_id: "turn-new",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+    });
+    expect(pre).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    const resuming = (await stateStore.load("resume-unconfirmed-session"))!;
+    expect(resuming.pendingCompletion).toMatchObject({
+      phase: "resuming",
+      turnId: "turn-new",
+      activityEpoch: 1,
+    });
+    const resumeOperationId = resuming.pendingCompletion!.operationId;
+
+    await expect(handleCodexHook({
+      ...sharedOptions,
+      eventName: "Stop",
+    }, {
+      session_id: "resume-unconfirmed-session",
+      cwd: repository,
+      hook_event_name: "Stop",
+      turn_id: "turn-new",
+    })).resolves.toEqual({ continue: true });
+    const [job] = await new TurnCompletionQueueStore(userDataPath).listForSession(
+      "resume-unconfirmed-session",
+    );
+    expect(job).toMatchObject({ turnId: "turn-new", activityEpoch: 1 });
+    expect(job?.operationId).not.toBe(resumeOperationId);
+    await expect(stateStore.load("resume-unconfirmed-session")).resolves.toMatchObject({
+      pendingCompletion: {
+        phase: "awaiting_commit",
+        operationId: job?.operationId,
+        activityEpoch: 1,
+      },
+    });
+  }, 10_000);
+
+  it("lets a new PreToolUse epoch supersede an in-flight Stop without stale state overwrite", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-stop-pre-race-"));
+    temporaryDirectories.push(root);
+    const repository = path.join(root, "repository");
+    const userDataPath = path.join(root, "user-data");
+    await createRepository(repository);
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+    const connectionStore = new ConnectionStore(path.join(userDataPath, "connections.json"), protector);
+    const connection = await connectionStore.save({
+      serverUrl: "http://agent-hub.test:4173",
+      memberToken: "member-token",
+      repositoryPath: repository,
+    });
+    const baseCommit = (await outputGit(repository, ["rev-parse", "HEAD"])).trim();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    await stateStore.save({
+      version: 1,
+      codexSessionId: "stop-pre-race-session",
+      connectionId: connection.id,
+      hubSessionId: "hub-stop-pre-race",
+      repositoryPath: repository,
+      branch: "main",
+      baseCommit,
+      initialChangedPaths: [],
+      initialChangedFingerprints: {},
+      observedChangedPaths: [],
+      observedChangedFingerprints: {},
+      activityEpoch: 0,
+      currentTurnId: "turn-old",
+      leases: [],
+      openedAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+    });
+    let signalStopEntered!: () => void;
+    let releaseStop!: () => void;
+    const stopEntered = new Promise<void>((resolve) => { signalStopEntered = resolve; });
+    const stopRelease = new Promise<void>((resolve) => { releaseStop = resolve; });
+    const fetchImpl = vi.fn<typeof fetch>(async (request) => {
+      const pathname = new URL(String(request)).pathname;
+      if (pathname.endsWith("/stop")) {
+        signalStopEntered();
+        await stopRelease;
+        return jsonResponse({ result: "awaiting_commit" });
+      }
+      if (pathname.endsWith("/resume")) {
+        releaseStop();
+        return jsonResponse({ result: "resumed" });
+      }
+      if (pathname === "/api/edits/prepare") {
+        return jsonResponse({
+          check: {
+            allowed: true,
+            blockers: [],
+            warnings: [],
+            coveredPaths: ["src/value.ts"],
+            uncoveredPaths: [],
+          },
+        });
+      }
+      if (pathname.endsWith("/completion/check")) return jsonResponse({ result: "superseded" });
+      throw new Error(`Unexpected concurrent Hook request: ${pathname}`);
+    });
+    const sharedOptions = { userDataPath, protector, fetchImpl };
+    const stop = handleCodexHook({ ...sharedOptions, eventName: "Stop" }, {
+      session_id: "stop-pre-race-session",
+      cwd: repository,
+      hook_event_name: "Stop",
+      turn_id: "turn-old",
+    });
+    await stopEntered;
+
+    const pre = await handleCodexHook({ ...sharedOptions, eventName: "PreToolUse" }, {
+      session_id: "stop-pre-race-session",
+      cwd: repository,
+      hook_event_name: "PreToolUse",
+      turn_id: "turn-new",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+    });
+    await expect(stop).resolves.toEqual({ continue: true });
+    expect(pre).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    await expect(stateStore.load("stop-pre-race-session")).resolves.toMatchObject({
+      activityEpoch: 1,
+      currentTurnId: "turn-new",
+      pendingWrite: { toolName: "apply_patch" },
+    });
+    expect((await stateStore.load("stop-pre-race-session"))?.pendingCompletion).toBeUndefined();
+    await expect(new TurnCompletionQueueStore(userDataPath).listForSession(
+      "stop-pre-race-session",
+    )).resolves.toEqual([]);
+  }, 10_000);
+
+  it("makes an in-flight PreToolUse adopt a later Stop fence before allowing the write", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-pre-stop-race-"));
+    temporaryDirectories.push(root);
+    const repository = path.join(root, "repository");
+    const userDataPath = path.join(root, "user-data");
+    await createRepository(repository);
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+    const connectionStore = new ConnectionStore(path.join(userDataPath, "connections.json"), protector);
+    const connection = await connectionStore.save({
+      serverUrl: "http://agent-hub.test:4173",
+      memberToken: "member-token",
+      repositoryPath: repository,
+    });
+    const baseCommit = (await outputGit(repository, ["rev-parse", "HEAD"])).trim();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    await stateStore.save({
+      version: 1,
+      codexSessionId: "pre-stop-race-session",
+      connectionId: connection.id,
+      hubSessionId: "hub-pre-stop-race",
+      repositoryPath: repository,
+      branch: "main",
+      baseCommit,
+      initialChangedPaths: [],
+      initialChangedFingerprints: {},
+      observedChangedPaths: [],
+      observedChangedFingerprints: {},
+      activityEpoch: 0,
+      currentTurnId: "turn-old",
+      leases: [],
+      openedAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+    });
+    let signalPrepareEntered!: () => void;
+    let releasePrepare!: () => void;
+    const prepareEntered = new Promise<void>((resolve) => { signalPrepareEntered = resolve; });
+    const prepareRelease = new Promise<void>((resolve) => { releasePrepare = resolve; });
+    const fetchImpl = vi.fn<typeof fetch>(async (request) => {
+      const pathname = new URL(String(request)).pathname;
+      if (pathname === "/api/edits/prepare") {
+        signalPrepareEntered();
+        await prepareRelease;
+        return jsonResponse({
+          check: {
+            allowed: true,
+            blockers: [],
+            warnings: [],
+            coveredPaths: ["src/value.ts"],
+            uncoveredPaths: [],
+          },
+        });
+      }
+      if (pathname.endsWith("/stop")) throw new TypeError("network offline");
+      throw new Error(`Unexpected reverse-race Hook request: ${pathname}`);
+    });
+    const sharedOptions = { userDataPath, protector, fetchImpl };
+    const pre = handleCodexHook({ ...sharedOptions, eventName: "PreToolUse" }, {
+      session_id: "pre-stop-race-session",
+      cwd: repository,
+      hook_event_name: "PreToolUse",
+      turn_id: "turn-new",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+    });
+    await prepareEntered;
+
+    const stop = handleCodexHook({ ...sharedOptions, eventName: "Stop" }, {
+      session_id: "pre-stop-race-session",
+      cwd: repository,
+      hook_event_name: "Stop",
+      turn_id: "turn-new",
+    });
+    await vi.waitFor(async () => {
+      await expect(new TurnCompletionQueueStore(userDataPath).listForSession(
+        "pre-stop-race-session",
+      )).resolves.toHaveLength(1);
+    });
+    releasePrepare();
+
+    await expect(pre).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    await expect(stop).resolves.toEqual({ continue: true });
+    const [job] = await new TurnCompletionQueueStore(userDataPath).listForSession(
+      "pre-stop-race-session",
+    );
+    expect(job).toMatchObject({ turnId: "turn-new", activityEpoch: 0 });
+    await expect(stateStore.load("pre-stop-race-session")).resolves.toMatchObject({
+      currentTurnId: "turn-new",
+      pendingCompletion: {
+        operationId: job?.operationId,
+        phase: "awaiting_commit",
+      },
+    });
+    expect((await stateStore.load("pre-stop-race-session"))?.pendingWrite).toBeUndefined();
+  }, 10_000);
+
   it("silently removes inactive SessionEnd state and remains idempotent", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-inactive-end-"));
     temporaryDirectories.push(root);
@@ -463,6 +810,99 @@ describe("Codex hook integration", () => {
     await expect(stateStore.load("fast-end-session")).resolves.toBeUndefined();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   }, 5_000);
+
+  it("keeps initial dirty paths attributed but marks their completion evidence incomplete", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-initial-dirty-"));
+    temporaryDirectories.push(root);
+    const repository = path.join(root, "repository");
+    const userDataPath = path.join(root, "user-data");
+    await createRepository(repository);
+    await writeFile(path.join(repository, "src", "value.ts"), "export const value = 10;\n", "utf8");
+    await writeFile(path.join(repository, "src", "preexisting.ts"), "export const temp = true;\n", "utf8");
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+
+    const database = new AgentHubDatabase({ path: path.join(root, "agent-hub.sqlite") });
+    databases.push(database);
+    const service = new AgentHubService(database);
+    const room = service.createRoom({
+      name: "Initial dirty room",
+      projectName: "Initial dirty project",
+      repository: "https://example.test/team/initial-dirty.git",
+      defaultBranch: "main",
+      hostName: "Alice",
+      hostAgent: "Codex",
+    });
+    const server = createAgentHubApp({ database, service }).listen(0, "127.0.0.1");
+    servers.push(server);
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    const connectionStore = new ConnectionStore(path.join(userDataPath, "connections.json"), protector);
+    await connectionStore.save({
+      serverUrl: `http://127.0.0.1:${port}`,
+      memberToken: room.memberToken,
+      repositoryPath: repository,
+    });
+    const sessionId = "initial-dirty-session";
+    const hookInput = (
+      eventName: CodexHookInput["hook_event_name"],
+      extra: Partial<CodexHookInput> = {},
+    ): CodexHookInput => ({
+      session_id: sessionId,
+      cwd: repository,
+      hook_event_name: eventName,
+      turn_id: "initial-dirty-turn",
+      ...extra,
+    });
+    const hookOptions = (eventName: RunCodexHookOptions["eventName"]): RunCodexHookOptions => ({
+      eventName,
+      userDataPath,
+      protector,
+    });
+    const command = [
+      "*** Begin Patch",
+      "*** Update File: src/value.ts",
+      "*** Delete File: src/preexisting.ts",
+      "*** End Patch",
+    ].join("\n");
+
+    await handleCodexHook(hookOptions("SessionStart"), hookInput("SessionStart"));
+    await expect(handleCodexHook(hookOptions("PreToolUse"), hookInput("PreToolUse", {
+      tool_name: "apply_patch",
+      tool_input: { command },
+    }))).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    await runGit(repository, ["restore", "--", "src/value.ts"]);
+    await rm(path.join(repository, "src", "preexisting.ts"));
+    await handleCodexHook(hookOptions("PostToolUse"), hookInput("PostToolUse", {
+      tool_name: "apply_patch",
+      tool_input: { command },
+    }));
+
+    const stateStore = new CodexHookStateStore(userDataPath);
+    const state = (await stateStore.load(sessionId))!;
+    expect(state.attributedChangedPaths).toEqual(expect.arrayContaining([
+      "src/value.ts",
+      "src/preexisting.ts",
+    ]));
+    expect(state.attributedPathEvidence).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "src/value.ts", baseEntry: null }),
+      expect.objectContaining({ path: "src/preexisting.ts", baseEntry: null, attributedEntry: "missing" }),
+    ]));
+
+    await handleCodexHook(hookOptions("Stop"), hookInput("Stop"));
+    const jobs = await new TurnCompletionQueueStore(userDataPath).listForSession(sessionId);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({
+      attributionComplete: false,
+      baselineEvidence: expect.arrayContaining([
+        expect.objectContaining({ path: "src/value.ts", baseEntry: null }),
+        expect.objectContaining({ path: "src/preexisting.ts", baseEntry: null }),
+      ]),
+    });
+  }, 20_000);
 
   it("opens shared context, attributes Agent writes, ignores external changes, and blocks another member's Unity scope", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-flow-"));

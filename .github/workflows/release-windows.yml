@@ -61,16 +61,42 @@ jobs:
           $updateLog = Get-Content -LiteralPath UPDATE_LOG.txt -Raw -Encoding utf8
           $forbiddenMarkers = @(
             "当前为发布说明草稿",
+            "未发布说明",
+            "当前状态：开发候选",
             "待正式发布前填写",
+            "待回填",
             "已确认，待实现",
             "（暂无）",
             "发布状态：本地候选，尚未发布",
-            "尚未创建正式标签或 Release"
+            "尚未创建正式标签或 Release",
+            "尚未打包",
+            "未经明确指令"
           )
           foreach ($marker in $forbiddenMarkers) {
             if ($releaseNotes.Contains($marker) -or $updateLog.Contains($marker)) {
               throw "Release documentation is not finalized; found marker: $marker"
             }
+          }
+          $expectedTitle = "# Agent Hub ${{ github.ref_name }}"
+          $firstLine = ($releaseNotes -split "\r?\n" | Select-Object -First 1).Trim()
+          if ($firstLine -ne $expectedTitle) {
+            throw "Release notes must start with the exact title: $expectedTitle"
+          }
+          $releaseNoteLines = @($releaseNotes -split "\r?\n" | ForEach-Object { $_.TrimEnd() })
+          $requiredHeadings = @(
+            "## 新增内容",
+            "## 问题修复",
+            "## 兼容性与升级",
+            "## 已验证",
+            "## 尚未完成的真实验收"
+          )
+          foreach ($heading in $requiredHeadings) {
+            if ($releaseNoteLines -notcontains $heading) {
+              throw "Release notes are missing required heading: $heading"
+            }
+          }
+          if ($releaseNotes.Trim().Length -gt 8000) {
+            throw "Release notes exceed the signed update manifest limit of 8000 characters."
           }
 
       - name: Prepare Electron runtime

@@ -198,6 +198,7 @@ export interface SessionActivityOperationResult {
   result: SessionActivityOperationResultKind;
   previousResult?: Exclude<SessionActivityOperationResultKind, "already_applied">;
   releasedLeaseIds: string[];
+  awaitingAutomaticLeases?: Array<{ id: string; expiresAt: string }>;
 }
 
 export interface SessionActivityOperationInput {
@@ -257,6 +258,7 @@ export interface DashboardData {
   localScans: LocalScan[];
   settings: RoomSettings;
   releaseRequests: ReleaseRequest[];
+  generatedAt: string;
 }
 
 export interface UpdateRoomSettingsInput {
@@ -779,6 +781,7 @@ export class AgentHubService {
       localScans: this.listLocalScans(auth.room.id),
       settings: this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName),
       releaseRequests: this.listReleaseRequestsByRoom(auth.room.id, "pending"),
+      generatedAt: this.timestamp(),
     };
   }
 
@@ -2286,7 +2289,7 @@ export class AgentHubService {
             turnId: currentTurnId,
             activityEpoch: requestedActivityEpoch,
           });
-          return this.requireSessionById(existingSession.id);
+          return { ...this.requireSessionById(existingSession.id), reused: true };
         }
       }
       this.database.connection
@@ -2336,7 +2339,7 @@ export class AgentHubService {
         turnId: session.currentTurnId,
         activityEpoch: session.activityEpoch,
       });
-      return session;
+      return { ...session, reused: false };
     });
   }
 
@@ -2544,7 +2547,7 @@ export class AgentHubService {
     const payloadHash = operationPayloadHash({ turnId, activityEpoch });
     const stoppedAt = this.timestamp();
 
-    return this.database.transaction(() => {
+    const result = this.database.transaction(() => {
       const session = this.requireOwnedSession(input.sessionId, auth);
       const repeated = this.repeatedSessionOperation(
         session,
@@ -2606,6 +2609,19 @@ export class AgentHubService {
         stoppedAt,
       );
     });
+    const awaitingAutomaticLeases = this.database.connection.prepare(`
+      SELECT id, expires_at FROM leases
+      WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+        AND automatic_phase = 'awaiting_commit' AND expires_at > ?
+      ORDER BY created_at, id
+    `).all(input.sessionId, stoppedAt) as Row[];
+    return {
+      ...result,
+      awaitingAutomaticLeases: awaitingAutomaticLeases.map((lease) => ({
+        id: asString(lease.id),
+        expiresAt: asString(lease.expires_at),
+      })),
+    };
   }
 
   resumeSessionActivity(input: SessionActivityOperationInput): SessionActivityOperationResult {
@@ -2765,9 +2781,11 @@ export class AgentHubService {
           AND automatic_phase = 'awaiting_commit'
         ORDER BY created_at, id
       `).all(session.id) as Row[];
-      const requestedLeaseIds = leaseIds ? new Set(leaseIds) : null;
+      // 缺失清单代表客户端没有提供可归因的租约证据，必须按空集处理；
+      // 旧客户端仍可省略字段，但不能因此释放本会话的全部自动租约。
+      const requestedLeaseIds = new Set(leaseIds ?? []);
       const releasable = candidates.filter((lease) =>
-        !requestedLeaseIds || requestedLeaseIds.has(asString(lease.id)),
+        requestedLeaseIds.has(asString(lease.id)),
       );
       const completionSummary = input.outcome === "committed"
         ? `Automatic lease released after Git commit ${headCommit}.`

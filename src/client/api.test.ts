@@ -589,6 +589,7 @@ describe("dashboard lease compatibility", () => {
                 turnStoppedAt: "2026-08-27T08:00:00.000Z",
               }],
               localScans: [],
+              generatedAt: "2026-08-27T08:00:00.000Z",
               server: { mcpUrl: "http://127.0.0.1:4173/mcp" },
             },
           })),
@@ -604,5 +605,6 @@ describe("dashboard lease compatibility", () => {
       ["lease-unknown", "working"],
     ]);
     expect(result.sessions[0]?.turnStoppedAt).toBe("2026-08-27T08:00:00.000Z");
+    expect(result.generatedAt).toBe("2026-08-27T08:00:00.000Z");
   });
 });

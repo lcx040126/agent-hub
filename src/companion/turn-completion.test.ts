@@ -63,6 +63,25 @@ describe("turn completion Git evidence", () => {
     })).resolves.toMatchObject({ status: "awaiting_commit" });
   }, 10_000);
 
+  it("keeps a path pending when it is modified again after its attributed commit", async () => {
+    const repository = await createRepository();
+    const baseline = await identity(repository);
+    await write(repository, "src/task.ts", "export const task = 2;\n");
+    const evidence = await collectAttributedPathEvidence(repository, baseline.head, ["src/task.ts"]);
+    await git(repository, ["add", "src/task.ts"]);
+    await git(repository, ["commit", "-m", "commit attributed task"]);
+    await write(repository, "src/task.ts", "export const task = 3;\n");
+
+    await expect(evaluateTurnCompletionEvidence({
+      repositoryPath: repository,
+      branch: baseline.branch,
+      baseCommit: baseline.head,
+      attributedPaths: ["src/task.ts"],
+      baselineEvidence: evidence,
+      attributionComplete: true,
+    })).resolves.toMatchObject({ status: "awaiting_commit" });
+  }, 10_000);
+
   it("accepts a full revert but rejects a clean HEAD that matches neither trusted version", async () => {
     const repository = await createRepository();
     const baseline = await identity(repository);
@@ -110,6 +129,33 @@ describe("turn completion Git evidence", () => {
       attributedPaths: [],
       baselineEvidence: [],
       attributionComplete: false,
+    })).resolves.toMatchObject({ status: "incomplete" });
+  }, 10_000);
+
+  it("keeps branch changes and truncated attribution as incomplete evidence", async () => {
+    const repository = await createRepository();
+    const baseline = await identity(repository);
+    await write(repository, "src/task.ts", "export const task = 2;\n");
+    const evidence = await collectAttributedPathEvidence(repository, baseline.head, ["src/task.ts"]);
+
+    await expect(evaluateTurnCompletionEvidence({
+      repositoryPath: repository,
+      branch: baseline.branch,
+      baseCommit: baseline.head,
+      attributedPaths: ["src/task.ts"],
+      baselineEvidence: evidence,
+      attributedPathsTruncated: true,
+      attributionComplete: true,
+    })).resolves.toMatchObject({ status: "incomplete" });
+
+    await git(repository, ["switch", "-c", "different-branch"]);
+    await expect(evaluateTurnCompletionEvidence({
+      repositoryPath: repository,
+      branch: baseline.branch,
+      baseCommit: baseline.head,
+      attributedPaths: ["src/task.ts"],
+      baselineEvidence: evidence,
+      attributionComplete: true,
     })).resolves.toMatchObject({ status: "incomplete" });
   }, 10_000);
 });

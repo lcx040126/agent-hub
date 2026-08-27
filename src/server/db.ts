@@ -568,10 +568,9 @@ export class AgentHubDatabase {
         finalization_error = COALESCE(finalization_error, 'Superseded duplicate Codex session during schema 4 migration.')
       WHERE id = ?
     `);
-    const cancelDuplicateWorkingLease = this.connection.prepare(`
+    const preserveDuplicateWorkingLease = this.connection.prepare(`
       UPDATE leases SET
-        status = 'cancelled', completed_at = COALESCE(completed_at, ?), updated_at = ?,
-        completion_summary = COALESCE(completion_summary, 'Duplicate Codex session was canonicalized during schema 4 migration.')
+        automatic_phase = 'awaiting_commit', updated_at = ?
       WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
         AND automatic_phase = 'working'
     `);
@@ -582,7 +581,8 @@ export class AgentHubDatabase {
         continue;
       }
       closeDuplicateSession.run(row.id);
-      cancelDuplicateWorkingLease.run(row.last_seen_at, row.last_seen_at, row.id);
+      // schema 3 没有提交完整性证据；重复会话关闭后停止续租，但保护必须保留到原 TTL。
+      preserveDuplicateWorkingLease.run(row.last_seen_at, row.id);
     }
     this.connection.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS sessions_codex_identity_idx

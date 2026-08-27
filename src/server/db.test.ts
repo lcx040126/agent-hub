@@ -43,6 +43,240 @@ describe("Agent Hub database migrations", () => {
     );
   });
 
+  it("migrates duplicate Codex sessions from the v0.2.2 schema 3 layout", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-hub-schema3-codex-session-db-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "agent-hub.sqlite");
+    const memberToken = "ahm_schema3_duplicate_member_token";
+    const tokenHash = createHash("sha256")
+      .update(memberToken, "utf8")
+      .digest("hex");
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE rooms (
+        id TEXT PRIMARY KEY,
+        code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        name TEXT NOT NULL,
+        project_name TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'dissolved')),
+        auto_lock_after_auto_claim INTEGER NOT NULL DEFAULT 1,
+        blocking_protection_enabled INTEGER NOT NULL DEFAULT 1,
+        automatic_lease_ttl_minutes INTEGER NOT NULL DEFAULT 10,
+        maximum_exclusive_lease_minutes INTEGER NOT NULL DEFAULT 1440,
+        risk_policy_version INTEGER NOT NULL DEFAULT 1,
+        risk_policy_rules_json TEXT NOT NULL DEFAULT '[]',
+        settings_updated_at TEXT,
+        settings_updated_by TEXT,
+        dissolved_at TEXT
+      );
+      CREATE TABLE members (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('host', 'member')),
+        client_name TEXT,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        is_admin INTEGER NOT NULL DEFAULT 0,
+        removed_at TEXT,
+        client_version TEXT,
+        protocol_version INTEGER,
+        schema_version INTEGER
+      );
+      CREATE TABLE work_sessions (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        client_name TEXT,
+        agent_name TEXT,
+        repository TEXT,
+        branch TEXT,
+        worktree TEXT,
+        base_commit TEXT,
+        task TEXT,
+        status TEXT NOT NULL CHECK (status IN ('active', 'frozen', 'closed')),
+        branch_epoch INTEGER NOT NULL DEFAULT 1,
+        frozen_reason TEXT,
+        metadata_json TEXT NOT NULL,
+        opened_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        closed_at TEXT,
+        client_version TEXT,
+        protocol_version INTEGER,
+        schema_version INTEGER
+      );
+      CREATE TABLE leases (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        session_id TEXT REFERENCES work_sessions(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        intent TEXT NOT NULL,
+        branch TEXT,
+        base_commit TEXT,
+        mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
+        kind TEXT NOT NULL DEFAULT 'standard' CHECK (kind IN ('automatic', 'standard', 'exclusive')),
+        status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'cancelled', 'expired')),
+        decision TEXT NOT NULL CHECK (decision IN ('allow', 'warn', 'deny')),
+        override_reason TEXT,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        completion_summary TEXT,
+        outcome TEXT,
+        changed_paths_json TEXT NOT NULL DEFAULT '[]',
+        commit_hash TEXT,
+        validations_json TEXT NOT NULL DEFAULT '[]',
+        remaining_risks_json TEXT NOT NULL DEFAULT '[]',
+        handoff TEXT
+      );
+      CREATE TABLE lease_paths (
+        lease_id TEXT NOT NULL REFERENCES leases(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        path_key TEXT NOT NULL,
+        risk TEXT NOT NULL CHECK (risk IN ('normal', 'high')),
+        risk_reason TEXT,
+        PRIMARY KEY (lease_id, path_key)
+      );
+      INSERT INTO rooms (
+        id, code, name, project_name, repository, default_branch, created_at
+      ) VALUES (
+        'schema3-room', 'SCHEMA03', 'Schema 3 room', 'Schema 3 project',
+        'https://example.invalid/schema3.git', 'main', '2026-08-27T08:00:00.000Z'
+      );
+      INSERT INTO members (
+        id, room_id, name, role, client_name, token_hash, created_at, last_seen_at
+      ) VALUES (
+        'schema3-member', 'schema3-room', 'Alice', 'host', 'Codex', '${tokenHash}',
+        '2026-08-27T08:00:00.000Z', '2026-08-27T10:00:00.000Z'
+      );
+      INSERT INTO work_sessions (
+        id, room_id, member_id, client_name, agent_name, status, metadata_json,
+        opened_at, last_seen_at, closed_at
+      ) VALUES
+        (
+          'schema3-session-newer', 'schema3-room', 'schema3-member', 'Codex', 'Codex',
+          'active', '{"codexSessionId":"codex-schema3-duplicate"}',
+          '2026-08-27T08:30:00.000Z', '2026-08-27T10:00:00.000Z', NULL
+        ),
+        (
+          'schema3-session-older', 'schema3-room', 'schema3-member', 'Codex', 'Codex',
+          'active', '{"codexSessionId":"codex-schema3-duplicate"}',
+          '2026-08-27T08:00:00.000Z', '2026-08-27T09:00:00.000Z', NULL
+        );
+      INSERT INTO leases (
+        id, room_id, member_id, session_id, title, intent, mode, kind, status,
+        decision, expires_at, created_at, updated_at
+      ) VALUES
+        (
+          'schema3-canonical-auto', 'schema3-room', 'schema3-member', 'schema3-session-newer',
+          'Canonical automatic', '', 'write', 'automatic', 'active', 'allow',
+          '2026-08-27T12:00:00.000Z', '2026-08-27T08:30:00.000Z', '2026-08-27T08:30:00.000Z'
+        ),
+        (
+          'schema3-loser-auto', 'schema3-room', 'schema3-member', 'schema3-session-older',
+          'Loser automatic', '', 'write', 'automatic', 'active', 'allow',
+          '2026-08-27T12:00:00.000Z', '2026-08-27T08:00:00.000Z', '2026-08-27T08:00:00.000Z'
+        ),
+        (
+          'schema3-loser-standard', 'schema3-room', 'schema3-member', 'schema3-session-older',
+          'Loser standard', '', 'write', 'standard', 'active', 'allow',
+          '2026-08-27T13:00:00.000Z', '2026-08-27T08:00:00.000Z', '2026-08-27T08:00:00.000Z'
+        ),
+        (
+          'schema3-loser-exclusive', 'schema3-room', 'schema3-member', 'schema3-session-older',
+          'Loser exclusive', '', 'write', 'exclusive', 'active', 'allow',
+          '2026-08-27T14:00:00.000Z', '2026-08-27T08:00:00.000Z', '2026-08-27T08:00:00.000Z'
+        );
+      INSERT INTO lease_paths (lease_id, path, path_key, risk, risk_reason) VALUES (
+        'schema3-loser-auto', 'Assets/Scenes/Schema3.unity',
+        'assets/scenes/schema3.unity', 'high', 'Unity scene files require exclusive coordination.'
+      );
+      PRAGMA user_version = 3;
+    `);
+    legacy.close();
+
+    const migrated = new AgentHubDatabase({ path: databasePath });
+    expect(migrated.connection.prepare(`
+      SELECT id, codex_session_id, status, closed_at
+      FROM work_sessions
+      WHERE codex_session_id = 'codex-schema3-duplicate'
+      ORDER BY id
+    `).all()).toEqual([
+      {
+        id: "schema3-session-newer",
+        codex_session_id: "codex-schema3-duplicate",
+        status: "active",
+        closed_at: null,
+      },
+      {
+        id: "schema3-session-older",
+        codex_session_id: "codex-schema3-duplicate",
+        status: "closed",
+        closed_at: "2026-08-27T09:00:00.000Z",
+      },
+    ]);
+    expect(migrated.connection.prepare(`
+      SELECT id, session_id, kind, status, automatic_phase, expires_at
+      FROM leases
+      WHERE id LIKE 'schema3-%'
+      ORDER BY id
+    `).all()).toEqual([
+      { id: "schema3-canonical-auto", session_id: "schema3-session-newer", kind: "automatic", status: "active", automatic_phase: "working", expires_at: "2026-08-27T12:00:00.000Z" },
+      { id: "schema3-loser-auto", session_id: "schema3-session-older", kind: "automatic", status: "active", automatic_phase: "awaiting_commit", expires_at: "2026-08-27T12:00:00.000Z" },
+      { id: "schema3-loser-exclusive", session_id: "schema3-session-older", kind: "exclusive", status: "active", automatic_phase: "working", expires_at: "2026-08-27T14:00:00.000Z" },
+      { id: "schema3-loser-standard", session_id: "schema3-session-older", kind: "standard", status: "active", automatic_phase: "working", expires_at: "2026-08-27T13:00:00.000Z" },
+    ]);
+    expect(migrated.connection.prepare(`
+      SELECT COUNT(*) AS count FROM work_sessions
+      WHERE room_id = 'schema3-room' AND member_id = 'schema3-member'
+        AND codex_session_id = 'codex-schema3-duplicate' AND closed_at IS NULL
+    `).get()).toEqual({ count: 1 });
+    expect(migrated.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 4 });
+    expect(migrated.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+
+    let currentTime = new Date("2026-08-27T11:30:00.000Z");
+    const service = new AgentHubService(migrated, { now: () => currentTime });
+    const joined = service.joinRoom({
+      roomToken: "SCHEMA03",
+      displayName: "Bob",
+    });
+    const competingSession = service.openSession({
+      memberToken: joined.memberToken,
+      codexSessionId: "codex-schema3-competing",
+    });
+    expect(service.claimLease({
+      memberToken: joined.memberToken,
+      sessionId: competingSession.id,
+      title: "Competing scene edit",
+      paths: ["Assets/Scenes/Schema3.unity"],
+      kind: "automatic",
+    })).toMatchObject({ acquired: false, decision: "deny" });
+
+    currentTime = new Date("2026-08-27T12:00:00.001Z");
+    expect(service.claimLease({
+      memberToken: joined.memberToken,
+      sessionId: competingSession.id,
+      title: "Scene edit after migrated TTL",
+      paths: ["Assets/Scenes/Schema3.unity"],
+      kind: "automatic",
+    })).toMatchObject({ acquired: true });
+    expect(migrated.connection.prepare(`
+      SELECT status, automatic_phase, expires_at FROM leases WHERE id = 'schema3-loser-auto'
+    `).get()).toEqual({
+      status: "expired",
+      automatic_phase: "awaiting_commit",
+      expires_at: "2026-08-27T12:00:00.000Z",
+    });
+    migrated.close();
+  });
+
   it("backfills and canonicalizes duplicate Codex sessions in an older schema 4 database", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-hub-schema4-session-db-"));
     temporaryDirectories.push(directory);
@@ -244,7 +478,7 @@ describe("Agent Hub database migrations", () => {
       SELECT id, session_id, status, automatic_phase, expires_at FROM leases ORDER BY id
     `).all()).toEqual([
       { id: "canonical-auto", session_id: "session-finalizing", status: "active", automatic_phase: "working", expires_at: "2026-08-27T12:00:00.000Z" },
-      { id: "duplicate-auto", session_id: "session-newer", status: "cancelled", automatic_phase: "working", expires_at: "2026-08-27T12:00:00.000Z" },
+      { id: "duplicate-auto", session_id: "session-newer", status: "active", automatic_phase: "awaiting_commit", expires_at: "2026-08-27T12:00:00.000Z" },
       { id: "duplicate-finalizing-awaiting", session_id: "session-newer", status: "active", automatic_phase: "awaiting_commit", expires_at: "2026-08-27T12:00:00.000Z" },
       { id: "duplicate-standard", session_id: "session-newer", status: "active", automatic_phase: "working", expires_at: "2026-08-27T12:00:00.000Z" },
       { id: "preserved-active-awaiting", session_id: "session-active-older", status: "active", automatic_phase: "awaiting_commit", expires_at: "2026-08-27T12:00:00.000Z" },

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -38,6 +38,77 @@ describe("Codex session heartbeat scheduler", () => {
     await scheduler.scanNow();
     await scheduler.stop();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists renewed lease expiries without turning the heartbeat into Hook activity", async () => {
+    const userDataPath = await temporaryUserData();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    const state = hookState();
+    state.leases = [{
+      id: "lease-1",
+      paths: ["src/task.ts"],
+      expiresAt: "2026-08-27T00:02:00.000Z",
+    }];
+    await stateStore.save(state);
+    const beforeHeartbeat = (await stateStore.load(state.codexSessionId))!;
+    const renewedExpiry = "2026-08-27T00:10:00.000Z";
+    const scheduler = startCodexSessionHeartbeatScheduler({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl: vi.fn(async () => jsonResponse(200, {
+        session: { id: state.hubSessionId },
+        renewedLeases: [{ id: "lease-1", expiresAt: renewedExpiry }],
+      })) as typeof fetch,
+      intervalMs: 60_000,
+    });
+
+    await scheduler.scanNow();
+    await scheduler.stop();
+
+    const afterHeartbeat = (await stateStore.load(state.codexSessionId))!;
+    expect(afterHeartbeat.updatedAt).toBe(beforeHeartbeat.updatedAt);
+    expect(afterHeartbeat.leases).toEqual([
+      expect.objectContaining({ id: "lease-1", expiresAt: renewedExpiry }),
+    ]);
+    const completion = await new TurnCompletionQueueStore(userDataPath).enqueue({
+      operationId: "completion-renewed-expiry",
+      turnId: "turn-1",
+      activityEpoch: 0,
+      state: afterHeartbeat,
+    }, new Date("2026-08-27T00:01:00.000Z"));
+    expect(completion.expiresAt).toBe(renewedExpiry);
+  });
+
+  it("heartbeats two healthy sessions while isolating one malformed completion entry", async () => {
+    const userDataPath = await temporaryUserData();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    const first = hookState();
+    const second = hookState();
+    second.codexSessionId = "codex-session-2";
+    second.hubSessionId = "hub-session-2";
+    await stateStore.save(first);
+    await stateStore.save(second);
+    const queue = new TurnCompletionQueueStore(userDataPath);
+    await mkdir(queue.directory, { recursive: true });
+    await writeFile(path.join(queue.directory, "broken.json"), "{not-json", "utf8");
+    const onError = vi.fn();
+    const fetchImpl = vi.fn(async () => jsonResponse(200, {
+      session: {},
+      renewedLeases: [],
+    })) as typeof fetch;
+    const scheduler = startCodexSessionHeartbeatScheduler({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl,
+      intervalMs: 60_000,
+      onError,
+    });
+
+    await scheduler.scanNow();
+    await scheduler.stop();
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(onError.mock.calls.some(([error]) => String(error).includes("broken.json"))).toBe(true);
   });
 
   it("stops heartbeating but preserves ordinary Hook evidence after real activity becomes stale", async () => {

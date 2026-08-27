@@ -185,10 +185,16 @@ export class IntegrationController {
     connectionId: string,
     reason: PauseReason,
     requestId: string,
+    operationAlreadyDrained = false,
   ): Promise<PauseRequestResult> {
     const existing = this.preparedPauseTasks.get(requestId);
     if (existing) return existing;
-    const task = this.completePreparedPauseInternal(connectionId, reason, requestId)
+    const task = this.completePreparedPauseInternal(
+      connectionId,
+      reason,
+      requestId,
+      operationAlreadyDrained,
+    )
       .finally(() => {
         if (this.preparedPauseTasks.get(requestId) === task) {
           this.preparedPauseTasks.delete(requestId);
@@ -202,9 +208,10 @@ export class IntegrationController {
     connectionId: string,
     reason: PauseReason,
     requestId: string,
+    operationAlreadyDrained: boolean,
   ): Promise<PauseRequestResult> {
     try {
-      await this.operationTracker.drain(connectionId);
+      if (!operationAlreadyDrained) await this.operationTracker.drain(connectionId);
       await new CodexHookStateStore(this.options.userDataPath).removeForConnection(connectionId);
       await new TurnCompletionQueueStore(this.options.userDataPath).removeForConnection(connectionId);
     } catch (error) {
@@ -447,7 +454,7 @@ export class IntegrationController {
     else this.knownActiveConnectionIds.delete(connectionId);
   }
 
-  /** Disable all local integrations immediately, then attempt remote cleanup. */
+  /** Disable the local gate, preserving unfinished Stop work across a normal desktop restart. */
   async shutdown(reason: Exclude<PauseReason, "leave-room"> = "app-shutdown"): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.shutdownRequested = true;
@@ -486,13 +493,46 @@ export class IntegrationController {
           ));
         }
       }
-      await new CodexHookStateStore(this.options.userDataPath)
-        .removeForConnections(connectionIds)
-        .catch((error: unknown) => this.options.onError?.(toError(error)));
-      await new TurnCompletionQueueStore(this.options.userDataPath)
-        .removeForConnections(connectionIds)
-        .catch((error: unknown) => this.options.onError?.(toError(error)));
+      // Stop 先登记 tracked operation，再写 completion job/state。关闭 gate 后等待 drain，
+      // 才能取得稳定队列快照，避免把仍在持久化的 Stop 误判成普通会话。
+      const drainedConnections = new Set<string>();
       await Promise.all(connectionIds.map(async (connectionId) => {
+        try {
+          await this.operationTracker.drain(connectionId);
+          drainedConnections.add(connectionId);
+        } catch (error) {
+          this.options.onError?.(toError(error));
+        }
+      }));
+
+      const completionQueue = new TurnCompletionQueueStore(this.options.userDataPath);
+      let preservedConnectionIds = new Set<string>();
+      if (reason === "app-shutdown") {
+        try {
+          const activeIds = new Set(connectionIds);
+          const now = (this.options.now?.() ?? new Date()).getTime();
+          let queueEvidenceIncomplete = false;
+          const completionJobs = await completionQueue.list((error) => {
+            queueEvidenceIncomplete = true;
+            this.options.onError?.(error);
+          });
+          preservedConnectionIds = queueEvidenceIncomplete
+            ? new Set(connectionIds)
+            : new Set(completionJobs
+              .filter((job) => activeIds.has(job.connectionId) && Date.parse(job.expiresAt) > now)
+              .map((job) => job.connectionId));
+        } catch (error) {
+          // An unreadable queue is incomplete evidence. Keep remote authority
+          // and let the room TTL expire it rather than risk releasing a live
+          // automatic lease during shutdown.
+          this.options.onError?.(toError(error));
+          preservedConnectionIds = new Set(connectionIds);
+        }
+      }
+
+      const preparationConnectionIds = connectionIds.filter((connectionId) =>
+        !preservedConnectionIds.has(connectionId));
+      await Promise.all(preparationConnectionIds.map(async (connectionId) => {
         const requestId = randomUUID();
         try {
           await this.pausePreparationQueue.enqueue({ connectionId, reason, requestId });
@@ -504,9 +544,18 @@ export class IntegrationController {
           ));
           return;
         }
+        if (reason === "app-shutdown" && !drainedConnections.has(connectionId)) {
+          // drain 未完成时只保存恢复意图；重启后先恢复 gate，再重新 drain，不能用不稳定快照远端清理。
+          return;
+        }
         // App shutdown leaves the saved connection enabled for automatic
         // restart, while the process-wide sentinel prevents new local work.
-        const result = await this.completePreparedPause(connectionId, reason, requestId);
+        const result = await this.completePreparedPause(
+          connectionId,
+          reason,
+          requestId,
+          drainedConnections.has(connectionId),
+        );
         if (result.cleanupError) this.options.onError?.(new Error(result.cleanupError));
       }));
       try {

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,8 @@ import {
   type ConnectionDeletionCleanupContext,
 } from "./integration-controller.js";
 import { getLocalIntegrationStatus } from "./integration-gate.js";
+import { IntegrationOperationTracker } from "./integration-operations.js";
+import { CodexHookStateStore, type CodexHookSessionState } from "./hook-state.js";
 import { PAUSE_PREPARATION_FILENAME } from "./pause-preparation.js";
 import {
   PAUSE_RETRY_FILENAME,
@@ -21,6 +23,7 @@ import {
   type StartRuntimePresenceOptions,
 } from "./runtime-presence.js";
 import { TurnCompletionQueueStore } from "./turn-completion-queue.js";
+import { startTurnCompletionWorker } from "./turn-completion-worker.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -348,7 +351,194 @@ describe("integration controller lifecycle", () => {
     expect(connections.get(connection.id)?.integrationEnabled).toBe(false);
   });
 
-  it("persists a shutdown drain failure without sending an unsafe cutoff", async () => {
+  it("preserves only the connection with an unexpired completion job during desktop shutdown", async () => {
+    const userDataPath = await temporaryDirectory();
+    const pending = connectionRecord("connection-pending", true, path.resolve("project-pending"));
+    const ordinary = connectionRecord("connection-ordinary", true, path.resolve("project-ordinary"));
+    const { store } = createMutableStore([pending, ordinary]);
+    store.readMemberToken = vi.fn(async (connectionId: string) => `token-${connectionId}`);
+    const pendingJob = await enqueuePendingCompletion(userDataPath, pending, {
+      operationId: "shutdown-pending",
+      expiresAt: "2026-08-27T00:10:00.000Z",
+    });
+    const ordinaryState = completionState(ordinary, {
+      codexSessionId: "codex-ordinary",
+      hubSessionId: "hub-ordinary",
+      expiresAt: "2026-08-27T00:10:00.000Z",
+    });
+    const stateStore = new CodexHookStateStore(userDataPath);
+    await stateStore.save(ordinaryState);
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => pauseJsonResponse(init));
+    const drain = vi.fn(async () => undefined);
+    const controller = new IntegrationController({
+      userDataPath,
+      store,
+      fetchImpl,
+      now: () => new Date("2026-08-27T00:01:00.000Z"),
+      startPresence: createPresenceStarter(),
+      operationTracker: { drain },
+    });
+    const preparationEnqueue = vi.spyOn(controller.pausePreparationQueue, "enqueue");
+    await controller.start();
+
+    await controller.shutdown();
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(new Headers(fetchImpl.mock.calls[0]?.[1]?.headers).get("authorization"))
+      .toBe(`Bearer token-${ordinary.id}`);
+    expect(preparationEnqueue).toHaveBeenCalledOnce();
+    expect(preparationEnqueue).toHaveBeenCalledWith(expect.objectContaining({
+      connectionId: ordinary.id,
+      reason: "app-shutdown",
+    }));
+    await expect(new TurnCompletionQueueStore(userDataPath).list()).resolves.toEqual([pendingJob]);
+    await expect(stateStore.load(pendingJob.codexSessionId)).resolves.toMatchObject({
+      pendingCompletion: { operationId: pendingJob.operationId, phase: "awaiting_commit" },
+    });
+    await expect(stateStore.load(ordinaryState.codexSessionId)).resolves.toBeUndefined();
+    await expect(controller.pausePreparationQueue.list()).resolves.toEqual([]);
+    await expect(controller.pauseQueue.list()).resolves.toEqual([]);
+    expect(drain).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves every active connection when shutdown finds incomplete completion queue evidence", async () => {
+    const userDataPath = await temporaryDirectory();
+    const connection = connectionRecord("connection-corrupt-completion", true);
+    const { store } = createMutableStore([connection]);
+    const queue = new TurnCompletionQueueStore(userDataPath);
+    await mkdir(queue.directory, { recursive: true });
+    const corruptPath = path.join(queue.directory, "corrupt-completion.json");
+    await writeFile(corruptPath, "{not valid json", "utf8");
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => pauseJsonResponse(init));
+    const onError = vi.fn();
+    const controller = new IntegrationController({
+      userDataPath,
+      store,
+      fetchImpl,
+      onError,
+      now: () => new Date("2026-08-27T00:01:00.000Z"),
+      startPresence: createPresenceStarter(),
+      operationTracker: { drain: vi.fn(async () => undefined) },
+    });
+    const preparationEnqueue = vi.spyOn(controller.pausePreparationQueue, "enqueue");
+    await controller.start();
+
+    await controller.shutdown();
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(preparationEnqueue).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining("Skipped invalid Agent Hub turn-completion queue entry"),
+    }));
+    await expect(readFile(corruptPath, "utf8")).resolves.toBe("{not valid json");
+  });
+
+  it("lets a restarted desktop worker continue a preserved completion job", async () => {
+    const userDataPath = await temporaryDirectory();
+    const connection = connectionRecord("connection-restart", true);
+    const { store } = createMutableStore([connection]);
+    const job = await enqueuePendingCompletion(userDataPath, connection, {
+      operationId: "restart-pending",
+      expiresAt: "2026-08-27T00:10:00.000Z",
+    });
+    const firstFetch = vi.fn<typeof fetch>(async (_input, init) => pauseJsonResponse(init));
+    const first = new IntegrationController({
+      userDataPath,
+      store,
+      fetchImpl: firstFetch,
+      now: () => new Date("2026-08-27T00:01:00.000Z"),
+      startPresence: createPresenceStarter(),
+      operationTracker: { drain: vi.fn(async () => undefined) },
+    });
+    await first.start();
+    await first.shutdown();
+
+    expect(firstFetch).not.toHaveBeenCalled();
+    await expect(new TurnCompletionQueueStore(userDataPath).list()).resolves.toEqual([job]);
+
+    const restarted = new IntegrationController({
+      userDataPath,
+      store,
+      now: () => new Date("2026-08-27T00:01:01.000Z"),
+      startPresence: createPresenceStarter(),
+      operationTracker: { drain: vi.fn(async () => undefined) },
+    });
+    await restarted.start();
+    const workerFetch = vi.fn(async () => { throw new Error("network offline"); }) as typeof fetch;
+    const worker = startTurnCompletionWorker({
+      userDataPath,
+      store,
+      fetchImpl: workerFetch,
+      now: () => new Date("2026-08-27T00:01:01.000Z"),
+      intervalMs: 60_000,
+      operationTracker: { run: async (_connectionId, task) => task() },
+    });
+    await worker.scanNow();
+    await worker.stop();
+
+    expect(workerFetch).toHaveBeenCalledOnce();
+    await expect(new TurnCompletionQueueStore(userDataPath).list()).resolves.toMatchObject([{
+      operationId: job.operationId,
+      attempts: 1,
+      lastError: "network offline",
+    }]);
+    await restarted.stopPresence();
+  });
+
+  it.each(["pause", "delete"] as const)(
+    "does not leave a completion orphan when %s races with Stop persistence",
+    async (action) => {
+      const userDataPath = await temporaryDirectory();
+      const connection = connectionRecord(`connection-race-${action}`, true);
+      const { store } = createMutableStore([connection]);
+      const tracker = new IntegrationOperationTracker(userDataPath);
+      const drain = vi.fn((connectionId: string) => tracker.drain(connectionId, {
+        pollIntervalMs: 1,
+        timeoutMs: 5_000,
+      }));
+      const controller = new IntegrationController({
+        userDataPath,
+        store,
+        fetchImpl: vi.fn<typeof fetch>(async (_input, init) => pauseJsonResponse(init, "host")),
+        operationTracker: {
+          drain,
+          removeConnectionState: (connectionId) => tracker.removeConnectionState(connectionId),
+        },
+      });
+      let releaseStop: (() => void) | undefined;
+      const stopGate = new Promise<void>((resolve) => { releaseStop = resolve; });
+      let stopStarted: (() => void) | undefined;
+      const stopDidStart = new Promise<void>((resolve) => { stopStarted = resolve; });
+      const state = completionState(connection, {
+        codexSessionId: `codex-race-${action}`,
+        hubSessionId: `hub-race-${action}`,
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      });
+      const stopOperation = tracker.run(connection.id, async () => {
+        stopStarted?.();
+        await stopGate;
+        await enqueuePendingCompletion(userDataPath, connection, {
+          operationId: `race-${action}`,
+          state,
+          expiresAt: "2099-01-01T00:00:00.000Z",
+        });
+      });
+      await stopDidStart;
+
+      const lifecycle = action === "pause"
+        ? controller.pauseConnection(connection.id)
+        : controller.deleteConnection(connection.id, async () => ({ changed: false }));
+      await vi.waitFor(() => expect(drain).toHaveBeenCalled());
+      releaseStop?.();
+      await Promise.all([stopOperation, lifecycle]);
+
+      await expect(new TurnCompletionQueueStore(userDataPath).list()).resolves.toEqual([]);
+      await expect(new CodexHookStateStore(userDataPath).load(state.codexSessionId))
+        .resolves.toBeUndefined();
+    },
+  );
+
+  it("preserves a connection when shutdown cannot establish a stable completion snapshot", async () => {
     const userDataPath = await temporaryDirectory();
     const store = createStore();
     const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => pauseJsonResponse(init));
@@ -972,6 +1162,72 @@ function connectionRecord(
     createdAt: "2026-08-27T00:00:00.000Z",
     updatedAt: "2026-08-27T00:00:00.000Z",
   };
+}
+
+function completionState(
+  connection: SavedRoomConnection,
+  input: {
+    codexSessionId: string;
+    hubSessionId: string;
+    expiresAt: string;
+  },
+): CodexHookSessionState {
+  return {
+    version: 1,
+    codexSessionId: input.codexSessionId,
+    connectionId: connection.id,
+    hubSessionId: input.hubSessionId,
+    repositoryPath: connection.repositoryPath,
+    branch: "main",
+    baseCommit: "0123456789abcdef",
+    initialChangedPaths: [],
+    initialChangedFingerprints: {},
+    observedChangedPaths: [],
+    observedChangedFingerprints: {},
+    activityEpoch: 1,
+    currentTurnId: "turn-1",
+    leases: [{
+      id: `lease-${connection.id}`,
+      paths: ["src/task.ts"],
+      expiresAt: input.expiresAt,
+    }],
+    openedAt: "2026-08-27T00:00:00.000Z",
+    updatedAt: "2026-08-27T00:00:00.000Z",
+  };
+}
+
+async function enqueuePendingCompletion(
+  userDataPath: string,
+  connection: SavedRoomConnection,
+  input: {
+    operationId: string;
+    expiresAt: string;
+    state?: CodexHookSessionState;
+  },
+) {
+  const stateStore = new CodexHookStateStore(userDataPath);
+  const state = input.state ?? completionState(connection, {
+    codexSessionId: `codex-${connection.id}`,
+    hubSessionId: `hub-${connection.id}`,
+    expiresAt: input.expiresAt,
+  });
+  await stateStore.save(state);
+  const queue = new TurnCompletionQueueStore(userDataPath);
+  const job = await queue.enqueue({
+    operationId: input.operationId,
+    turnId: state.currentTurnId ?? "turn-1",
+    activityEpoch: state.activityEpoch ?? 0,
+    state,
+  }, new Date("2026-08-27T00:00:00.000Z"));
+  state.pendingCompletion = {
+    operationId: job.operationId,
+    turnId: job.turnId,
+    activityEpoch: job.activityEpoch,
+    phase: "awaiting_commit",
+    recordedAt: job.createdAt,
+  };
+  await stateStore.save(state);
+  return job;
 }
 
 function createMutableStore(initial: SavedRoomConnection[]): {

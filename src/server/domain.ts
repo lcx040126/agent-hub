@@ -612,6 +612,8 @@ export interface WorkSession {
   currentTurnId: string | null;
   activityEpoch: number;
   turnStoppedAt: string | null;
+  /** 仅用于打开会话响应，表明服务端复用了同一 Codex 身份的未关闭会话。 */
+  reused?: boolean;
 }
 
 export interface LocalScan {

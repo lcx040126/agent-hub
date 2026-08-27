@@ -59,7 +59,8 @@ export function attributedChangedPaths(
   repositoryTargets: string[],
   attributedSideEffects: boolean,
 ): { attributed: string[]; external: string[] } {
-  const changedSinceBaseline = after.changedPaths.filter((candidate) => {
+  // 恢复为干净状态或删除初始未跟踪文件时，路径只存在于 before；并集才能保留这类真实写入。
+  const changedSinceBaseline = unique([...after.changedPaths, ...before.changedPaths]).filter((candidate) => {
     const key = pathKey(candidate);
     return before.changedPathFingerprints[key] !== after.changedPathFingerprints[key];
   });

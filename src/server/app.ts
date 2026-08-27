@@ -172,6 +172,7 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       localScans: dashboard.localScans,
       settings: dashboard.settings,
       releaseRequests: dashboard.releaseRequests,
+      generatedAt: dashboard.generatedAt,
       server: { mcpUrl: resolveMcpUrl(request, options.mcpUrl) },
     });
   });

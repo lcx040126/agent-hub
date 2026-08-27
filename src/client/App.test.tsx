@@ -6,6 +6,7 @@ import {
   SavedConnectionList,
   WorkItem,
   WorkView,
+  dashboardClockOffsetMs,
   formatLeaseExpiryCountdown,
   isRealtimeAgentSession,
   isValidLease,
@@ -118,6 +119,18 @@ describe("dashboard modal coordination", () => {
 });
 
 describe("lease protection presentation", () => {
+  it("uses server-relative time when the member clock is ahead and falls back for older servers", () => {
+    const memberClock = Date.parse("2026-08-27T10:00:00.000Z");
+    const offset = dashboardClockOffsetMs("2026-08-27T08:00:00.000Z", memberClock);
+    const serverRelativeNow = memberClock + offset;
+
+    expect(offset).toBe(-2 * 60 * 60_000);
+    expect(isValidLease(lease({ expiresAt: "2026-08-27T08:01:00.000Z" }), serverRelativeNow)).toBe(true);
+    expect(formatLeaseExpiryCountdown("2026-08-27T08:01:00.000Z", serverRelativeNow)).toBe("1 分 00 秒后到期");
+    expect(dashboardClockOffsetMs(undefined, memberClock)).toBe(0);
+    expect(dashboardClockOffsetMs("not-a-date", memberClock)).toBe(0);
+  });
+
   it("uses a strict expiry boundary and renders a second-level countdown", () => {
     expect(isValidLease(lease({ expiresAt: "2026-08-27T08:00:00.001Z" }), LEASE_NOW)).toBe(true);
     expect(isValidLease(lease({ expiresAt: "2026-08-27T08:00:00.000Z" }), LEASE_NOW)).toBe(false);

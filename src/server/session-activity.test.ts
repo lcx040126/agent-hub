@@ -13,6 +13,7 @@ describe("Codex turn activity fencing", () => {
       branch: "main",
       baseCommit: "base-0",
     });
+    expect(session.reused).toBe(false);
     const reused = service.openSession({
       memberToken,
       codexSessionId: "codex-session-1",
@@ -22,6 +23,7 @@ describe("Codex turn activity fencing", () => {
     });
     expect(reused).toMatchObject({
       id: session.id,
+      reused: true,
       codexSessionId: "codex-session-1",
       currentTurnId: "turn-0",
       activityEpoch: 0,
@@ -66,6 +68,10 @@ describe("Codex turn activity fencing", () => {
     expect(stopped).toMatchObject({
       result: "awaiting_commit",
       session: { currentTurnId: "turn-0", activityEpoch: 0 },
+      awaitingAutomaticLeases: [{
+        id: automatic.lease.id,
+        expiresAt: automatic.lease.expiresAt,
+      }],
     });
     expect(stopped.session.turnStoppedAt).not.toBeNull();
     expect(service.getDashboard(memberToken).leases).toEqual(expect.arrayContaining([
@@ -262,6 +268,7 @@ describe("Codex turn activity fencing", () => {
       turnId: "turn-final",
       activityEpoch: 7,
       outcome: "reverted",
+      leaseIds: [automatic.lease.id],
       attributedPaths: ["src/pending.ts"],
     })).toMatchObject({
       result: "released",
@@ -274,6 +281,82 @@ describe("Codex turn activity fencing", () => {
     expect(database.connection.prepare(
       "SELECT status, expires_at FROM leases WHERE id = ?",
     ).get(standard.lease.id)).toEqual({ status: "active", expires_at: standardExpiry });
+    database.close();
+  });
+
+  it.each([
+    { label: "omitted", includeLeaseIds: false },
+    { label: "explicitly empty", includeLeaseIds: true },
+  ])("treats an $label completion lease list as releasing zero leases", ({ includeLeaseIds }) => {
+    const { database, service, memberToken } = testService();
+    const session = service.openSession({
+      memberToken,
+      codexSessionId: "codex-session-empty-completion-list",
+      turnId: "turn-empty-completion-list",
+      activityEpoch: 4,
+    });
+    const automatic = service.claimLease({
+      memberToken,
+      sessionId: session.id,
+      title: "Automatic lease must remain",
+      paths: ["src/automatic-empty-list.ts"],
+      kind: "automatic",
+    });
+    const standard = service.claimLease({
+      memberToken,
+      sessionId: session.id,
+      title: "Manual standard must remain unchanged",
+      paths: ["src/standard-empty-list.ts"],
+      kind: "standard",
+    });
+    const exclusive = service.claimLease({
+      memberToken,
+      sessionId: session.id,
+      title: "Manual exclusive must remain unchanged",
+      paths: ["src/exclusive-empty-list.ts"],
+      kind: "exclusive",
+      ttlMinutes: 30,
+    });
+    if (!automatic.acquired || !standard.acquired || !exclusive.acquired) {
+      throw new Error("Test leases were not acquired.");
+    }
+    const manualBefore = new Map(
+      [standard.lease, exclusive.lease].map((lease) => [lease.id, {
+        status: lease.status,
+        expires_at: lease.expiresAt,
+      }]),
+    );
+
+    service.stopSessionActivity({
+      memberToken,
+      sessionId: session.id,
+      operationId: "completion-empty-list",
+      turnId: "turn-empty-completion-list",
+      activityEpoch: 4,
+    });
+    expect(service.completeSessionActivity({
+      memberToken,
+      sessionId: session.id,
+      operationId: "completion-empty-list",
+      turnId: "turn-empty-completion-list",
+      activityEpoch: 4,
+      outcome: "reverted",
+      ...(includeLeaseIds ? { leaseIds: [] } : {}),
+      attributedPaths: [],
+    })).toMatchObject({ result: "released", releasedLeaseIds: [] });
+
+    expect(database.connection.prepare(
+      "SELECT status, automatic_phase, expires_at FROM leases WHERE id = ?",
+    ).get(automatic.lease.id)).toEqual({
+      status: "active",
+      automatic_phase: "awaiting_commit",
+      expires_at: automatic.lease.expiresAt,
+    });
+    for (const lease of [standard.lease, exclusive.lease]) {
+      expect(database.connection.prepare(
+        "SELECT status, expires_at FROM leases WHERE id = ?",
+      ).get(lease.id)).toEqual(manualBefore.get(lease.id));
+    }
     database.close();
   });
 
@@ -421,6 +504,52 @@ describe("Codex turn activity fencing", () => {
     expect(database.connection.prepare(
       "SELECT status FROM leases WHERE id = ?",
     ).get(automatic.lease.id)).toEqual({ status: "expired" });
+    database.close();
+  });
+
+  it("lets an awaiting automatic lease expire at its original TTL", () => {
+    let currentTime = new Date("2026-08-27T12:00:00.000Z");
+    const { database, service, memberToken } = testService(() => currentTime);
+    const session = service.openSession({
+      memberToken,
+      codexSessionId: "codex-session-awaiting-expiry",
+      turnId: "turn-awaiting-expiry",
+      activityEpoch: 21,
+    });
+    const automatic = service.claimLease({
+      memberToken,
+      sessionId: session.id,
+      title: "Awaiting work expires naturally",
+      paths: ["src/awaiting-expiry.ts"],
+      kind: "automatic",
+    });
+    if (!automatic.acquired) throw new Error("Test lease was not acquired.");
+
+    service.stopSessionActivity({
+      memberToken,
+      sessionId: session.id,
+      operationId: "stop-awaiting-expiry",
+      turnId: "turn-awaiting-expiry",
+      activityEpoch: 21,
+    });
+    expect(database.connection.prepare(
+      "SELECT status, automatic_phase, expires_at FROM leases WHERE id = ?",
+    ).get(automatic.lease.id)).toEqual({
+      status: "active",
+      automatic_phase: "awaiting_commit",
+      expires_at: automatic.lease.expiresAt,
+    });
+
+    currentTime = new Date(new Date(automatic.lease.expiresAt).getTime() + 1);
+    expect(service.getDashboard(memberToken).leases.map((lease) => lease.id))
+      .not.toContain(automatic.lease.id);
+    expect(database.connection.prepare(
+      "SELECT status, automatic_phase, expires_at FROM leases WHERE id = ?",
+    ).get(automatic.lease.id)).toEqual({
+      status: "expired",
+      automatic_phase: "awaiting_commit",
+      expires_at: automatic.lease.expiresAt,
+    });
     database.close();
   });
 

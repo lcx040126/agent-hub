@@ -1,8 +1,32 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AttributedPathEvidence } from "./turn-completion.js";
+
+const SESSION_LOCKS_DIRECTORY = "codex-hook-session-locks";
+const SESSION_LOCK_VERSION = 1 as const;
+const SESSION_LOCK_POLL_INTERVAL_MS = 20;
+const SESSION_LOCK_TIMEOUT_MS = 30_000;
+const INVALID_SESSION_LOCK_GRACE_MS = 1_000;
+
+interface SessionLockMarker {
+  version: typeof SESSION_LOCK_VERSION;
+  pid: number;
+  token: string;
+  startedAt: string;
+}
+
+export interface CodexHookStateLockOptions {
+  timeoutMs?: number;
+}
+
+export class CodexHookStateLockTimeoutError extends Error {
+  constructor(codexSessionId: string, timeoutMs: number) {
+    super(`Timed out after ${timeoutMs} ms while waiting for Agent Hub state lock for Codex session ${codexSessionId}.`);
+    this.name = "CodexHookStateLockTimeoutError";
+  }
+}
 
 export interface HookLeaseState {
   id: string;
@@ -66,6 +90,8 @@ export interface CodexHookSessionState {
   currentTurnId?: string;
   pendingCompletion?: HookPendingCompletionState;
   leases: HookLeaseState[];
+  /** false 表示本地状态曾丢失，服务端可能仍有本机尚未恢复的自动租约。 */
+  leaseAttributionComplete?: boolean;
   pendingWrite?: HookPendingWriteState;
   externalChangeDiagnostics?: HookExternalChangeDiagnostic[];
   loadedFeatureVersions?: Record<string, string>;
@@ -77,9 +103,11 @@ export interface CodexHookSessionState {
 
 export class CodexHookStateStore {
   readonly directory: string;
+  private readonly locksDirectory: string;
 
   constructor(userDataPath: string) {
     this.directory = path.join(userDataPath, "codex-hook-sessions");
+    this.locksDirectory = path.join(userDataPath, SESSION_LOCKS_DIRECTORY);
   }
 
   async load(codexSessionId: string): Promise<CodexHookSessionState | undefined> {
@@ -92,7 +120,61 @@ export class CodexHookStateStore {
   }
 
   async save(state: CodexHookSessionState): Promise<void> {
-    const parsed = parseState(JSON.stringify({ ...state, updatedAt: new Date().toISOString() }));
+    await this.writeState(state, true);
+  }
+
+  /**
+   * 同一个 Codex session 的 Stop、PreToolUse 与心跳都必须在这里串行化。
+   * 进程内 Promise 锁无法覆盖独立 Hook 进程，因此使用原子创建的文件作为所有权凭据。
+   */
+  async runExclusive<T>(
+    codexSessionId: string,
+    operation: () => Promise<T>,
+    options: CodexHookStateLockOptions = {},
+  ): Promise<T> {
+    const timeoutMs = positiveFinite(options.timeoutMs ?? SESSION_LOCK_TIMEOUT_MS, "Codex session lock timeout");
+    const release = await this.acquireSessionLock(codexSessionId, timeoutMs);
+    try {
+      return await operation();
+    } finally {
+      await release();
+    }
+  }
+
+  /**
+   * 心跳只能延长服务器已经确认续租的 lease，不能把一次后台维护伪装成用户活动。
+   * 锁内重读可避免用陈旧快照覆盖 Stop/PreToolUse 刚写入的 epoch、pendingCompletion 等字段。
+   */
+  async updateLeaseExpiries(
+    codexSessionId: string,
+    renewedLeases: Array<Pick<HookLeaseState, "id" | "expiresAt">>,
+  ): Promise<CodexHookSessionState | undefined> {
+    const normalizedRenewals = new Map(renewedLeases.map((lease) => [
+      requiredText(lease.id, "lease ID"),
+      isoText(lease.expiresAt, "lease expiry"),
+    ]));
+    return this.runExclusive(codexSessionId, async () => {
+      const state = await this.load(codexSessionId);
+      if (!state) return undefined;
+      let changed = false;
+      const leases = state.leases.map((lease) => {
+        const expiresAt = normalizedRenewals.get(lease.id);
+        if (!expiresAt || expiresAt === lease.expiresAt) return lease;
+        changed = true;
+        return { ...lease, expiresAt };
+      });
+      if (!changed) return state;
+      const updated = { ...state, leases };
+      await this.writeState(updated, false);
+      return updated;
+    });
+  }
+
+  private async writeState(state: CodexHookSessionState, touchUpdatedAt: boolean): Promise<void> {
+    const parsed = parseState(JSON.stringify({
+      ...state,
+      updatedAt: touchUpdatedAt ? new Date().toISOString() : state.updatedAt,
+    }));
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     await restrictPermissions(this.directory, 0o700);
     const destination = this.filePath(parsed.codexSessionId);
@@ -163,6 +245,61 @@ export class CodexHookStateStore {
     const key = createHash("sha256").update(requiredText(codexSessionId, "Codex session ID")).digest("hex");
     return path.join(this.directory, `${key}.json`);
   }
+
+  private lockPath(codexSessionId: string): string {
+    const key = createHash("sha256").update(requiredText(codexSessionId, "Codex session ID")).digest("hex");
+    return path.join(this.locksDirectory, `${key}.lock`);
+  }
+
+  private async acquireSessionLock(
+    codexSessionId: string,
+    timeoutMs: number,
+  ): Promise<() => Promise<void>> {
+    await mkdir(this.locksDirectory, { recursive: true, mode: 0o700 });
+    await restrictPermissions(this.locksDirectory, 0o700);
+    const lockPath = this.lockPath(codexSessionId);
+    const marker: SessionLockMarker = {
+      version: SESSION_LOCK_VERSION,
+      pid: process.pid,
+      token: randomUUID(),
+      startedAt: new Date().toISOString(),
+    };
+    const deadline = Date.now() + timeoutMs;
+
+    while (true) {
+      try {
+        await writeFile(lockPath, `${JSON.stringify(marker)}\n`, {
+          encoding: "utf8",
+          flag: "wx",
+          mode: 0o600,
+        });
+        await restrictPermissions(lockPath, 0o600);
+        break;
+      } catch (error) {
+        if (!isAlreadyExists(error)) throw error;
+        if (await canReclaimSessionLock(lockPath)) {
+          await unlink(lockPath).catch((unlinkError: unknown) => {
+            if (!isMissingFile(unlinkError)) throw unlinkError;
+          });
+          continue;
+        }
+        if (Date.now() >= deadline) {
+          throw new CodexHookStateLockTimeoutError(codexSessionId, timeoutMs);
+        }
+        await delay(SESSION_LOCK_POLL_INTERVAL_MS);
+      }
+    }
+
+    return async () => {
+      try {
+        const current = parseSessionLock(await readFile(lockPath, "utf8"));
+        // 只删除自己创建的锁，避免异常恢复期间误删后继进程刚取得的所有权。
+        if (current.token === marker.token) await unlink(lockPath);
+      } catch (error) {
+        if (!isMissingFile(error)) throw error;
+      }
+    };
+  }
 }
 
 export function parseState(raw: string): CodexHookSessionState {
@@ -207,6 +344,9 @@ export function parseState(raw: string): CodexHookSessionState {
       ? undefined
       : parsePendingCompletion(value.pendingCompletion),
     leases: Array.isArray(value.leases) ? value.leases.map(parseLease) : [],
+    leaseAttributionComplete: value.leaseAttributionComplete === undefined
+      ? true
+      : booleanValue(value.leaseAttributionComplete, "lease attribution completeness"),
     pendingWrite: value.pendingWrite === undefined ? undefined : parsePendingWrite(value.pendingWrite),
     externalChangeDiagnostics: value.externalChangeDiagnostics === undefined
       ? undefined
@@ -339,6 +479,16 @@ function nonNegativeInteger(value: unknown, name: string): number {
   return Number(value);
 }
 
+function booleanValue(value: unknown, name: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`The ${name} is invalid.`);
+  return value;
+}
+
+function positiveFinite(value: number, name: string): number {
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`The ${name} must be positive.`);
+  return value;
+}
+
 function requiredText(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`The ${name} is required.`);
   return value.trim();
@@ -368,6 +518,62 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isMissingFile(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "EEXIST");
+}
+
+async function canReclaimSessionLock(lockPath: string): Promise<boolean> {
+  try {
+    const marker = parseSessionLock(await readFile(lockPath, "utf8"));
+    return !isProcessAlive(marker.pid);
+  } catch (error) {
+    if (isMissingFile(error)) return false;
+    // 写入所有权凭据存在极短窗口；只回收已稳定一段时间的损坏锁，避免抢走正在建立的锁。
+    try {
+      const metadata = await stat(lockPath);
+      return Date.now() - metadata.mtimeMs >= INVALID_SESSION_LOCK_GRACE_MS;
+    } catch (statError) {
+      if (isMissingFile(statError)) return false;
+      throw statError;
+    }
+  }
+}
+
+function parseSessionLock(raw: string): SessionLockMarker {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("The Agent Hub Codex session lock is not valid JSON.");
+  }
+  if (!isRecord(value) || value.version !== SESSION_LOCK_VERSION) {
+    throw new Error("The Agent Hub Codex session lock has an unsupported format.");
+  }
+  if (!Number.isSafeInteger(value.pid) || Number(value.pid) <= 0) {
+    throw new Error("The Agent Hub Codex session lock PID is invalid.");
+  }
+  return {
+    version: SESSION_LOCK_VERSION,
+    pid: Number(value.pid),
+    token: requiredIdentifier(value.token, "Codex session lock token"),
+    startedAt: isoText(value.startedAt, "Codex session lock startedAt"),
+  };
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function restrictPermissions(target: string, mode: number): Promise<void> {

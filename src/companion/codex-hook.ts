@@ -30,6 +30,7 @@ import {
   type FeatureGitEvidence,
 } from "./feature-evidence.js";
 import {
+  CodexHookStateLockTimeoutError,
   CodexHookStateStore,
   type CodexHookSessionState,
   type HookLeaseState,
@@ -129,6 +130,7 @@ interface LeaseResponse {
 const MAX_HOOK_INPUT_BYTES = 1024 * 1024;
 const MAX_SESSION_FEATURE_PATHS = 100;
 const LEASE_TTL_MINUTES = 10;
+const STOP_STATE_LOCK_TIMEOUT_MS = 750;
 
 export async function runCodexHook(options: RunCodexHookOptions): Promise<number> {
   const output = options.stdout ?? process.stdout;
@@ -290,6 +292,18 @@ async function handlePreToolUse(
 ): Promise<Record<string, unknown> | undefined> {
   const intent = extractAttributedWriteIntent(input.tool_name, input.tool_input);
   if (!intent.writes) return undefined;
+  const stateStore = new CodexHookStateStore(options.userDataPath);
+  // PreToolUse 会跨多次网络调用读写 epoch、completion 与 pendingWrite；整段串行化才能阻止 Stop 覆盖新回合。
+  return stateStore.runExclusive(input.session_id, () =>
+    handlePreToolUseExclusive(options, input, record, intent));
+}
+
+async function handlePreToolUseExclusive(
+  options: RunCodexHookOptions,
+  input: CodexHookInput,
+  record: ResolvedRoomConnectionRecord,
+  intent: AttributedWriteIntent,
+): Promise<Record<string, unknown> | undefined> {
   const runtime = await findHookRuntime(options, input, record);
   if (!runtime) return undefined;
   if (runtime.state.quarantine) {
@@ -298,13 +312,19 @@ async function handlePreToolUse(
       + " 请停止新增修改，人工检查现有 Git 差异，并结束当前 Codex 会话后再继续。",
     );
   }
-  await resumePendingTurnCompletion({
-    userDataPath: options.userDataPath,
-    state: runtime.state,
-    stateStore: runtime.stateStore,
-    client: runtime.client,
-    turnId: completionTurnId(input, (runtime.state.activityEpoch ?? 0) + 1),
-  });
+  try {
+    await resumePendingTurnCompletion({
+      userDataPath: options.userDataPath,
+      state: runtime.state,
+      stateStore: runtime.stateStore,
+      client: runtime.client,
+      turnId: completionTurnId(input, (runtime.state.activityEpoch ?? 0) + 1),
+    });
+  } catch (error) {
+    if (error instanceof HookIntegrationInactiveError || error instanceof HookCleanupPendingError) throw error;
+    // resume 未得到幂等确认时，旧任务仍可能释放 lease；必须保留本地 job/state 并明确拒绝新写入。
+    return denyOutput(`Agent Hub 尚未确认上一回合已恢复，本次写入已暂停：${humanError(error)}`);
+  }
   const currentTurnId = completionTurnId(input, runtime.state.activityEpoch ?? 0);
   if (runtime.state.currentTurnId !== currentTurnId) {
     runtime.state.currentTurnId = currentTurnId;
@@ -352,6 +372,8 @@ async function handlePreToolUse(
 
   if (paths.length === 0) {
     if (intent.attributedSideEffects && intent.proposalHash) {
+      const stopFence = await adoptConcurrentStopFence(options.userDataPath, runtime);
+      if (stopFence) return stopFence;
       setPendingWrite(runtime, input, intent, proposedEdits);
       await runtime.stateStore.save(runtime.state);
       return allowOutput(
@@ -361,11 +383,18 @@ async function handlePreToolUse(
     const hasRepositoryLease = runtime.state.leases.some((lease) =>
       lease.paths.some((leasePath) => leasePath === "."),
     );
-    if (hasRepositoryLease) return allowOutput("Agent Hub 已确认当前会话持有整个仓库的写入范围。");
+    if (hasRepositoryLease) {
+      const stopFence = await adoptConcurrentStopFence(options.userDataPath, runtime);
+      if (stopFence) return stopFence;
+      return allowOutput("Agent Hub 已确认当前会话持有整个仓库的写入范围。");
+    }
     return denyOutput(
       "Agent Hub 无法从这条命令确定将写入哪些文件。请让 Agent 改用 apply_patch，或先通过 lease_acquire 明确领取最小路径后再执行。",
     );
   }
+
+  const stopFenceBeforePrepare = await adoptConcurrentStopFence(options.userDataPath, runtime);
+  if (stopFenceBeforePrepare) return stopFenceBeforePrepare;
 
   let prepared: PrepareEditsResponse;
   try {
@@ -396,6 +425,8 @@ async function handlePreToolUse(
       expiresAt: prepared.claim.lease.expiresAt,
     });
   }
+  const stopFenceAfterPrepare = await adoptConcurrentStopFence(options.userDataPath, runtime);
+  if (stopFenceAfterPrepare) return stopFenceAfterPrepare;
   if (prepared.check.allowed) {
     setPendingWrite(runtime, input, intent, proposedEdits);
     await runtime.stateStore.save(runtime.state);
@@ -408,6 +439,34 @@ async function handlePreToolUse(
     return denyOutput(formatConflicts(prepared.claim.conflicts ?? [], prepared.claim.decision));
   }
   return denyOutput(formatEditBlockers(prepared.check.blockers, runtime.state.hubSessionId));
+}
+
+async function adoptConcurrentStopFence(
+  userDataPath: string,
+  runtime: HookRuntime,
+): Promise<Record<string, unknown> | undefined> {
+  const jobs = await new TurnCompletionQueueStore(userDataPath).listForSession(
+    runtime.state.codexSessionId,
+  );
+  const currentEpoch = runtime.state.activityEpoch ?? 0;
+  const candidate = jobs
+    .filter((job) => job.activityEpoch >= currentEpoch)
+    .at(-1);
+  if (!candidate) return undefined;
+
+  if (candidate.activityEpoch === currentEpoch) {
+    // Stop 在本次 PreToolUse 持锁期间到达时，由锁持有者接管 fence，防止放行后同 epoch 被晚到 worker 停止。
+    runtime.state.pendingCompletion = {
+      operationId: candidate.operationId,
+      turnId: candidate.turnId,
+      activityEpoch: candidate.activityEpoch,
+      phase: "awaiting_commit",
+      recordedAt: candidate.createdAt,
+    };
+    runtime.state.currentTurnId = candidate.turnId;
+    await runtime.stateStore.save(runtime.state);
+  }
+  return denyOutput("Agent Hub 已收到并发的回合结束信号，本次写入已暂停；请在完成状态确认后重试。");
 }
 
 interface FeatureMemoryCardResponse {
@@ -497,12 +556,16 @@ async function handlePostToolUse(
   runtime.state.attributedPathsTruncated = runtime.state.attributedPathsTruncated === true
     || accumulatedAttributedPaths.length > MAX_SESSION_FEATURE_PATHS;
   runtime.state.attributedChangedPaths = accumulatedAttributedPaths.slice(0, MAX_SESSION_FEATURE_PATHS);
-  const pathEvidence = await collectAttributedPathEvidence(
+  const initialChangedPathKeys = new Set(runtime.state.initialChangedPaths.map(pathKey));
+  const pathEvidence = (await collectAttributedPathEvidence(
     runtime.git.repositoryRoot,
     runtime.state.baseCommit,
     newlyObserved,
     { gitExecutable: options.gitExecutable },
-  );
+  )).map((evidence) => initialChangedPathKeys.has(pathKey(evidence.path))
+    // 会话开始时已经脏的路径，其真实任务基线不是 baseCommit；保守标记未知，避免误释放 lease。
+    ? { ...evidence, baseEntry: null }
+    : evidence);
   runtime.state.attributedPathEvidence = mergeAttributedPathEvidence(
     runtime.state.attributedPathEvidence ?? [],
     pathEvidence,
@@ -600,70 +663,179 @@ async function handleStop(
   input: CodexHookInput,
 ): Promise<void> {
   const stateStore = new CodexHookStateStore(options.userDataPath);
-  const state = await stateStore.load(input.session_id);
-  if (!state || (state.pendingCompletion && state.pendingCompletion.phase !== "awaiting_commit")) return;
-
+  // marker 前只读取 connectionId；暂停若抢先完成清理，marker 内重读会看到 state 已不存在并直接退出。
+  const initialState = await stateStore.load(input.session_id);
+  if (!initialState) return;
   const queue = new TurnCompletionQueueStore(options.userDataPath);
-  const activityEpoch = state.activityEpoch ?? 0;
-  const existingJobs = await queue.listForSession(state.codexSessionId);
-  let job = existingJobs.find((candidate) =>
-    candidate.activityEpoch === activityEpoch
-    && candidate.operationId === state.pendingCompletion?.operationId);
-  if (!job) {
-    const operationId = state.pendingCompletion?.activityEpoch === activityEpoch
-      ? state.pendingCompletion.operationId
-      : randomUUID();
-    const turnId = state.pendingCompletion?.activityEpoch === activityEpoch
-      ? state.pendingCompletion.turnId
-      : completionTurnId(input, activityEpoch);
-    // 持久化队列是 Stop 的第一项不可逆动作；Git 和网络检查只能发生在它之后。
-    job = await queue.enqueue({ operationId, turnId, activityEpoch, state });
-  }
-  state.pendingCompletion = {
-    operationId: job.operationId,
-    turnId: job.turnId,
-    activityEpoch: job.activityEpoch,
-    phase: "awaiting_commit",
-    recordedAt: job.createdAt,
-  };
-  state.currentTurnId = job.turnId;
-  await stateStore.save(state);
+  await new IntegrationOperationTracker(options.userDataPath).run(initialState.connectionId, async () => {
+    const snapshot = await stateStore.load(input.session_id);
+    if (!snapshot || snapshot.connectionId !== initialState.connectionId) return;
+    if (snapshot.pendingCompletion?.phase === "stopped") return;
 
-  try {
-    await new IntegrationOperationTracker(options.userDataPath).run(state.connectionId, async () => {
-      const record = await resolveConnectionRecordById(
-        options.userDataPath,
-        state.connectionId,
-        options.protector,
-      );
-      if (!record) return;
+    const knownRecord = await resolveOptionalConnectionRecordById(
+      options.userDataPath,
+      snapshot.connectionId,
+      options.protector,
+    );
+    if (knownRecord) {
       const integration = await getLocalIntegrationStatus(
         options.userDataPath,
-        record.connection,
+        knownRecord.connection,
         options.runtimePresencePath,
       );
       if (!integration.active || !integration.remoteAllowed) return;
+    }
+
+    // 先写保守 fence job：即使 PreToolUse 长时间持锁，Stop 也能在宿主预算内留下不可误释放的本地证据。
+    const fenced = await ensureStopCompletionJob(queue, snapshot, input, true);
+    let job: TurnCompletionJob | undefined = fenced.job;
+    let connectionId: string | undefined;
+    try {
+      await stateStore.runExclusive(input.session_id, async () => {
+        const state = await stateStore.load(input.session_id);
+        if (!state || state.connectionId !== initialState.connectionId) {
+          if (fenced.created) await queue.remove(fenced.job.operationId);
+          job = undefined;
+          return;
+        }
+        if (state.pendingCompletion?.phase === "stopped") {
+          if (fenced.created) await queue.remove(fenced.job.operationId);
+          job = undefined;
+          return;
+        }
+
+        const authoritativeTurnId = state.pendingCompletion?.turnId ?? state.currentTurnId;
+        const explicitStopTurnId = input.turn_id?.trim();
+        const activityAdvanced = (state.activityEpoch ?? 0) > (snapshot.activityEpoch ?? 0);
+        if (
+          (explicitStopTurnId
+            && authoritativeTurnId
+            && explicitStopTurnId !== authoritativeTurnId
+            && state.pendingWrite !== undefined)
+          || (activityAdvanced && state.pendingCompletion?.phase !== "resuming")
+        ) {
+          // 新 turn 已经越过本次 Stop 的 fence；旧 Stop 只能丢弃，不能把新 epoch 写回 awaiting。
+          if (fenced.created) await queue.remove(fenced.job.operationId);
+          job = undefined;
+          return;
+        }
+
+        const current = await ensureStopCompletionJob(queue, state, input, false);
+        if (fenced.created && fenced.job.operationId !== current.job.operationId) {
+          await queue.remove(fenced.job.operationId);
+        }
+        job = current.job;
+
+        const currentRecord = await resolveOptionalConnectionRecordById(
+          options.userDataPath,
+          state.connectionId,
+          options.protector,
+        );
+        if (currentRecord) {
+          const integration = await getLocalIntegrationStatus(
+            options.userDataPath,
+            currentRecord.connection,
+            options.runtimePresencePath,
+          );
+          // marker 已登记的 job 留给 pause/shutdown 在 drain 后统一判断；这里只禁止新的 state 回写。
+          if (!integration.active || !integration.remoteAllowed) return;
+        }
+
+        state.pendingCompletion = {
+          operationId: job.operationId,
+          turnId: job.turnId,
+          activityEpoch: job.activityEpoch,
+          phase: "awaiting_commit",
+          recordedAt: job.createdAt,
+        };
+        state.currentTurnId = job.turnId;
+        await stateStore.save(state);
+        connectionId = state.connectionId;
+      }, { timeoutMs: STOP_STATE_LOCK_TIMEOUT_MS });
+    } catch (error) {
+      if (!(error instanceof CodexHookStateLockTimeoutError)) throw error;
+      // fence job 已经包含 truncated 标记；锁持有者结束前不得再以陈旧 state 写入。
+      return;
+    }
+
+    if (!job || !connectionId) return;
+    try {
+      // 持久化后再次读取 gate；marker 会让 pause/shutdown 等到这里退出后再决定清理或保留任务。
+      await assertHookIntegrationActive(options, connectionId);
+      const record = await resolveConnectionRecordById(
+        options.userDataPath,
+        connectionId,
+        options.protector,
+      );
+      if (!record) return;
       const resolved = await hydrateConnectionRecord(record);
       const client = new AgentHubClient({
         serverUrl: resolved.connection.serverUrl,
         memberToken: resolved.memberToken,
-        fetchImpl: options.fetchImpl,
+        fetchImpl: createHookGatedFetch(options, connectionId),
         timeoutMs: 500,
       });
-      await queue.runExclusive(job!.operationId, async () => {
+      await queue.runExclusive(job.operationId, async () => {
         const pending = await processTurnCompletionJob(job!, {
           userDataPath: options.userDataPath,
           client,
           gitExecutable: options.gitExecutable,
           gitTimeoutMs: 350,
         });
-        if (pending) await queue.recordRetry(job!, pending.error);
-        else await queue.remove(job!.operationId);
+        if (pending) {
+          const latest = await stateStore.load(job!.codexSessionId);
+          // 新 epoch 已经恢复后，旧 Stop 的证据诊断不再权威；直接丢弃旧 job，不能回写或继续重试。
+          if ((latest?.activityEpoch ?? 0) > job!.activityEpoch) await queue.remove(job!.operationId);
+          else await queue.recordRetry(job!, pending.error);
+        } else await queue.remove(job!.operationId);
       });
-    });
-  } catch {
-    // 15 秒后台 worker 继续使用同一 operationId 重试；Stop 始终允许 Codex 结束本回合。
-  }
+    } catch {
+      // 15 秒后台 worker 继续使用同一 operationId 重试；Stop 始终允许 Codex 结束本回合。
+    }
+  });
+}
+
+async function ensureStopCompletionJob(
+  queue: TurnCompletionQueueStore,
+  state: CodexHookSessionState,
+  input: CodexHookInput,
+  conservative: boolean,
+): Promise<{ job: TurnCompletionJob; created: boolean }> {
+  const activityEpoch = state.pendingCompletion?.activityEpoch ?? state.activityEpoch ?? 0;
+  const turnId = state.pendingCompletion?.turnId ?? completionTurnId(input, activityEpoch);
+  const existingJobs = await queue.listForSession(state.codexSessionId);
+  const existing = state.pendingCompletion?.phase === "awaiting_commit"
+    ? existingJobs.find((candidate) =>
+        candidate.activityEpoch === activityEpoch
+        && candidate.operationId === state.pendingCompletion?.operationId)
+    : existingJobs.find((candidate) =>
+        candidate.activityEpoch === activityEpoch
+        && candidate.turnId === turnId
+        && candidate.operationId !== state.pendingCompletion?.operationId);
+  if (existing && conservative) return { job: existing, created: false };
+
+  // resuming 的 operationId 属于恢复请求，Stop 必须使用新的幂等键表达同一 epoch 的完成检查。
+  const operationId = existing?.operationId
+    ?? (state.pendingCompletion?.phase === "awaiting_commit"
+      ? state.pendingCompletion.operationId
+      : randomUUID());
+  const queuedState = conservative
+    ? { ...state, attributedPathsTruncated: true }
+    : state;
+  return {
+    job: await queue.enqueue({ operationId, turnId, activityEpoch, state: queuedState }),
+    created: !existing,
+  };
+}
+
+async function resolveOptionalConnectionRecordById(
+  userDataPath: string,
+  connectionId: string,
+  protector?: SecretProtector,
+): Promise<ResolvedRoomConnectionRecord | undefined> {
+  const store = await openConnectionStore(userDataPath, protector);
+  const connection = await store.get(connectionId);
+  return connection ? { connection, store } : undefined;
 }
 
 async function handleSessionEnd(
@@ -857,6 +1029,7 @@ async function openHookRuntime(
       currentTurnId?: string | null;
       activityEpoch?: number;
       turnStoppedAt?: string | null;
+      reused?: boolean;
     } }>("/api/sessions", {
       clientName: "Agent Hub Codex hook",
       agentName: "Codex",
@@ -901,6 +1074,8 @@ async function openHookRuntime(
         recordedAt: opened.session.turnStoppedAt,
       } : undefined,
       leases: [],
+      // 没有本地 state 却复用了远端 session 时，旧租约与旧归因路径都不能凭空重建。
+      leaseAttributionComplete: opened.session.reused === false,
       openedAt: now,
       updatedAt: now,
     };

@@ -328,6 +328,7 @@ describe("Agent Hub REST API", () => {
 
     const dashboard = await auth(request(app).get("/api/dashboard"), joined.body.token);
     expect(dashboard.status).toBe(200);
+    expect(Date.parse(dashboard.body.generatedAt)).not.toBeNaN();
     expect(dashboard.body.members.map((member: { name: string }) => member.name)).toEqual([
       "Alice",
       "Bob",

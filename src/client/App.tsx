@@ -180,6 +180,15 @@ export function formatLeaseExpiryCountdown(value: string | undefined, now = Date
   return `${seconds} 秒后到期`;
 }
 
+export function dashboardClockOffsetMs(
+  generatedAt: string | undefined,
+  localObservedAt = Date.now(),
+): number {
+  if (!generatedAt) return 0;
+  const serverObservedAt = Date.parse(generatedAt);
+  return Number.isFinite(serverObservedAt) ? serverObservedAt - localObservedAt : 0;
+}
+
 function shortCommit(value?: string): string {
   if (!value) return "未记录";
   return value.length > 10 ? value.slice(0, 10) : value;
@@ -1542,17 +1551,19 @@ function ConnectionView({
   dashboard,
   session,
   online,
+  now,
   deleting,
   onRemoveLocal,
 }: {
   dashboard: Dashboard;
   session: Session;
   online: boolean;
+  now: number;
   deleting: boolean;
   onRemoveLocal: () => void;
 }) {
   const currentSessions = dashboard.sessions.filter((item) =>
-    item.memberId === dashboard.currentMember.id && isRealtimeAgentSession(item));
+    item.memberId === dashboard.currentMember.id && isRealtimeAgentSession(item, now));
   const latestScan = dashboard.localScans
     .filter((item) => item.memberId === dashboard.currentMember.id)
     .sort((left, right) => (right.scannedAt ?? "").localeCompare(left.scannedAt ?? ""))[0];
@@ -1898,6 +1909,7 @@ function DashboardApp({
   const [busyLeaseId, setBusyLeaseId] = useState<string>();
   const [transientConflicts, setTransientConflicts] = useState<Conflict[]>([]);
   const [dismissedReleaseRequestIds, setDismissedReleaseRequestIds] = useState<Set<string>>(() => new Set());
+  const [serverClockOffsetMs, setServerClockOffsetMs] = useState(0);
   const [leaseNow, setLeaseNow] = useState(() => Date.now());
   const closingLease = activeModal?.type === "close" ? activeModal.lease : null;
   const releaseRequestId = activeModal?.type === "release" ? activeModal.requestId : undefined;
@@ -1913,7 +1925,11 @@ function DashboardApp({
       const next = await getDashboard(session, session.roomToken);
       if (!next.currentMember.id) next.currentMember = session.member;
       if (!next.members.some((member) => member.id === next.currentMember.id)) next.members.unshift(next.currentMember);
+      const localObservedAt = Date.now();
+      const nextClockOffsetMs = dashboardClockOffsetMs(next.generatedAt, localObservedAt);
       setDashboard(next);
+      setServerClockOffsetMs(nextClockOffsetMs);
+      setLeaseNow(localObservedAt + nextClockOffsetMs);
       setOnline(true);
       setError("");
     } catch (caught) {
@@ -1943,9 +1959,11 @@ function DashboardApp({
   }, [refresh]);
 
   useEffect(() => {
-    const interval = window.setInterval(() => setLeaseNow(Date.now()), 1_000);
+    const updateClock = () => setLeaseNow(Date.now() + serverClockOffsetMs);
+    updateClock();
+    const interval = window.setInterval(updateClock, 1_000);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [serverClockOffsetMs]);
 
   useEffect(() => {
     if (!notice) return;
@@ -2084,7 +2102,7 @@ function DashboardApp({
           {view === "work" && <WorkView dashboard={dashboard} busyLeaseId={busyLeaseId} transientConflicts={transientConflicts} now={leaseNow} onClaim={() => openModal({ type: "claim" })} onRenew={handleRenew} onClose={(lease) => openModal({ type: "close", lease })} />}
           {view === "records" && <RecordsView dashboard={dashboard} onAdd={(recordKind) => openModal({ type: "record", recordKind })} />}
           {view === "management" && <ManagementView dashboard={dashboard} session={session} onRefresh={() => refresh(true)} onNotice={(message, tone = "success") => setNotice({ message, tone })} />}
-          {view === "connection" && <ConnectionView dashboard={dashboard} session={session} online={online} deleting={deletingCurrentConnection} onRemoveLocal={onDeleteCurrentConnection} />}
+          {view === "connection" && <ConnectionView dashboard={dashboard} session={session} online={online} now={leaseNow} deleting={deletingCurrentConnection} onRemoveLocal={onDeleteCurrentConnection} />}
         </main>
       </div>
       {activeModal?.type === "claim" && <ClaimLeaseModal settings={dashboard.settings} onClose={() => setActiveModal(null)} onSubmit={handleClaim} />}

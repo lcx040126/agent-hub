@@ -16,6 +16,7 @@ export interface TurnCompletionJob {
   branch: string;
   baseCommit: string;
   leaseIds: string[];
+  leaseAttributionComplete: boolean;
   attributedPaths: string[];
   baselineEvidence: AttributedPathEvidence[];
   attributedPathsTruncated: boolean;
@@ -35,7 +36,10 @@ export interface EnqueueTurnCompletionInput {
   state: CodexHookSessionState;
 }
 
-const FALLBACK_JOB_TTL_MS = 10 * 60_000;
+export type TurnCompletionQueueDiagnostic = (error: Error, filePath: string) => void;
+
+const DEFAULT_JOB_TTL_MS = 10 * 60_000;
+const MAX_AUTOMATIC_LEASE_TTL_MS = 60 * 60_000;
 const STALE_LOCK_MS = 30_000;
 
 export class TurnCompletionQueueStore {
@@ -51,6 +55,12 @@ export class TurnCompletionQueueStore {
       .map((lease) => Date.parse(lease.expiresAt))
       .filter(Number.isFinite)
       .reduce((latest, candidate) => Math.max(latest, candidate), 0);
+    const attributedPaths = unique(input.state.attributedChangedPaths ?? []);
+    const baselineEvidence = uniqueEvidence(input.state.attributedPathEvidence ?? []);
+    const leaseAttributionComplete = input.state.leaseAttributionComplete !== false;
+    const expiresAt = leaseAttributionComplete
+      ? (leaseExpiry > 0 ? leaseExpiry : now.getTime() + DEFAULT_JOB_TTL_MS)
+      : Math.max(leaseExpiry, now.getTime() + MAX_AUTOMATIC_LEASE_TTL_MS);
     const job: TurnCompletionJob = {
       version: 1,
       operationId: requiredId(input.operationId, "completion operation ID"),
@@ -63,12 +73,14 @@ export class TurnCompletionQueueStore {
       branch: requiredText(input.state.branch, "branch"),
       baseCommit: requiredText(input.state.baseCommit, "base commit"),
       leaseIds: unique(input.state.leases.map((lease) => lease.id)),
-      attributedPaths: unique(input.state.attributedChangedPaths ?? []),
-      baselineEvidence: uniqueEvidence(input.state.attributedPathEvidence ?? []),
+      leaseAttributionComplete,
+      attributedPaths,
+      baselineEvidence,
       attributedPathsTruncated: input.state.attributedPathsTruncated === true,
       attributionComplete: input.state.pendingWrite === undefined
-        && input.state.attributedPathsTruncated !== true,
-      expiresAt: new Date(leaseExpiry > 0 ? leaseExpiry : now.getTime() + FALLBACK_JOB_TTL_MS).toISOString(),
+        && input.state.attributedPathsTruncated !== true
+        && hasCompleteAttributionEvidence(attributedPaths, baselineEvidence),
+      expiresAt: new Date(expiresAt).toISOString(),
       attempts: 0,
       nextAttemptAt: timestamp,
       lastError: null,
@@ -90,7 +102,7 @@ export class TurnCompletionQueueStore {
     }
   }
 
-  async list(): Promise<TurnCompletionJob[]> {
+  async list(onDiagnostic?: TurnCompletionQueueDiagnostic): Promise<TurnCompletionJob[]> {
     let names: string[];
     try {
       names = (await readdir(this.directory, { withFileTypes: true }))
@@ -100,14 +112,35 @@ export class TurnCompletionQueueStore {
       if (isMissingFile(error)) return [];
       throw error;
     }
-    const jobs = await Promise.all(names.map(async (name) =>
-      parseTurnCompletionJob(await readFile(path.join(this.directory, name), "utf8"))));
-    return jobs.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    const jobs = await Promise.all(names.map(async (name) => {
+      const filePath = path.join(this.directory, name);
+      try {
+        return parseTurnCompletionJob(await readFile(filePath, "utf8"));
+      } catch (error) {
+        if (isMissingFile(error)) return undefined;
+        const diagnostic = new Error(
+          `Skipped invalid Agent Hub turn-completion queue entry ${name}: ${errorMessage(error)}`,
+          { cause: error },
+        );
+        try {
+          onDiagnostic?.(diagnostic, filePath);
+        } catch {
+          // 诊断处理本身不能让一个损坏条目重新阻断其他完成任务。
+        }
+        return undefined;
+      }
+    }));
+    return jobs
+      .filter((job): job is TurnCompletionJob => job !== undefined)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
-  async listForSession(codexSessionId: string): Promise<TurnCompletionJob[]> {
+  async listForSession(
+    codexSessionId: string,
+    onDiagnostic?: TurnCompletionQueueDiagnostic,
+  ): Promise<TurnCompletionJob[]> {
     const selected = requiredText(codexSessionId, "Codex session ID");
-    return (await this.list()).filter((job) => job.codexSessionId === selected);
+    return (await this.list(onDiagnostic)).filter((job) => job.codexSessionId === selected);
   }
 
   async runExclusive<T>(operationId: string, task: () => Promise<T>): Promise<T | undefined> {
@@ -222,6 +255,9 @@ export function parseTurnCompletionJob(raw: string): TurnCompletionJob {
     branch: requiredText(value.branch, "branch"),
     baseCommit: requiredText(value.baseCommit, "base commit"),
     leaseIds: stringArray(value.leaseIds),
+    leaseAttributionComplete: value.leaseAttributionComplete === undefined
+      ? stringArray(value.leaseIds).length > 0
+      : booleanValue(value.leaseAttributionComplete, "lease attribution completeness"),
     attributedPaths: stringArray(value.attributedPaths),
     baselineEvidence: value.baselineEvidence.map(parseEvidence),
     attributedPathsTruncated: value.attributedPathsTruncated === true,
@@ -248,6 +284,19 @@ function uniqueEvidence(values: AttributedPathEvidence[]): AttributedPathEvidenc
   const result = new Map<string, AttributedPathEvidence>();
   for (const value of values) result.set(pathKey(value.path), { ...value });
   return [...result.values()];
+}
+
+function hasCompleteAttributionEvidence(
+  attributedPaths: string[],
+  evidence: AttributedPathEvidence[],
+): boolean {
+  const attributedKeys = new Set(attributedPaths.map(pathKey));
+  if (attributedKeys.size !== attributedPaths.length || evidence.length !== attributedKeys.size) return false;
+  const evidenceByPath = new Map(evidence.map((entry) => [pathKey(entry.path), entry]));
+  return [...attributedKeys].every((key) => {
+    const entry = evidenceByPath.get(key);
+    return entry?.baseEntry !== null && entry?.attributedEntry !== null;
+  });
 }
 
 function serialize(job: TurnCompletionJob): string {
@@ -287,6 +336,11 @@ function nonNegativeInteger(value: unknown, name: string): number {
   return Number(value);
 }
 
+function booleanValue(value: unknown, name: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`The ${name} is invalid.`);
+  return value;
+}
+
 function stringArray(value: unknown): string[] {
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
     throw new Error("The Agent Hub turn-completion queue contains an invalid string list.");
@@ -312,6 +366,10 @@ function isMissingFile(error: unknown): boolean {
 
 function isAlreadyExists(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "EEXIST");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function restrictPermissions(target: string, mode: number): Promise<void> {

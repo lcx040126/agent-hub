@@ -105,6 +105,34 @@ describe("Agent write attribution", () => {
     expect(result.external).toEqual([]);
   });
 
+  it("attributes a tracked dirty path that the tool restores to clean", () => {
+    const result = attributedChangedPaths(
+      {
+        changedPaths: ["src/restored.ts"],
+        changedPathFingerprints: { "src/restored.ts": "dirty-content" },
+      },
+      { changedPaths: [], changedPathFingerprints: {} },
+      ["src/restored.ts"],
+      false,
+    );
+
+    expect(result).toEqual({ attributed: ["src/restored.ts"], external: [] });
+  });
+
+  it("attributes an initially untracked path that the tool deletes", () => {
+    const result = attributedChangedPaths(
+      {
+        changedPaths: ["src/temporary.ts"],
+        changedPathFingerprints: { "src/temporary.ts": "untracked-content" },
+      },
+      { changedPaths: [], changedPathFingerprints: {} },
+      ["src/temporary.ts"],
+      false,
+    );
+
+    expect(result).toEqual({ attributed: ["src/temporary.ts"], external: [] });
+  });
+
   it("ignores read-only shell commands", () => {
     expect(extractAttributedWriteIntent("Bash", { command: "git diff -- src/app.ts" })).toMatchObject({
       writes: false,

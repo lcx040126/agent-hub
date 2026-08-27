@@ -37,6 +37,13 @@ export interface StartCodexSessionHeartbeatOptions {
   operationTracker?: Pick<ConnectionOperationTracker, "run">;
 }
 
+interface HeartbeatResponse {
+  renewedLeases?: Array<{
+    id: string;
+    expiresAt: string;
+  }>;
+}
+
 const DEFAULT_INTERVAL_MS = 2 * 60_000;
 const ACTIVE_STATE_MAX_AGE_MS = 5 * 60_000;
 const PENDING_WRITE_MAX_AGE_MS = 2 * 60 * 60_000;
@@ -81,7 +88,7 @@ async function heartbeatAll(
 ): Promise<void> {
   const states = await readHookStates(stateStore, options.onError);
   const pendingCompletionSessions = new Set(
-    (await new TurnCompletionQueueStore(options.userDataPath).list())
+    (await new TurnCompletionQueueStore(options.userDataPath).list((error) => options.onError?.(error)))
       .map((job) => job.codexSessionId),
   );
   const now = (options.now?.() ?? new Date()).getTime();
@@ -114,13 +121,20 @@ async function heartbeatAll(
           memberToken,
           fetchImpl: options.fetchImpl,
         });
-        await client.post(`/api/sessions/${encodeURIComponent(state.hubSessionId)}/heartbeat`, {
-          clientVersion: AGENT_HUB_VERSION,
-          protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
-          schemaVersion: AGENT_HUB_SCHEMA_VERSION,
-          turnId: state.currentTurnId,
-          activityEpoch: state.activityEpoch ?? 0,
-        });
+        const heartbeat = await client.post<HeartbeatResponse>(
+          `/api/sessions/${encodeURIComponent(state.hubSessionId)}/heartbeat`,
+          {
+            clientVersion: AGENT_HUB_VERSION,
+            protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+            schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+            turnId: state.currentTurnId,
+            activityEpoch: state.activityEpoch ?? 0,
+          },
+        );
+        await stateStore.updateLeaseExpiries(
+          state.codexSessionId,
+          heartbeat.renewedLeases ?? [],
+        );
       });
     } catch (error) {
       if (error instanceof AgentHubHttpError && error.status === 404) {

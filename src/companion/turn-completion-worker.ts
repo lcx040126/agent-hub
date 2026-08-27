@@ -54,6 +54,25 @@ type StopResult = "awaiting_commit" | "already_applied" | "superseded";
 type ResumeResult = "resumed" | "already_applied" | "superseded";
 type CompletionResult = "released" | "awaiting_commit" | "already_applied" | "superseded";
 
+interface StopResponse {
+  result: StopResult;
+  awaitingAutomaticLeases?: Array<{
+    id: string;
+    expiresAt: string;
+  }>;
+}
+
+interface ResumeResponse {
+  result: ResumeResult;
+  previousResult?: ResumeResult;
+  session?: {
+    status?: string;
+    currentTurnId?: string | null;
+    activityEpoch?: number;
+    turnStoppedAt?: string | null;
+  };
+}
+
 const DEFAULT_INTERVAL_MS = 15_000;
 
 export function startTurnCompletionWorker(
@@ -93,7 +112,8 @@ async function processQueue(
   operationTracker: Pick<ConnectionOperationTracker, "run">,
 ): Promise<void> {
   const now = options.now?.() ?? new Date();
-  const jobs = (await queue.list()).filter((job) => Date.parse(job.nextAttemptAt) <= now.getTime());
+  const jobs = (await queue.list((error) => options.onError?.(error)))
+    .filter((job) => Date.parse(job.nextAttemptAt) <= now.getTime());
   for (const job of jobs) {
     await operationTracker.run(job.connectionId, async () => {
       await queue.runExclusive(job.operationId, async () => {
@@ -151,7 +171,7 @@ export async function processTurnCompletionJob(
   job: TurnCompletionJob,
   options: ProcessTurnCompletionJobOptions,
 ): Promise<{ error: Error | null } | null> {
-  const stop = await options.client.post<{ result: StopResult }>(
+  const stop = await options.client.post<StopResponse>(
     `/api/sessions/${encodeURIComponent(job.hubSessionId)}/stop`,
     {
       operationId: job.operationId,
@@ -162,6 +182,34 @@ export async function processTurnCompletionJob(
   if (stop.result === "superseded") {
     await clearPendingState(options.userDataPath, job);
     return null;
+  }
+
+  if (Array.isArray(stop.awaitingAutomaticLeases)) {
+    const serverLeases = stop.awaitingAutomaticLeases;
+    const malformed = serverLeases.some((lease) =>
+      !lease || typeof lease.id !== "string" || !lease.id.trim()
+      || typeof lease.expiresAt !== "string" || !Number.isFinite(Date.parse(lease.expiresAt)));
+    if (malformed) {
+      return { error: new Error("Agent Hub returned incomplete automatic lease evidence; preserving protection until TTL.") };
+    }
+    const knownLeaseIds = new Set(job.leaseIds);
+    const unknownLeases = serverLeases.filter((lease) => !knownLeaseIds.has(lease.id));
+    if (unknownLeases.length > 0) {
+      job.expiresAt = new Date(Math.max(...serverLeases.map((lease) => Date.parse(lease.expiresAt)))).toISOString();
+      return {
+        error: new Error(
+          "Local Hook state does not account for every active automatic lease; preserving protection until TTL.",
+        ),
+      };
+    }
+    if (serverLeases.length === 0 && job.leaseIds.length === 0) {
+      await markStoppedState(options.userDataPath, job);
+      return null;
+    }
+  } else {
+    // 只有服务端明确返回租约清单（合法空任务为 []）才能证明没有遗漏；
+    // 字段缺失可能来自旧响应或证据截断，必须保留保护直至 TTL。
+    return { error: new Error("Automatic lease evidence is unavailable; preserving protection until TTL.") };
   }
 
   const evidence = await evaluateTurnCompletionEvidence({
@@ -227,7 +275,7 @@ export async function resumePendingTurnCompletion(
     await options.stateStore.save(options.state);
   }
 
-  const response = await options.client.post<{ result: ResumeResult }>(
+  const response = await options.client.post<ResumeResponse>(
     `/api/sessions/${encodeURIComponent(options.state.hubSessionId)}/resume`,
     {
       operationId: pending.operationId,
@@ -235,14 +283,9 @@ export async function resumePendingTurnCompletion(
       activityEpoch: pending.activityEpoch,
     },
   );
-  if (!new Set<ResumeResult>(["resumed", "already_applied", "superseded"]).has(response.result)) {
-    throw new Error("Agent Hub returned an invalid resume result.");
-  }
-  options.state.activityEpoch = pending.activityEpoch;
-  options.state.currentTurnId = pending.turnId;
-  options.state.pendingCompletion = undefined;
+  applyResumeResponse(options.state, pending, response);
   await options.stateStore.save(options.state);
-  await queue.removeForSession(options.state.codexSessionId, pending.activityEpoch);
+  await queue.removeForSession(options.state.codexSessionId, options.state.activityEpoch);
 }
 
 async function completeResume(
@@ -253,7 +296,7 @@ async function completeResume(
 ): Promise<void> {
   const pending = state.pendingCompletion;
   if (!pending || pending.phase !== "resuming") return;
-  await client.post<{ result: ResumeResult }>(
+  const response = await client.post<ResumeResponse>(
     `/api/sessions/${encodeURIComponent(state.hubSessionId)}/resume`,
     {
       operationId: pending.operationId,
@@ -261,34 +304,93 @@ async function completeResume(
       activityEpoch: pending.activityEpoch,
     },
   );
-  state.pendingCompletion = undefined;
+  const stateStore = new CodexHookStateStore(userDataPath);
+  const resumedEpoch = await stateStore.runExclusive(state.codexSessionId, async () => {
+    const latest = await stateStore.load(state.codexSessionId);
+    if (
+      !latest?.pendingCompletion
+      || latest.pendingCompletion.operationId !== pending.operationId
+      || latest.pendingCompletion.activityEpoch !== pending.activityEpoch
+      || latest.pendingCompletion.phase !== "resuming"
+    ) return undefined;
+    applyResumeResponse(latest, latest.pendingCompletion, response);
+    await stateStore.save(latest);
+    return latest.activityEpoch;
+  });
+  if (resumedEpoch !== undefined) {
+    await queue.removeForSession(state.codexSessionId, resumedEpoch);
+  }
+}
+
+function applyResumeResponse(
+  state: CodexHookSessionState,
+  pending: NonNullable<CodexHookSessionState["pendingCompletion"]>,
+  response: ResumeResponse,
+): void {
+  if (response.result === "resumed") {
+    state.activityEpoch = pending.activityEpoch;
+    state.currentTurnId = pending.turnId;
+    state.pendingCompletion = undefined;
+    return;
+  }
+  if (response.result === "already_applied") {
+    if (response.previousResult !== "resumed") {
+      throw new Error("Agent Hub replayed a resume without a confirmed resumed result.");
+    }
+    state.activityEpoch = pending.activityEpoch;
+    state.currentTurnId = pending.turnId;
+    state.pendingCompletion = undefined;
+    return;
+  }
+  if (response.result !== "superseded") {
+    throw new Error("Agent Hub returned an invalid resume result.");
+  }
+
+  const server = response.session;
+  if (
+    server?.status !== "active"
+    || server.turnStoppedAt !== null
+    || server.currentTurnId !== pending.turnId
+    || !Number.isSafeInteger(server.activityEpoch)
+    || Number(server.activityEpoch) < pending.activityEpoch
+  ) {
+    throw new Error(
+      "Agent Hub superseded the resume request without proving that this turn is active; the write remains blocked.",
+    );
+  }
+
+  // 同一 turn 已由并发请求恢复时，以服务端 epoch 为准；其他 superseded 状态继续保留本地证据并阻止写入。
+  state.activityEpoch = Number(server.activityEpoch);
   state.currentTurnId = pending.turnId;
-  await new CodexHookStateStore(userDataPath).save(state);
-  await queue.removeForSession(state.codexSessionId, pending.activityEpoch);
+  state.pendingCompletion = undefined;
 }
 
 async function clearPendingState(userDataPath: string, job: TurnCompletionJob): Promise<void> {
   const stateStore = new CodexHookStateStore(userDataPath);
-  const state = await stateStore.load(job.codexSessionId);
-  if (
-    !state?.pendingCompletion
-    || state.pendingCompletion.operationId !== job.operationId
-    || state.pendingCompletion.activityEpoch !== job.activityEpoch
-  ) return;
-  state.pendingCompletion = undefined;
-  await stateStore.save(state);
+  await stateStore.runExclusive(job.codexSessionId, async () => {
+    const state = await stateStore.load(job.codexSessionId);
+    if (
+      !state?.pendingCompletion
+      || state.pendingCompletion.operationId !== job.operationId
+      || state.pendingCompletion.activityEpoch !== job.activityEpoch
+    ) return;
+    state.pendingCompletion = undefined;
+    await stateStore.save(state);
+  });
 }
 
 async function markStoppedState(userDataPath: string, job: TurnCompletionJob): Promise<void> {
   const stateStore = new CodexHookStateStore(userDataPath);
-  const state = await stateStore.load(job.codexSessionId);
-  if (
-    !state?.pendingCompletion
-    || state.pendingCompletion.operationId !== job.operationId
-    || state.pendingCompletion.activityEpoch !== job.activityEpoch
-  ) return;
-  state.pendingCompletion.phase = "stopped";
-  await stateStore.save(state);
+  await stateStore.runExclusive(job.codexSessionId, async () => {
+    const state = await stateStore.load(job.codexSessionId);
+    if (
+      !state?.pendingCompletion
+      || state.pendingCompletion.operationId !== job.operationId
+      || state.pendingCompletion.activityEpoch !== job.activityEpoch
+    ) return;
+    state.pendingCompletion.phase = "stopped";
+    await stateStore.save(state);
+  });
 }
 
 async function clientForJob(

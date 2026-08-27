@@ -2,7 +2,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { CodexHookStateStore, type CodexHookSessionState } from "./hook-state.js";
+import {
+  CodexHookStateLockTimeoutError,
+  CodexHookStateStore,
+  type CodexHookSessionState,
+} from "./hook-state.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -32,6 +36,7 @@ describe("CodexHookStateStore", () => {
       attributedChangedPaths: ["src/new.ts"],
       attributedPathsTruncated: true,
       leases: [{ id: "lease-1", paths: ["src/new.ts"], expiresAt: now }],
+      leaseAttributionComplete: false,
       pendingWrite: {
         proposalHash: "a".repeat(64),
         toolName: "apply_patch",
@@ -59,6 +64,7 @@ describe("CodexHookStateStore", () => {
       leases: [{ id: "lease-1", paths: ["src/new.ts"] }],
       attributedChangedPaths: ["src/new.ts"],
       attributedPathsTruncated: true,
+      leaseAttributionComplete: false,
       pendingWrite: { proposedEdits: [{ symbols: ["createItem"] }] },
       externalChangeDiagnostics: [{ paths: ["Assets/Scene.unity"] }],
       loadedFeatureVersions: { "inventory-move": "revision-2" },
@@ -92,6 +98,62 @@ describe("CodexHookStateStore", () => {
     });
     await expect(store.removeForConnections(["connection-b", "connection-b"])).resolves.toBe(1);
     await expect(store.removeForConnections([])).resolves.toBe(0);
+  });
+
+  it("merges renewed lease expiries without refreshing user activity or overwriting state", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-state-renew-"));
+    temporaryDirectories.push(directory);
+    const store = new CodexHookStateStore(directory);
+    const state = stateForConnection(directory, "codex-renew", "connection-a", "hub-a");
+    state.activityEpoch = 4;
+    state.currentTurnId = "turn-4";
+    state.leases = [{
+      id: "lease-1",
+      paths: ["src/value.ts"],
+      expiresAt: "2026-08-27T00:10:00.000Z",
+    }];
+    await store.save(state);
+    const before = (await store.load(state.codexSessionId))!;
+
+    await store.updateLeaseExpiries(state.codexSessionId, [
+      { id: "lease-1", expiresAt: "2026-08-27T00:20:00.000Z" },
+      { id: "unknown-lease", expiresAt: "2026-08-27T00:30:00.000Z" },
+    ]);
+
+    await expect(store.load(state.codexSessionId)).resolves.toMatchObject({
+      activityEpoch: 4,
+      currentTurnId: "turn-4",
+      updatedAt: before.updatedAt,
+      leases: [{
+        id: "lease-1",
+        paths: ["src/value.ts"],
+        expiresAt: "2026-08-27T00:20:00.000Z",
+      }],
+    });
+  });
+
+  it("times out a competing session lock within budget and releases ownership cleanly", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-state-lock-"));
+    temporaryDirectories.push(directory);
+    const store = new CodexHookStateStore(directory);
+    let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { firstEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const first = store.runExclusive("codex-locked", async () => {
+      firstEntered();
+      await release;
+    });
+    await entered;
+
+    await expect(store.runExclusive("codex-locked", async () => undefined, {
+      timeoutMs: 40,
+    })).rejects.toBeInstanceOf(CodexHookStateLockTimeoutError);
+    releaseFirst();
+    await first;
+    await expect(store.runExclusive("codex-locked", async () => "released", {
+      timeoutMs: 100,
+    })).resolves.toBe("released");
   });
 });
 
