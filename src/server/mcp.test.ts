@@ -124,7 +124,7 @@ describe("Agent Hub Streamable HTTP MCP", () => {
 
     expect(client.getServerVersion()).toMatchObject({
       name: "agent-hub",
-      version: "0.2.0",
+      version: "0.2.1",
     });
     expect(client.getInstructions()).toContain("reuse that exact Hook session");
     expect(client.getInstructions()).toContain("do not call session_open");

@@ -22,63 +22,115 @@ interface ConnectionStoreDocument {
 }
 
 export class ConnectionStore {
+  private writeQueue: Promise<void> = Promise.resolve();
+
   constructor(
     readonly filePath: string,
     private readonly protector: SecretProtector,
   ) {}
 
   async list(): Promise<SavedRoomConnection[]> {
+    await this.waitForWrites();
     return (await this.readDocument()).connections
       .map(toPublicConnection)
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
+  async listActive(): Promise<SavedRoomConnection[]> {
+    return (await this.list()).filter((connection) => connection.integrationEnabled);
+  }
+
   async save(input: SaveRoomConnectionInput): Promise<SavedRoomConnection> {
-    if (!this.protector.isEncryptionAvailable()) {
-      throw new Error("Windows secure storage is unavailable, so Agent Hub refused to save the member token.");
-    }
-    const normalized = normalizeConnectionInput(input);
-    const document = await this.readDocument();
-    const existingIndex = normalized.id
-      ? document.connections.findIndex((connection) => connection.id === normalized.id)
-      : -1;
-    if (normalized.id && existingIndex < 0) {
-      throw new Error("The room connection to update does not exist.");
-    }
+    return this.withWriteLock(async () => {
+      if (!this.protector.isEncryptionAvailable()) {
+        throw new Error("Windows secure storage is unavailable, so Agent Hub refused to save the member token.");
+      }
+      const normalized = normalizeConnectionInput(input);
+      const document = await this.readDocument();
+      const existingIndex = normalized.id
+        ? document.connections.findIndex((connection) => connection.id === normalized.id)
+        : -1;
+      if (normalized.id && existingIndex < 0) {
+        throw new Error("The room connection to update does not exist.");
+      }
 
-    const now = new Date().toISOString();
-    const existing = existingIndex >= 0 ? document.connections[existingIndex] : undefined;
-    const encrypted: EncryptedRoomConnection = {
-      id: existing?.id ?? randomUUID(),
-      serverUrl: normalized.serverUrl,
-      repositoryPath: normalized.repositoryPath,
-      roomId: normalized.roomId,
-      roomName: normalized.roomName,
-      memberName: normalized.memberName,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
-      tokenCiphertext: this.protector.encryptString(normalized.memberToken).toString("base64"),
-      tokenProtection: "windows-dpapi-v1",
-    };
+      const now = new Date().toISOString();
+      const existing = existingIndex >= 0 ? document.connections[existingIndex] : undefined;
+      const encrypted: EncryptedRoomConnection = {
+        id: existing?.id ?? randomUUID(),
+        serverUrl: normalized.serverUrl,
+        repositoryPath: normalized.repositoryPath,
+        roomId: normalized.roomId,
+        roomName: normalized.roomName,
+        memberName: normalized.memberName,
+        memberRole: normalized.memberRole ?? existing?.memberRole ?? "member",
+        integrationEnabled: normalized.integrationEnabled ?? existing?.integrationEnabled ?? true,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        tokenCiphertext: this.protector.encryptString(normalized.memberToken).toString("base64"),
+        tokenProtection: "windows-dpapi-v1",
+      };
 
-    if (existingIndex >= 0) document.connections[existingIndex] = encrypted;
-    else document.connections.push(encrypted);
-    await this.writeDocument(document);
-    return toPublicConnection(encrypted);
+      if (existingIndex >= 0) document.connections[existingIndex] = encrypted;
+      else document.connections.push(encrypted);
+      await this.writeDocument(document);
+      return toPublicConnection(encrypted);
+    });
   }
 
   async get(connectionId: string): Promise<SavedRoomConnection | undefined> {
+    await this.waitForWrites();
     const connection = (await this.readDocument()).connections.find((item) => item.id === connectionId);
     return connection ? toPublicConnection(connection) : undefined;
   }
 
   async readMemberToken(connectionId: string): Promise<string> {
+    await this.waitForWrites();
     if (!this.protector.isEncryptionAvailable()) {
       throw new Error("Windows secure storage is unavailable, so the member token cannot be decrypted.");
     }
     const connection = (await this.readDocument()).connections.find((item) => item.id === connectionId);
     if (!connection) throw new Error("The requested room connection does not exist.");
     return this.protector.decryptString(Buffer.from(connection.tokenCiphertext, "base64"));
+  }
+
+  /** Toggle the local Codex integration without changing the saved token or room identity. */
+  async setIntegrationEnabled(connectionId: string, enabled: boolean): Promise<SavedRoomConnection> {
+    if (typeof enabled !== "boolean") throw new Error("Integration state must be a boolean.");
+    return this.withWriteLock(async () => {
+      const document = await this.readDocument();
+      const index = document.connections.findIndex((connection) => connection.id === connectionId);
+      if (index < 0) throw new Error("The room connection to update does not exist.");
+      const current = document.connections[index];
+      if (current.integrationEnabled === enabled) return toPublicConnection(current);
+      const updated: EncryptedRoomConnection = {
+        ...current,
+        integrationEnabled: enabled,
+        updatedAt: new Date().toISOString(),
+      };
+      document.connections[index] = updated;
+      await this.writeDocument(document);
+      return toPublicConnection(updated);
+    });
+  }
+
+  async pauseIntegration(connectionId: string): Promise<SavedRoomConnection> {
+    return this.setIntegrationEnabled(connectionId, false);
+  }
+
+  async activateIntegration(connectionId: string): Promise<SavedRoomConnection> {
+    return this.setIntegrationEnabled(connectionId, true);
+  }
+
+  private async waitForWrites(): Promise<void> {
+    await this.writeQueue;
+  }
+
+  private async withWriteLock<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.writeQueue.then(operation);
+    // Keep the queue usable after a failed operation while returning its error.
+    this.writeQueue = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   private async readDocument(): Promise<ConnectionStoreDocument> {
@@ -140,6 +192,8 @@ export function normalizeConnectionInput(input: SaveRoomConnectionInput): SaveRo
     roomId: optionalText(input.roomId, 256),
     roomName: optionalText(input.roomName, 256),
     memberName: optionalText(input.memberName, 256),
+    memberRole: optionalMemberRole(input.memberRole),
+    integrationEnabled: optionalBoolean(input.integrationEnabled, "integrationEnabled"),
   };
 }
 
@@ -158,6 +212,8 @@ function parseEncryptedConnection(value: unknown): EncryptedRoomConnection {
     roomId: optionalText(value.roomId, 256),
     roomName: optionalText(value.roomName, 256),
     memberName: optionalText(value.memberName, 256),
+    memberRole: optionalMemberRole(value.memberRole),
+    integrationEnabled: optionalBoolean(value.integrationEnabled, "integrationEnabled") ?? true,
     createdAt: requiredIsoDate(value.createdAt, "createdAt"),
     updatedAt: requiredIsoDate(value.updatedAt, "updatedAt"),
     tokenCiphertext,
@@ -201,6 +257,20 @@ function optionalText(value: unknown, maxLength: number): string | undefined {
   if (!trimmed) return undefined;
   if (trimmed.length > maxLength) throw new Error("An optional connection field is too long.");
   return trimmed;
+}
+
+function optionalBoolean(value: unknown, name: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new Error(`The ${name} value must be a boolean.`);
+  return value;
+}
+
+function optionalMemberRole(value: unknown): "host" | "member" | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (value !== "host" && value !== "member") {
+    throw new Error("The saved member role must be host or member.");
+  }
+  return value;
 }
 
 function requiredIsoDate(value: unknown, name: string): string {

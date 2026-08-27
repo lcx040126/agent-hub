@@ -147,6 +147,16 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
     });
   });
 
+  app.post("/api/member/pause", (request, response) => {
+    const body = bodyObject(request);
+    response.json(service.pauseMember({
+      memberToken: bearerToken(request),
+      reason: value(body, "reason"),
+      cutoffAt: value(body, "cutoffAt"),
+      requestId: value(body, "requestId"),
+    }));
+  });
+
   app.get("/api/dashboard", (request, response) => {
     const token = bearerToken(request);
     const dashboard = service.getDashboard(token);

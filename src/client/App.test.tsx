@@ -61,4 +61,24 @@ describe("entry screen updates", () => {
     expect(markup).toContain("entry-update-control");
     expect(markup).toContain('aria-label="软件更新"');
   });
+
+  it("shows a warning after local exit succeeds but remote cleanup fails", () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        agentHubDesktop: {},
+        location: { origin: "http://127.0.0.1:4173" },
+      },
+    });
+
+    const markup = renderToStaticMarkup(
+      <EntryScreen
+        onConnected={() => undefined}
+        initialNotice={{ tone: "warning", message: "房间中的会话或租约未能立即清理。" }}
+      />,
+    );
+
+    expect(markup).toContain("toast warning");
+    expect(markup).toContain("房间中的会话或租约未能立即清理。");
+  });
 });

@@ -43,6 +43,9 @@ export interface SaveRoomConnectionInput {
   roomId?: string;
   roomName?: string;
   memberName?: string;
+  memberRole?: "host" | "member";
+  /** Local gate for Codex hooks and MCP. Omitted values preserve current state on update. */
+  integrationEnabled?: boolean;
 }
 
 export interface SavedRoomConnection {
@@ -52,8 +55,19 @@ export interface SavedRoomConnection {
   roomId?: string;
   roomName?: string;
   memberName?: string;
+  /** Missing only for legacy v0.2.0 documents that did not persist the role. */
+  memberRole?: "host" | "member";
+  integrationEnabled: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface PauseRoomConnectionResult {
+  connection: SavedRoomConnection;
+  queued: boolean;
+  requestId: string;
+  cleanupError?: string;
+  localRoomServerStopped: boolean;
 }
 
 export interface CodexInstallResult {
@@ -102,6 +116,8 @@ export interface AgentHubDesktopApi {
   getServerInfo(): Promise<DesktopServerInfo>;
   saveRoomConnection(input: SaveRoomConnectionInput): Promise<SavedRoomConnection>;
   listRoomConnections(): Promise<SavedRoomConnection[]>;
+  pauseRoomConnection(connectionId: string): Promise<PauseRoomConnectionResult>;
+  activateRoomConnection(connectionId: string): Promise<SavedRoomConnection>;
   requestRoomServer(input: RoomServerRequestInput): Promise<RoomServerResponse>;
   installCodexIntegration(connectionId: string): Promise<CodexInstallResult>;
   getDesktopUpdateStatus(): Promise<DesktopUpdateStatus>;
@@ -119,6 +135,8 @@ export const DESKTOP_IPC = {
   getServerInfo: "agent-hub:get-server-info",
   saveRoomConnection: "agent-hub:save-room-connection",
   listRoomConnections: "agent-hub:list-room-connections",
+  pauseRoomConnection: "agent-hub:pause-room-connection",
+  activateRoomConnection: "agent-hub:activate-room-connection",
   requestRoomServer: "agent-hub:request-room-server",
   installCodexIntegration: "agent-hub:install-codex-integration",
   getDesktopUpdateStatus: "agent-hub:get-desktop-update-status",

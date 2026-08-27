@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export interface HookLeaseState {
@@ -99,6 +100,49 @@ export class CodexHookStateStore {
     await unlink(this.filePath(codexSessionId)).catch((error: unknown) => {
       if (!isMissingFile(error)) throw error;
     });
+  }
+
+  async removeForConnection(connectionId: string): Promise<number> {
+    return this.removeForConnections([connectionId]);
+  }
+
+  /** Remove only sessions owned by the selected saved room connections. */
+  async removeForConnections(connectionIds: Iterable<string>): Promise<number> {
+    const selected = new Set(
+      [...connectionIds].map((connectionId) => requiredText(connectionId, "connection ID")),
+    );
+    if (selected.size === 0) return 0;
+
+    let entries: Dirent[];
+    try {
+      entries = await readdir(this.directory, { withFileTypes: true });
+    } catch (error) {
+      if (isMissingFile(error)) return 0;
+      throw error;
+    }
+
+    let removed = 0;
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const filePath = path.join(this.directory, entry.name);
+      let state: CodexHookSessionState;
+      try {
+        state = parseState(await readFile(filePath, "utf8"));
+      } catch (error) {
+        // A malformed file cannot be attributed safely to a room. Leave it for
+        // diagnostics instead of deleting unrelated local state.
+        if (isMissingFile(error)) continue;
+        continue;
+      }
+      if (!selected.has(state.connectionId)) continue;
+      try {
+        await unlink(filePath);
+        removed += 1;
+      } catch (error) {
+        if (!isMissingFile(error)) throw error;
+      }
+    }
+    return removed;
   }
 
   private filePath(codexSessionId: string): string {

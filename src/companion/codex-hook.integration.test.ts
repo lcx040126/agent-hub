@@ -5,19 +5,25 @@ import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable, Writable } from "node:stream";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAgentHubApp } from "../server/app.js";
 import { AgentHubDatabase } from "../server/db.js";
 import { FeatureMemoryStore } from "../server/feature-memory.js";
 import { AgentHubService } from "../server/service.js";
 import { ConnectionStore, type SecretProtector } from "../desktop/connection-store.js";
-import { handleCodexHook, type CodexHookInput, type RunCodexHookOptions } from "./codex-hook.js";
+import { handleCodexHook, runCodexHook, type CodexHookInput, type RunCodexHookOptions } from "./codex-hook.js";
+import { CodexHookStateStore } from "./hook-state.js";
+import { IntegrationOperationTracker } from "./integration-operations.js";
+import { PausePreparationQueue } from "./pause-preparation.js";
+import { startRuntimePresence, type RuntimePresenceHandle } from "./runtime-presence.js";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
 const servers: Server[] = [];
 const databases: AgentHubDatabase[] = [];
+const presences: RuntimePresenceHandle[] = [];
 
 const protector: SecretProtector = {
   isEncryptionAvailable: () => true,
@@ -30,6 +36,8 @@ const protector: SecretProtector = {
 };
 
 afterEach(async () => {
+  vi.restoreAllMocks();
+  await Promise.all(presences.splice(0).map((presence) => presence.stop()));
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
   databases.splice(0).forEach((database) => database.close());
   await Promise.all(temporaryDirectories.splice(0).map((directory) =>
@@ -37,6 +45,91 @@ afterEach(async () => {
 });
 
 describe("Codex hook integration", () => {
+  it("uses one connection resolution so a late match cannot bypass operation tracking", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-resolution-"));
+    temporaryDirectories.push(root);
+    const repository = path.join(root, "repository");
+    const userDataPath = path.join(root, "user-data");
+    await createRepository(repository);
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+    const store = new ConnectionStore(path.join(userDataPath, "connections.json"), protector);
+    await store.save({
+      serverUrl: "http://agent-hub.test:4173",
+      memberToken: "member-token",
+      repositoryPath: repository,
+    });
+    const list = vi.spyOn(ConnectionStore.prototype, "list").mockResolvedValueOnce([]);
+    const fetchImpl = vi.fn<typeof fetch>();
+
+    await expect(handleCodexHook({
+      eventName: "SessionStart",
+      userDataPath,
+      protector,
+      fetchImpl,
+    }, {
+      session_id: "late-match-session",
+      cwd: repository,
+      hook_event_name: "SessionStart",
+    })).resolves.toBeUndefined();
+
+    expect(list).toHaveBeenCalledOnce();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("keeps an in-flight hook registered until pause cleanup can choose its cutoff", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-drain-"));
+    temporaryDirectories.push(root);
+    const repository = path.join(root, "repository");
+    const userDataPath = path.join(root, "user-data");
+    await createRepository(repository);
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+    const store = new ConnectionStore(path.join(userDataPath, "connections.json"), protector);
+    const connection = await store.save({
+      serverUrl: "http://agent-hub.test:4173",
+      memberToken: "member-token",
+      repositoryPath: repository,
+    });
+    let releaseSession: (() => void) | undefined;
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      const pathname = new URL(String(input)).pathname;
+      if (pathname === "/api/sessions") {
+        await new Promise<void>((resolve) => { releaseSession = resolve; });
+        return jsonResponse({ session: { id: "late-session" } });
+      }
+      if (pathname.endsWith("/scan")) return jsonResponse({ scan: { id: "scan-a" } });
+      if (pathname === "/api/snapshot") return jsonResponse({});
+      if (pathname === "/api/features/query") return jsonResponse({ cards: [] });
+      throw new Error(`Unexpected hook request: ${pathname}`);
+    });
+    const hook = handleCodexHook({
+      eventName: "SessionStart",
+      userDataPath,
+      protector,
+      fetchImpl,
+    }, {
+      session_id: "drained-session",
+      cwd: repository,
+      hook_event_name: "SessionStart",
+    });
+    await vi.waitFor(() => expect(releaseSession).toBeTypeOf("function"), { timeout: 10_000 });
+
+    await store.pauseIntegration(connection.id);
+    let drained = false;
+    const drain = new IntegrationOperationTracker(userDataPath).drain(connection.id, { pollIntervalMs: 5 })
+      .then(() => { drained = true; });
+    await vi.waitFor(() => expect(drained).toBe(false));
+    releaseSession?.();
+    await expect(hook).resolves.toBeUndefined();
+    await drain;
+    expect(drained).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(new URL(String(fetchImpl.mock.calls[0]?.[0])).pathname).toBe("/api/sessions");
+  }, 20_000);
+
   it("does not affect repositories that have not joined a room", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-unconnected-"));
     temporaryDirectories.push(root);
@@ -53,12 +146,208 @@ describe("Codex hook integration", () => {
     })).resolves.toBeUndefined();
   });
 
+  it("is completely silent and makes no room request after a connection is paused", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-paused-hook-"));
+    temporaryDirectories.push(root);
+    const userDataPath = path.join(root, "user-data");
+    const decryptString = vi.fn((value: Buffer) => value.toString("utf8"));
+    const pausedProtector: SecretProtector = {
+      isEncryptionAvailable: () => true,
+      encryptString: (value) => Buffer.from(value, "utf8"),
+      decryptString,
+    };
+    const store = new ConnectionStore(path.join(userDataPath, "connections.json"), pausedProtector);
+    const connection = await store.save({
+      serverUrl: "http://127.0.0.1:9",
+      memberToken: "must-not-be-read",
+      repositoryPath: root,
+    });
+    await store.pauseIntegration(connection.id);
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+    // A paused connection must not depend on operation-marker storage being
+    // writable. A file at this path makes marker creation fail if attempted.
+    await writeFile(path.join(userDataPath, "integration-operations"), "unavailable", "utf8");
+    const fetchImpl = vi.fn<typeof fetch>();
+    let output = "";
+    const stdout = new Writable({
+      write(chunk, _encoding, callback) {
+        output += chunk.toString();
+        callback();
+      },
+    });
+
+    await expect(runCodexHook({
+      eventName: "PreToolUse",
+      userDataPath,
+      protector: pausedProtector,
+      fetchImpl,
+      stdin: Readable.from([JSON.stringify({
+        session_id: "paused-session",
+        cwd: root,
+        hook_event_name: "PreToolUse",
+        tool_name: "apply_patch",
+        tool_input: { command: "*** Begin Patch\n*** Add File: local.txt\n*** End Patch" },
+      })]),
+      stdout,
+    })).resolves.toBe(0);
+
+    expect(output).toBe("");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(decryptString).not.toHaveBeenCalled();
+  });
+
+  it("allows writes with a yellow diagnostic and no room request while exit cleanup is pending", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-pending-hook-"));
+    temporaryDirectories.push(root);
+    const repository = path.join(root, "repository");
+    const userDataPath = path.join(root, "user-data");
+    await createRepository(repository);
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+    const store = new ConnectionStore(path.join(userDataPath, "connections.json"), protector);
+    const connection = await store.save({
+      serverUrl: "http://agent-hub.test:4173",
+      memberToken: "member-token",
+      repositoryPath: repository,
+    });
+    await new PausePreparationQueue({
+      filePath: path.join(userDataPath, "pause-preparation.json"),
+    }).enqueue({
+      connectionId: connection.id,
+      reason: "app-shutdown",
+      requestId: "pending-hook-cleanup",
+    });
+    await writeFile(path.join(userDataPath, "integration-operations"), "unavailable", "utf8");
+    const fetchImpl = vi.fn<typeof fetch>();
+    let output = "";
+    const stdout = new Writable({
+      write(chunk, _encoding, callback) {
+        output += chunk.toString();
+        callback();
+      },
+    });
+
+    await expect(runCodexHook({
+      eventName: "PreToolUse",
+      userDataPath,
+      protector,
+      fetchImpl,
+      stdin: Readable.from([JSON.stringify({
+        session_id: "pending-cleanup-session",
+        cwd: repository,
+        hook_event_name: "PreToolUse",
+        tool_name: "apply_patch",
+        tool_input: { command: "*** Begin Patch\n*** Add File: src/pending.ts\n*** End Patch" },
+      })]),
+      stdout,
+    })).resolves.toBe(0);
+
+    expect(JSON.parse(output)).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "allow",
+        additionalContext: expect.stringContaining("退出清理"),
+      },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("allows a write with a visible diagnostic when the room network is offline", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-offline-hook-"));
+    temporaryDirectories.push(root);
+    const repository = path.join(root, "repository");
+    const userDataPath = path.join(root, "user-data");
+    await createRepository(repository);
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
+    const store = new ConnectionStore(path.join(userDataPath, "connections.json"), protector);
+    await store.save({
+      serverUrl: "http://127.0.0.1:9",
+      memberToken: "offline-member",
+      repositoryPath: repository,
+    });
+    let output = "";
+    const stdout = new Writable({
+      write(chunk, _encoding, callback) {
+        output += chunk.toString();
+        callback();
+      },
+    });
+
+    await runCodexHook({
+      eventName: "PreToolUse",
+      userDataPath,
+      protector,
+      fetchImpl: vi.fn(async () => { throw new TypeError("fetch failed"); }),
+      stdin: Readable.from([JSON.stringify({
+        session_id: "offline-session",
+        cwd: repository,
+        hook_event_name: "PreToolUse",
+        tool_name: "apply_patch",
+        tool_input: { command: "*** Begin Patch\n*** Add File: src/offline.ts\n*** End Patch" },
+      })]),
+      stdout,
+    });
+
+    expect(JSON.parse(output)).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "allow",
+        additionalContext: expect.stringContaining("本次操作不会因网络故障被阻止"),
+      },
+    });
+  });
+
+  it("silently removes inactive SessionEnd state and remains idempotent", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "agent-hub-inactive-end-"));
+    temporaryDirectories.push(root);
+    const userDataPath = path.join(root, "user-data");
+    const stateStore = new CodexHookStateStore(userDataPath);
+    await stateStore.save({
+      version: 1,
+      codexSessionId: "inactive-session",
+      connectionId: "connection-a",
+      hubSessionId: "hub-session-a",
+      repositoryPath: root,
+      branch: "main",
+      baseCommit: "0123456789abcdef",
+      initialChangedPaths: [],
+      initialChangedFingerprints: {},
+      observedChangedPaths: [],
+      observedChangedFingerprints: {},
+      leases: [],
+      openedAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+    });
+    const options: RunCodexHookOptions = {
+      eventName: "SessionEnd",
+      userDataPath,
+      protector,
+      fetchImpl: vi.fn(),
+    };
+    const input: CodexHookInput = {
+      session_id: "inactive-session",
+      cwd: root,
+      hook_event_name: "SessionEnd",
+    };
+
+    await expect(handleCodexHook(options, input)).resolves.toBeUndefined();
+    await expect(handleCodexHook(options, input)).resolves.toBeUndefined();
+    await expect(stateStore.load(input.session_id)).resolves.toBeUndefined();
+    expect(options.fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("opens shared context, attributes Agent writes, ignores external changes, and blocks another member's Unity scope", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-flow-"));
     temporaryDirectories.push(root);
     const repository = path.join(root, "repository");
     const userDataPath = path.join(root, "user-data");
     await createRepository(repository);
+    presences.push(await startRuntimePresence(path.join(userDataPath, "runtime-presence.json"), {
+      heartbeatIntervalMs: 0,
+    }));
 
     const database = new AgentHubDatabase({ path: path.join(root, "agent-hub.sqlite") });
     databases.push(database);
@@ -442,6 +731,13 @@ async function createRepository(repository: string): Promise<void> {
   await runGit(repository, ["add", "."]);
   await runGit(repository, ["commit", "-m", "Initial commit"]);
   await runGit(repository, ["branch", "-M", "main"]);
+}
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 async function runGit(cwd: string, args: string[]): Promise<void> {

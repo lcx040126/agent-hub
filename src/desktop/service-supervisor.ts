@@ -1,5 +1,4 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { once } from "node:events";
 
 export interface ServiceSupervisorOptions {
   executable: string;
@@ -9,6 +8,8 @@ export interface ServiceSupervisorOptions {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   startupTimeoutMs?: number;
+  stopTimeoutMs?: number;
+  spawnImpl?: typeof spawn;
 }
 
 export interface ServiceSupervisor {
@@ -22,14 +23,30 @@ export interface ServiceSupervisor {
 export function createServiceSupervisor(options: ServiceSupervisorOptions): ServiceSupervisor {
   const fetchImpl = options.fetchImpl ?? fetch;
   const startupTimeoutMs = options.startupTimeoutMs ?? 15_000;
+  const stopTimeoutMs = options.stopTimeoutMs ?? 5_000;
+  const spawnImpl = options.spawnImpl ?? spawn;
   let child: ChildProcess | null = null;
-  let stopping = false;
+  let operationQueue: Promise<void> = Promise.resolve();
   const url = `http://127.0.0.1:${options.port}`;
 
-  const start = async () => {
-    if (child && child.exitCode === null) return;
-    stopping = false;
-    child = spawn(options.executable, [options.scriptPath], {
+  const stopChild = async (current: ChildProcess) => {
+    if (current.exitCode !== null || current.signalCode !== null) {
+      if (child === current) child = null;
+      return;
+    }
+    current.kill();
+    if (!(await waitForChildExit(current, stopTimeoutMs))) {
+      current.kill("SIGKILL");
+      if (!(await waitForChildExit(current, stopTimeoutMs))) {
+        throw new Error("Agent Hub service did not exit after it was force-stopped.");
+      }
+    }
+    if (child === current) child = null;
+  };
+
+  const startInternal = async () => {
+    if (child && child.exitCode === null && child.signalCode === null) return;
+    const current = spawnImpl(options.executable, [options.scriptPath], {
       env: {
         ...process.env,
         ...options.env,
@@ -42,36 +59,68 @@ export function createServiceSupervisor(options: ServiceSupervisorOptions): Serv
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
-    child.stdout?.on("data", (chunk) => process.stdout.write(`[agent-hub-service] ${chunk}`));
-    child.stderr?.on("data", (chunk) => process.stderr.write(`[agent-hub-service] ${chunk}`));
-    child.once("exit", () => {
-      if (!stopping) child = null;
+    child = current;
+    current.stdout?.on("data", (chunk) => process.stdout.write(`[agent-hub-service] ${chunk}`));
+    current.stderr?.on("data", (chunk) => process.stderr.write(`[agent-hub-service] ${chunk}`));
+    current.once("exit", () => {
+      if (child === current) child = null;
     });
-    await waitForHealth(fetchImpl, url, startupTimeoutMs);
+    try {
+      await waitForHealth(fetchImpl, url, startupTimeoutMs);
+    } catch (healthError) {
+      try {
+        await stopChild(current);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [healthError, cleanupError],
+          "Agent Hub service failed health check and could not be stopped.",
+        );
+      }
+      throw healthError;
+    }
   };
 
-  const stop = async () => {
+  const stopInternal = async () => {
     const current = child;
-    if (!current || current.exitCode !== null) return;
-    stopping = true;
-    current.kill();
-    await Promise.race([
-      once(current, "exit").then(() => undefined),
-      new Promise<void>((resolve) => setTimeout(() => { current.kill("SIGKILL"); resolve(); }, 5_000)),
-    ]);
-    child = null;
+    if (!current) return;
+    await stopChild(current);
+  };
+
+  const serialize = <T>(operation: () => Promise<T>): Promise<T> => {
+    const run = operationQueue.then(operation);
+    operationQueue = run.then(() => undefined, () => undefined);
+    return run;
   };
 
   return {
     port: options.port,
     url,
-    start,
-    stop,
-    async restart() {
-      await stop();
-      await start();
-    },
+    start: () => serialize(startInternal),
+    stop: () => serialize(stopInternal),
+    restart: () => serialize(async () => {
+      await stopInternal();
+      await startInternal();
+    }),
   };
+}
+
+async function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (exited: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref();
+    child.once("exit", onExit);
+    if (child.exitCode !== null || child.signalCode !== null) finish(true);
+  });
 }
 
 async function waitForHealth(fetchImpl: typeof fetch, url: string, timeoutMs: number): Promise<void> {

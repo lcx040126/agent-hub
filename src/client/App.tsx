@@ -40,6 +40,7 @@ import {
 } from "lucide-react";
 import {
   ApiError,
+  activateSavedConnection,
   clearSession,
   checkDesktopUpdate,
   chooseRepository,
@@ -67,6 +68,7 @@ import {
   loadSession,
   renewLease,
   resumeSavedConnection,
+  pauseSavedConnection,
   saveSession,
   secureDesktopSession,
   subscribeDesktopUpdateStatus,
@@ -318,13 +320,19 @@ function Field({
   );
 }
 
-export function EntryScreen({ onConnected }: { onConnected: (session: Session) => void }) {
+export function EntryScreen({
+  onConnected,
+  initialNotice = null,
+}: {
+  onConnected: (session: Session) => void;
+  initialNotice?: Notice | null;
+}) {
   const desktop = isDesktopApp();
   const [mode, setMode] = useState<"create" | "join">("create");
   const [busy, setBusy] = useState(false);
   const [repoBusy, setRepoBusy] = useState(false);
   const [error, setError] = useState("");
-  const [updateNotice, setUpdateNotice] = useState<Notice | null>(null);
+  const [updateNotice, setUpdateNotice] = useState<Notice | null>(initialNotice);
   const [repositoryPath, setRepositoryPath] = useState("");
   const [savedConnections, setSavedConnections] = useState<SavedRoomConnection[]>([]);
   const [createValues, setCreateValues] = useState({
@@ -422,8 +430,15 @@ export function EntryScreen({ onConnected }: { onConnected: (session: Session) =
   };
 
   const openSaved = (connection: SavedRoomConnection) => {
-    const session = resumeSavedConnection(connection);
-    enterSession(session);
+    setBusy(true);
+    setError("");
+    void activateSavedConnection(connection.id)
+      .then((activated) => {
+        const next = activated ?? connection;
+        enterSession(resumeSavedConnection(next));
+      })
+      .catch((caught) => setError(caught instanceof Error ? caught.message : "无法恢复房间连接。"))
+      .finally(() => setBusy(false));
   };
 
   const repositoryPicker = desktop && (
@@ -469,7 +484,7 @@ export function EntryScreen({ onConnected }: { onConnected: (session: Session) =
                 {savedConnections.slice(0, 3).map((connection) => (
                   <button type="button" key={connection.id} onClick={() => openSaved(connection)}>
                     <span><Server aria-hidden="true" /></span>
-                    <div><strong>{connection.roomName || "项目协作房间"}</strong><small>{connection.memberName || "已保存成员"} · {connection.serverUrl}</small></div>
+                    <div><strong>{connection.roomName || "项目协作房间"}</strong><small>{connection.memberName || "已保存成员"} · {connection.integrationEnabled === false ? "接入已暂停，点击恢复" : connection.serverUrl}</small></div>
                     <ChevronRight aria-hidden="true" />
                   </button>
                 ))}
@@ -1561,12 +1576,13 @@ function RecordModal({ kind, leases, members, onClose, onSubmit }: { kind: Exclu
   );
 }
 
-function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => void }) {
+function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => Promise<void> }) {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [view, setView] = useState<View>("work");
   const [navOpen, setNavOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [leaving, setLeaving] = useState(false);
   const [online, setOnline] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -1582,6 +1598,7 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
   };
 
   const refresh = useCallback(async (quiet = false) => {
+    if (leaving) return;
     if (!quiet) setRefreshing(true);
     try {
       const next = await getDashboard(session, session.roomToken);
@@ -1601,7 +1618,7 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
       setLoading(false);
       setRefreshing(false);
     }
-  }, [session]);
+  }, [leaving, session]);
 
   useEffect(() => {
     void refresh();
@@ -1621,6 +1638,17 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
     const timeout = window.setTimeout(() => setNotice(null), 3500);
     return () => window.clearTimeout(timeout);
   }, [notice]);
+
+  const requestLeave = () => {
+    if (leaving) return;
+    setLeaving(true);
+    void onLeave().catch((caught) => {
+      setLeaving(false);
+      const message = caught instanceof Error ? caught.message : "无法暂停本机房间连接，请重试。";
+      if (dashboard) setNotice({ tone: "danger", message });
+      else setError(message);
+    });
+  };
 
   useEffect(() => {
     if (!dashboard) return;
@@ -1699,7 +1727,7 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
   }
 
   if (!dashboard) {
-    return <main className="fatal-screen"><AlertTriangle aria-hidden="true" /><h1>暂时无法进入房间</h1><p>{error || "房主服务可能尚未启动。"}</p><div><button type="button" className="primary-button" onClick={() => void refresh()}><RefreshCw aria-hidden="true" />重新连接</button><button type="button" className="secondary-button" onClick={onLeave}><LogOut aria-hidden="true" />返回登录</button></div></main>;
+    return <main className="fatal-screen"><AlertTriangle aria-hidden="true" /><h1>暂时无法进入房间</h1><p>{error || "房主服务可能尚未启动。"}</p><div><button type="button" className="primary-button" onClick={() => void refresh()} disabled={leaving}><RefreshCw aria-hidden="true" />重新连接</button><button type="button" className="secondary-button" onClick={requestLeave} disabled={leaving}>{leaving ? <LoaderCircle className="spin" aria-hidden="true" /> : <LogOut aria-hidden="true" />}返回登录</button></div></main>;
   }
 
   const ownedReleaseRequests = dashboard.releaseRequests.filter((request) => request.status === "pending" && request.holderMemberId === dashboard.currentMember.id);
@@ -1723,9 +1751,9 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
         </div>
         <div className="top-actions">
           <span className={`connection-pill ${online ? "online" : "offline"}`}><span />{online ? "已连接" : "连接中"}</span>
-          <IconButton label="刷新团队状态" onClick={() => void refresh()} disabled={refreshing}><RefreshCw className={refreshing ? "spin" : ""} aria-hidden="true" /></IconButton>
+          <IconButton label="刷新团队状态" onClick={() => void refresh()} disabled={refreshing || leaving}><RefreshCw className={refreshing ? "spin" : ""} aria-hidden="true" /></IconButton>
           <div className="current-user" title={dashboard.currentMember.name}><span>{dashboard.currentMember.name.slice(0, 1).toUpperCase()}</span><div><strong>{dashboard.currentMember.name}</strong><small>{dashboard.currentMember.role === "host" ? "房主" : "成员"}</small></div></div>
-          <IconButton label="离开当前房间" onClick={onLeave}><LogOut aria-hidden="true" /></IconButton>
+          <IconButton label="离开当前房间" onClick={requestLeave} disabled={leaving}>{leaving ? <LoaderCircle className="spin" aria-hidden="true" /> : <LogOut aria-hidden="true" />}</IconButton>
         </div>
       </header>
       <div className="app-body">
@@ -1752,9 +1780,30 @@ function DashboardApp({ session, onLeave }: { session: Session; onLeave: () => v
 
 export function App() {
   const [session, setSession] = useState<Session | null>(() => loadSession());
-  const leave = () => {
+  const [entryNotice, setEntryNotice] = useState<Notice | null>(null);
+  const leave = async () => {
+    const connectionId = session?.connectionId;
+    let cleanupError: string | undefined;
+    if (connectionId && isDesktopApp()) {
+      const paused = await pauseSavedConnection(connectionId);
+      cleanupError = paused.cleanupError;
+    }
     clearSession();
     setSession(null);
+    setEntryNotice(cleanupError
+      ? {
+          tone: "warning",
+          message: `本机 Agent Hub 接入已经暂停，但房间中的会话或租约未能立即清理。请稍后重新进入房间重试，或联系房主确认。原因：${cleanupError}`,
+        }
+      : null);
   };
-  return session ? <DashboardApp session={session} onLeave={leave} /> : <EntryScreen onConnected={setSession} />;
+  return session
+    ? <DashboardApp session={session} onLeave={leave} />
+    : <EntryScreen
+        initialNotice={entryNotice}
+        onConnected={(next) => {
+          setEntryNotice(null);
+          setSession(next);
+        }}
+      />;
 }

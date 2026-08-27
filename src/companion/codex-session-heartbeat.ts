@@ -8,10 +8,16 @@ import {
 } from "../shared/version.js";
 import { AgentHubClient, AgentHubHttpError } from "./hub-client.js";
 import { CodexHookStateStore, parseState, type CodexHookSessionState } from "./hook-state.js";
+import {
+  IntegrationOperationTracker,
+  type ConnectionOperationTracker,
+} from "./integration-operations.js";
+import { hasPendingPauseForConnection } from "./pause-retry.js";
+import { hasPendingPausePreparationForConnection } from "./pause-preparation.js";
 
 export interface CodexSessionHeartbeatScheduler {
   scanNow(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void>;
 }
 
 interface ConnectionLookup {
@@ -26,6 +32,7 @@ export interface StartCodexSessionHeartbeatOptions {
   fetchImpl?: typeof fetch;
   now?: () => Date;
   onError?: (error: Error, state?: CodexHookSessionState) => void;
+  operationTracker?: Pick<ConnectionOperationTracker, "run">;
 }
 
 const DEFAULT_INTERVAL_MS = 2 * 60_000;
@@ -36,13 +43,15 @@ export function startCodexSessionHeartbeatScheduler(
   options: StartCodexSessionHeartbeatOptions,
 ): CodexSessionHeartbeatScheduler {
   const stateStore = new CodexHookStateStore(options.userDataPath);
+  const operationTracker = options.operationTracker
+    ?? new IntegrationOperationTracker(options.userDataPath);
   let stopped = false;
   let running: Promise<void> | undefined;
 
   const scanNow = (): Promise<void> => {
     if (stopped) return Promise.resolve();
     if (running) return running;
-    running = heartbeatAll(stateStore, options)
+    running = heartbeatAll(stateStore, options, operationTracker)
       .catch((error: unknown) => options.onError?.(toError(error)))
       .finally(() => {
         running = undefined;
@@ -55,9 +64,10 @@ export function startCodexSessionHeartbeatScheduler(
   timer.unref?.();
   return {
     scanNow,
-    stop() {
+    async stop() {
       stopped = true;
       clearInterval(timer);
+      await running;
     },
   };
 }
@@ -65,6 +75,7 @@ export function startCodexSessionHeartbeatScheduler(
 async function heartbeatAll(
   stateStore: CodexHookStateStore,
   options: StartCodexSessionHeartbeatOptions,
+  operationTracker: Pick<ConnectionOperationTracker, "run">,
 ): Promise<void> {
   const states = await readHookStates(stateStore, options.onError);
   const now = (options.now?.() ?? new Date()).getTime();
@@ -74,21 +85,27 @@ async function heartbeatAll(
         await stateStore.remove(state.codexSessionId);
         return;
       }
-      const connection = await options.store.get(state.connectionId);
-      if (!connection) {
-        await stateStore.remove(state.codexSessionId);
-        return;
-      }
-      const memberToken = await options.store.readMemberToken(state.connectionId);
-      const client = new AgentHubClient({
-        serverUrl: connection.serverUrl,
-        memberToken,
-        fetchImpl: options.fetchImpl,
-      });
-      await client.post(`/api/sessions/${encodeURIComponent(state.hubSessionId)}/heartbeat`, {
-        clientVersion: AGENT_HUB_VERSION,
-        protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
-        schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+      await operationTracker.run(state.connectionId, async () => {
+        const connection = await options.store.get(state.connectionId);
+        if (!connection || connection.integrationEnabled === false) {
+          await stateStore.remove(state.codexSessionId);
+          return;
+        }
+        if (
+          await hasPendingPausePreparationForConnection(options.userDataPath, state.connectionId)
+          || await hasPendingPauseForConnection(options.userDataPath, state.connectionId)
+        ) return;
+        const memberToken = await options.store.readMemberToken(state.connectionId);
+        const client = new AgentHubClient({
+          serverUrl: connection.serverUrl,
+          memberToken,
+          fetchImpl: options.fetchImpl,
+        });
+        await client.post(`/api/sessions/${encodeURIComponent(state.hubSessionId)}/heartbeat`, {
+          clientVersion: AGENT_HUB_VERSION,
+          protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+          schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+        });
       });
     } catch (error) {
       if (error instanceof AgentHubHttpError && (error.status === 404 || error.status === 409)) {

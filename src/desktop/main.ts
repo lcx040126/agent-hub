@@ -17,6 +17,7 @@ import {
   type OpenDialogOptions,
 } from "electron";
 import { inspectRepository } from "../companion/repository.js";
+import { IntegrationController } from "../companion/integration-controller.js";
 import {
   startCodexSessionHeartbeatScheduler,
   type CodexSessionHeartbeatScheduler,
@@ -39,6 +40,14 @@ import { installCodexMcpConfig, codexServerName } from "./codex-config.js";
 import { CONNECTION_STORE_FILENAME, ConnectionStore } from "./connection-store.js";
 import { DESKTOP_IPC, type SaveRoomConnectionInput, type DesktopServerInfo } from "./contracts.js";
 import { installHeadlessLauncher } from "./headless-launcher.js";
+import {
+  activateDesktopRoomConnection,
+  enterDesktopMaintenance,
+  pauseDesktopRoomConnection,
+  recoverDesktopMaintenance,
+  shouldStartLocalRoomService,
+  shutdownDesktopIntegration,
+} from "./integration-lifecycle.js";
 import { candidatePorts, collectLanUrls } from "./network.js";
 import { requestRoomServer } from "./room-server-proxy.js";
 import {
@@ -62,8 +71,12 @@ let scanScheduler: RepositoryScanScheduler | null = null;
 let hookHeartbeatScheduler: CodexSessionHeartbeatScheduler | null = null;
 let releaseRequestNotifier: ReleaseRequestNotificationScheduler | null = null;
 let desktopUpdater: DesktopAppUpdater | null = null;
+let integrationController: IntegrationController | null = null;
 let unsubscribeUpdateStatus: (() => void) | null = null;
 let isQuitting = false;
+let quitCleanupComplete = false;
+let quitCleanupPromise: Promise<void> | null = null;
+let updateInstallInProgress = false;
 
 startDesktopLifecycle();
 
@@ -73,20 +86,25 @@ function startDesktopLifecycle(): void {
     return;
   }
   electronApp.on("second-instance", () => showMainWindow());
-  electronApp.on("before-quit", () => {
+  electronApp.on("before-quit", (event) => {
+    // The signed updater owns its own restart path. Maintenance keeps leases
+    // alive, so the normal quit cleanup must not run during installation.
+    if (quitCleanupComplete || updateInstallInProgress) {
+      isQuitting = true;
+      return;
+    }
+    event.preventDefault();
+    if (quitCleanupPromise) return;
     isQuitting = true;
-    scanScheduler?.stop();
-    scanScheduler = null;
-    hookHeartbeatScheduler?.stop();
-    hookHeartbeatScheduler = null;
-    releaseRequestNotifier?.stop();
-    releaseRequestNotifier = null;
-    unsubscribeUpdateStatus?.();
-    unsubscribeUpdateStatus = null;
-    desktopUpdater?.dispose();
-    desktopUpdater = null;
-    void hostServer?.stop();
-    hostServer = null;
+    quitCleanupPromise = cleanupBeforeQuit()
+      .catch((error: unknown) => {
+        console.error(`Agent Hub shutdown cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+      })
+      .finally(() => {
+        quitCleanupComplete = true;
+        quitCleanupPromise = null;
+        electronApp.quit();
+      });
   });
   electronApp.on("activate", () => showMainWindow());
   electronApp.on("window-all-closed", () => {
@@ -142,39 +160,51 @@ async function bootstrap(): Promise<void> {
     path.join(userDataDirectory, CONNECTION_STORE_FILENAME),
     new WindowsDpapiProtector(),
   );
+  integrationController = new IntegrationController({
+    userDataPath: userDataDirectory,
+    store,
+    onError(error) {
+      console.error(`Agent Hub integration lifecycle warning: ${error.message}`);
+    },
+  });
+  await integrationController.start();
+  const integrationIsActive = () => integrationController?.getPresence()?.record.status === "active";
   const startScanner = () => startRepositoryScanScheduler({
     store,
+    integrationActive: integrationIsActive,
     onError(error, connection) {
       const repository = connection?.repositoryPath ? ` (${connection.repositoryPath})` : "";
       console.error(`Agent Hub repository scan failed${repository}: ${error.message}`);
     },
   });
-  scanScheduler = startScanner();
-  hookHeartbeatScheduler = startCodexSessionHeartbeatScheduler({
-    userDataPath: userDataDirectory,
-    store,
-    onError(error, state) {
-      const session = state?.hubSessionId ? ` (${state.hubSessionId})` : "";
-      console.error(`Agent Hub Codex heartbeat failed${session}: ${error.message}`);
-    },
-  });
-  releaseRequestNotifier = startReleaseRequestNotificationScheduler({
-    store,
-    notify(request, connection) {
-      if (!Notification.isSupported()) return;
-      const notification = new Notification({
-        title: `${connection.roomName || "Agent Hub"}：保护范围交接申请`,
-        body: `${request.requesterName} 请求“${request.requestTitle}”${request.requestedPaths[0] ? `\n${request.requestedPaths[0]}` : ""}`,
-        silent: false,
-      });
-      notification.on("click", () => showMainWindow());
-      notification.show();
-    },
-    onError(error, connection) {
-      const room = connection?.roomName ? ` (${connection.roomName})` : "";
-      console.error(`Agent Hub release-request notification check failed${room}: ${error.message}`);
-    },
-  });
+  if (integrationIsActive()) {
+    scanScheduler = startScanner();
+    hookHeartbeatScheduler = startCodexSessionHeartbeatScheduler({
+      userDataPath: userDataDirectory,
+      store,
+      onError(error, state) {
+        const session = state?.hubSessionId ? ` (${state.hubSessionId})` : "";
+        console.error(`Agent Hub Codex heartbeat failed${session}: ${error.message}`);
+      },
+    });
+    releaseRequestNotifier = startReleaseRequestNotificationScheduler({
+      store,
+      notify(request, connection) {
+        if (!Notification.isSupported()) return;
+        const notification = new Notification({
+          title: `${connection.roomName || "Agent Hub"}：保护范围交接申请`,
+          body: `${request.requesterName} 请求“${request.requestTitle}”${request.requestedPaths[0] ? `\n${request.requestedPaths[0]}` : ""}`,
+          silent: false,
+        });
+        notification.on("click", () => showMainWindow());
+        notification.show();
+      },
+      onError(error, connection) {
+        const room = connection?.roomName ? ` (${connection.roomName})` : "";
+        console.error(`Agent Hub release-request notification check failed${room}: ${error.message}`);
+      },
+    });
+  }
 
   const engine = await createElectronUpdateEngine();
   const updater = new DesktopAppUpdater({
@@ -188,11 +218,18 @@ async function bootstrap(): Promise<void> {
       restoreRootDirectory: userDataDirectory,
     },
     recoveryExecutor,
-    installHooks: {
+      installHooks: {
       async prepareForInstall() {
-        scanScheduler?.stop();
+        const maintenanceScanner = scanScheduler;
+        // A scheduler marks itself stopped before draining its current scan.
+        // Clear the live reference first so abort recovery always creates a
+        // fresh instance even when a later maintenance step fails.
         scanScheduler = null;
-        await hostServer?.stop();
+        await enterDesktopMaintenance({
+          controller: integrationController,
+          scanner: maintenanceScanner,
+          localServer: hostServer,
+        });
         const databasePath = path.join(userDataDirectory, "server", "agent-hub.sqlite");
         const snapshotPath = path.join(updateDirectory, "staging", "agent-hub-pre-update.sqlite");
         const database = new DatabaseSync(databasePath);
@@ -212,18 +249,41 @@ async function bootstrap(): Promise<void> {
         ];
       },
       onInstallLaunching() {
+        updateInstallInProgress = true;
         isQuitting = true;
       },
       async onInstallAborted() {
+        updateInstallInProgress = false;
         isQuitting = false;
-        await hostServer?.start();
-        if (!scanScheduler) scanScheduler = startScanner();
+        await recoverDesktopMaintenance({
+          controller: integrationController,
+          localServer: hostServer,
+          restartSchedulers: [
+            () => {
+              if (!scanScheduler && integrationController?.getPresence()?.record.status === "active") {
+                scanScheduler = startScanner();
+              }
+            },
+            () => {
+              if (!hookHeartbeatScheduler && integrationController?.getPresence()?.record.status === "active") {
+                hookHeartbeatScheduler = startCodexSessionHeartbeatScheduler({
+                  userDataPath: userDataDirectory,
+                  store,
+                  onError(error, state) {
+                    const session = state?.hubSessionId ? ` (${state.hubSessionId})` : "";
+                    console.error(`Agent Hub Codex heartbeat failed${session}: ${error.message}`);
+                  },
+                });
+              }
+            },
+          ],
+        });
       },
     },
   });
   desktopUpdater = updater;
 
-  registerIpc(serverInfo, store, userDataDirectory, updater);
+  registerIpc(serverInfo, store, userDataDirectory, updater, integrationController, hostServer);
   const window = createMainWindow(serverInfo.localServerUrl);
   mainWindow = window;
   unsubscribeUpdateStatus = updater.subscribe((status) => {
@@ -255,6 +315,29 @@ async function createElectronUpdateEngine(): Promise<ElectronUpdateEngine> {
     owner: AGENT_HUB_RELEASE_OWNER,
     repo: AGENT_HUB_RELEASE_REPOSITORY,
   }) as ElectronUpdateEngine;
+}
+
+async function cleanupBeforeQuit(): Promise<void> {
+  // shutdownDesktopIntegration closes the sentinel before waiting on these
+  // producers, then drains their operation markers before remote cleanup.
+  const schedulers = [scanScheduler, hookHeartbeatScheduler, releaseRequestNotifier];
+  scanScheduler = null;
+  hookHeartbeatScheduler = null;
+  releaseRequestNotifier = null;
+  unsubscribeUpdateStatus?.();
+  unsubscribeUpdateStatus = null;
+  desktopUpdater?.dispose();
+  desktopUpdater = null;
+  // Keep the local room service available until remote cleanup has been sent.
+  await shutdownDesktopIntegration({
+    schedulers,
+    controller: integrationController,
+    localServer: hostServer,
+  });
+  hostServer = null;
+  integrationController = null;
+  tray?.destroy();
+  tray = null;
 }
 
 async function findAvailableServicePort(): Promise<number> {
@@ -331,7 +414,6 @@ function createTray(serverInfo: DesktopServerInfo): void {
       {
         label: "Quit",
         click: () => {
-          isQuitting = true;
           electronApp.quit();
         },
       },
@@ -345,6 +427,8 @@ function registerIpc(
   store: ConnectionStore,
   userDataDirectory: string,
   updater: DesktopAppUpdater,
+  controller: IntegrationController,
+  localServer: ServiceSupervisor,
 ): void {
   const allowedRepositories = new Set<string>();
   void store.list().then((connections) => {
@@ -383,10 +467,42 @@ function registerIpc(
     return store.list();
   });
 
+  ipcMain.handle(
+    DESKTOP_IPC.pauseRoomConnection,
+    async (event, connectionId: unknown) => {
+      assertTrustedRenderer(event, serverInfo.localServerUrl);
+      if (typeof connectionId !== "string" || !connectionId.trim()) {
+        throw new Error("A saved room connection is required.");
+      }
+      const normalizedId = connectionId.trim();
+      return pauseDesktopRoomConnection({
+        connectionId: normalizedId,
+        controller,
+        store,
+        localServer,
+      });
+    },
+  );
+
+  ipcMain.handle(DESKTOP_IPC.activateRoomConnection, async (event, connectionId: unknown) => {
+    assertTrustedRenderer(event, serverInfo.localServerUrl);
+    if (typeof connectionId !== "string" || !connectionId.trim()) {
+      throw new Error("A saved room connection is required.");
+    }
+    const normalizedId = connectionId.trim();
+    return activateDesktopRoomConnection({
+      connectionId: normalizedId,
+      controller,
+      store,
+      localServer,
+    });
+  });
+
   ipcMain.handle(DESKTOP_IPC.saveRoomConnection, async (event, input: SaveRoomConnectionInput) => {
     assertTrustedRenderer(event, serverInfo.localServerUrl);
     requireApprovedRepository(input?.repositoryPath, allowedRepositories);
     const saved = await store.save(input);
+    controller.rememberConnectionState(saved.id, saved.integrationEnabled !== false);
     allowedRepositories.add(pathKey(saved.repositoryPath));
     await scanScheduler?.scanNow();
     return saved;
@@ -394,6 +510,7 @@ function registerIpc(
 
   ipcMain.handle(DESKTOP_IPC.requestRoomServer, async (event, input: unknown) => {
     assertTrustedRenderer(event, serverInfo.localServerUrl);
+    if (shouldStartLocalRoomService(input, localServer.url)) await localServer.start();
     return requestRoomServer(input, store);
   });
 

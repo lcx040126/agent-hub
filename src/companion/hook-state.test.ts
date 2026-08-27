@@ -73,4 +73,49 @@ describe("CodexHookStateStore", () => {
     await store.remove(state.codexSessionId);
     await expect(store.load(state.codexSessionId)).resolves.toBeUndefined();
   });
+
+  it("removes only Hook sessions belonging to the selected room connection", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-state-"));
+    temporaryDirectories.push(directory);
+    const store = new CodexHookStateStore(directory);
+    const first = stateForConnection(directory, "codex-a", "connection-a", "hub-a");
+    const second = stateForConnection(directory, "codex-b", "connection-b", "hub-b");
+    const third = stateForConnection(directory, "codex-c", "connection-a", "hub-c");
+    await Promise.all([store.save(first), store.save(second), store.save(third)]);
+
+    await expect(store.removeForConnection("connection-a")).resolves.toBe(2);
+    await expect(store.load(first.codexSessionId)).resolves.toBeUndefined();
+    await expect(store.load(third.codexSessionId)).resolves.toBeUndefined();
+    await expect(store.load(second.codexSessionId)).resolves.toMatchObject({
+      connectionId: "connection-b",
+      hubSessionId: "hub-b",
+    });
+    await expect(store.removeForConnections(["connection-b", "connection-b"])).resolves.toBe(1);
+    await expect(store.removeForConnections([])).resolves.toBe(0);
+  });
 });
+
+function stateForConnection(
+  repositoryPath: string,
+  codexSessionId: string,
+  connectionId: string,
+  hubSessionId: string,
+): CodexHookSessionState {
+  const now = "2026-08-27T00:00:00.000Z";
+  return {
+    version: 1,
+    codexSessionId,
+    connectionId,
+    hubSessionId,
+    repositoryPath,
+    branch: "main",
+    baseCommit: "0123456789abcdef",
+    initialChangedPaths: [],
+    initialChangedFingerprints: {},
+    observedChangedPaths: [],
+    observedChangedFingerprints: {},
+    leases: [],
+    openedAt: now,
+    updatedAt: now,
+  };
+}

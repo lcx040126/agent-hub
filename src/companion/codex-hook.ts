@@ -9,9 +9,11 @@ import {
   type ContextBudgetCandidate,
 } from "../server/context-budget.js";
 import {
-  resolveConnectionById,
-  resolveConnectionForPath,
+  openConnectionStore,
+  resolveConnectionRecordById,
+  resolveConnectionRecordForPath,
   type ResolvedRoomConnection,
+  type ResolvedRoomConnectionRecord,
 } from "./connection-runtime.js";
 import {
   inspectGitWorkingState,
@@ -34,6 +36,8 @@ import {
   extractAttributedWriteIntent,
   type AttributedWriteIntent,
 } from "./write-attribution.js";
+import { getLocalIntegrationStatus, getRuntimeIntegrationStatus } from "./integration-gate.js";
+import { IntegrationOperationTracker } from "./integration-operations.js";
 
 export type CodexHookEventName =
   | "SessionStart"
@@ -50,6 +54,8 @@ export interface RunCodexHookOptions {
   protector?: SecretProtector;
   fetchImpl?: typeof fetch;
   gitExecutable?: string;
+  /** Override used by embedded callers/tests; production uses userData/runtime-presence.json. */
+  runtimePresencePath?: string;
 }
 
 export interface CodexHookInput {
@@ -115,8 +121,7 @@ export async function runCodexHook(options: RunCodexHookOptions): Promise<number
     if (result !== undefined) output.write(`${JSON.stringify(result)}\n`);
     return 0;
   } catch (error) {
-    const message = humanError(error);
-    const result = failureOutput(options.eventName, message);
+    const result = failureOutput(options.eventName, error);
     if (result !== undefined) output.write(`${JSON.stringify(result)}\n`);
     return 0;
   }
@@ -129,31 +134,100 @@ export async function handleCodexHook(
   if (input.hook_event_name && input.hook_event_name !== options.eventName) {
     throw new Error(`Hook event mismatch: expected ${options.eventName}.`);
   }
+  const runtimePresence = await getRuntimeIntegrationStatus(
+    options.userDataPath,
+    options.runtimePresencePath,
+  );
+  if (!runtimePresence.active) {
+    if (options.eventName === "SessionEnd") {
+      await new CodexHookStateStore(options.userDataPath).remove(input.session_id);
+    }
+    return undefined;
+  }
+  const record = await resolveTrackedConnectionRecord(options, input);
+  if (!record) return undefined;
+  const connectionId = record.connection.id;
+  const localStatus = await getLocalIntegrationStatus(
+    options.userDataPath,
+    record.connection,
+    options.runtimePresencePath,
+  );
+  if (!localStatus.active) {
+    if (options.eventName === "SessionEnd") {
+      await new CodexHookStateStore(options.userDataPath).remove(input.session_id);
+    }
+    return undefined;
+  }
+  if (!localStatus.remoteAllowed) {
+    if (options.eventName === "SessionEnd") {
+      await new CodexHookStateStore(options.userDataPath).remove(input.session_id);
+    }
+    return failureOutput(
+      options.eventName,
+      new HookCleanupPendingError(localStatus.diagnostic),
+    );
+  }
+  const dispatch = async () => {
+    const result = await dispatchCodexHook(options, input, record);
+    await assertHookIntegrationActive(options, connectionId);
+    return result;
+  };
+  try {
+    return await new IntegrationOperationTracker(options.userDataPath).run(connectionId, dispatch);
+  } catch (error) {
+    if (!(error instanceof HookIntegrationInactiveError)) throw error;
+    await new CodexHookStateStore(options.userDataPath).remove(input.session_id);
+    return undefined;
+  }
+}
+
+async function dispatchCodexHook(
+  options: RunCodexHookOptions,
+  input: CodexHookInput,
+  record: ResolvedRoomConnectionRecord,
+): Promise<Record<string, unknown> | undefined> {
   switch (options.eventName) {
     case "SessionStart":
-      return handleSessionStart(options, input);
+      return handleSessionStart(options, input, record);
     case "PreToolUse":
-      return handlePreToolUse(options, input);
+      return handlePreToolUse(options, input, record);
     case "PostToolUse":
-      return handlePostToolUse(options, input);
+      return handlePostToolUse(options, input, record);
     case "SessionEnd":
-      await handleSessionEnd(options, input);
+      await handleSessionEnd(options, input, record);
       return undefined;
   }
+}
+
+async function resolveTrackedConnectionRecord(
+  options: RunCodexHookOptions,
+  input: CodexHookInput,
+): Promise<ResolvedRoomConnectionRecord | undefined> {
+  const state = await new CodexHookStateStore(options.userDataPath).load(input.session_id);
+  if (state) {
+    return resolveConnectionRecordById(options.userDataPath, state.connectionId, options.protector);
+  }
+  return resolveConnectionRecordForPath(
+    options.userDataPath,
+    input.cwd || options.cwd || process.cwd(),
+    options.protector,
+  );
 }
 
 async function handleSessionStart(
   options: RunCodexHookOptions,
   input: CodexHookInput,
+  record: ResolvedRoomConnectionRecord,
 ): Promise<Record<string, unknown> | undefined> {
-  const resolved = await resolveConnectionForPath(
-    options.userDataPath,
-    input.cwd || options.cwd || process.cwd(),
-    options.protector,
-  );
-  if (!resolved) return undefined;
   const stateStore = new CodexHookStateStore(options.userDataPath);
   const existingState = await stateStore.load(input.session_id);
+  if (existingState && existingState.connectionId !== record.connection.id) return undefined;
+  if (!(await getLocalIntegrationStatus(
+    options.userDataPath,
+    record.connection,
+    options.runtimePresencePath,
+  )).active) return undefined;
+  const resolved = await hydrateConnectionRecord(record);
   const runtime = await openHookRuntime(options, input, resolved, !existingState, existingState);
   const snapshot = await runtime.client.get<RoomSnapshotLike>("/api/snapshot");
   try {
@@ -185,10 +259,11 @@ async function handleSessionStart(
 async function handlePreToolUse(
   options: RunCodexHookOptions,
   input: CodexHookInput,
+  record: ResolvedRoomConnectionRecord,
 ): Promise<Record<string, unknown> | undefined> {
   const intent = extractAttributedWriteIntent(input.tool_name, input.tool_input);
   if (!intent.writes) return undefined;
-  const runtime = await findHookRuntime(options, input);
+  const runtime = await findHookRuntime(options, input, record);
   if (!runtime) return undefined;
   runtime.git = await inspectGitWorkingState(runtime.connection.repositoryPath, { gitExecutable: options.gitExecutable });
   try {
@@ -321,10 +396,11 @@ interface AutomaticFeatureVerification {
 async function handlePostToolUse(
   options: RunCodexHookOptions,
   input: CodexHookInput,
+  record: ResolvedRoomConnectionRecord,
 ): Promise<Record<string, unknown> | undefined> {
   const intent = extractAttributedWriteIntent(input.tool_name, input.tool_input);
   if (!intent.writes) return undefined;
-  const runtime = await findHookRuntime(options, input);
+  const runtime = await findHookRuntime(options, input, record);
   if (!runtime) return undefined;
   runtime.git = await inspectGitWorkingState(runtime.connection.repositoryPath, {
     gitExecutable: options.gitExecutable,
@@ -462,19 +538,31 @@ async function handlePostToolUse(
   };
 }
 
-async function handleSessionEnd(options: RunCodexHookOptions, input: CodexHookInput): Promise<void> {
+async function handleSessionEnd(
+  options: RunCodexHookOptions,
+  input: CodexHookInput,
+  record: ResolvedRoomConnectionRecord,
+): Promise<void> {
   const stateStore = new CodexHookStateStore(options.userDataPath);
   const state = await stateStore.load(input.session_id);
   if (!state) return;
-  const resolved = await resolveConnectionById(
+  if (state.connectionId !== record.connection.id) return;
+  const integration = await getLocalIntegrationStatus(
     options.userDataPath,
-    state.connectionId,
-    options.protector,
+    record.connection,
+    options.runtimePresencePath,
   );
+  if (!integration.active) {
+    // A paused/stopped integration must not leave a stale local session that
+    // could be resumed accidentally after the room is reopened.
+    await stateStore.remove(input.session_id);
+    return;
+  }
+  const resolved = await hydrateConnectionRecord(record);
   const client = new AgentHubClient({
     serverUrl: resolved.connection.serverUrl,
     memberToken: resolved.memberToken,
-    fetchImpl: options.fetchImpl,
+    fetchImpl: createHookGatedFetch(options, resolved.connection.id),
   });
   const git = await inspectGitWorkingState(resolved.connection.repositoryPath, {
     gitExecutable: options.gitExecutable,
@@ -582,18 +670,25 @@ async function handleSessionEnd(options: RunCodexHookOptions, input: CodexHookIn
 async function findHookRuntime(
   options: RunCodexHookOptions,
   input: CodexHookInput,
+  record: ResolvedRoomConnectionRecord,
 ): Promise<HookRuntime | undefined> {
   const stateStore = new CodexHookStateStore(options.userDataPath);
   const state = await stateStore.load(input.session_id);
-  const resolved = state
-    ? await resolveConnectionById(options.userDataPath, state.connectionId, options.protector)
-    : await resolveConnectionForPath(
-        options.userDataPath,
-        input.cwd || options.cwd || process.cwd(),
-        options.protector,
-      );
-  if (!resolved) return undefined;
+  if (state && state.connectionId !== record.connection.id) return undefined;
+  if (!(await getLocalIntegrationStatus(
+    options.userDataPath,
+    record.connection,
+    options.runtimePresencePath,
+  )).active) return undefined;
+  const resolved = await hydrateConnectionRecord(record);
   return openHookRuntime(options, input, resolved, false, state);
+}
+
+async function hydrateConnectionRecord(record: ResolvedRoomConnectionRecord): Promise<ResolvedRoomConnection> {
+  return {
+    ...record,
+    memberToken: await record.store.readMemberToken(record.connection.id),
+  };
 }
 
 async function openHookRuntime(
@@ -610,7 +705,7 @@ async function openHookRuntime(
   const client = new AgentHubClient({
     serverUrl: resolved.connection.serverUrl,
     memberToken: resolved.memberToken,
-    fetchImpl: options.fetchImpl,
+    fetchImpl: createHookGatedFetch(options, resolved.connection.id),
   });
   let state = existingState ?? (await stateStore.load(input.session_id));
   if (!state || refreshInitial) {
@@ -1119,7 +1214,22 @@ function contextOutput(additionalContext: string): Record<string, unknown> {
   };
 }
 
-function failureOutput(event: CodexHookEventName, message: string): Record<string, unknown> | undefined {
+function failureOutput(event: CodexHookEventName, error: unknown): Record<string, unknown> | undefined {
+  const message = humanError(error);
+  if (isSoftIntegrationFailure(error)) {
+    const warning = `Agent Hub 暂时无法连接（${message}）。本次操作不会因网络故障被阻止；恢复连接后再补登记和协作检查。`;
+    if (event === "PreToolUse") return allowOutput(warning);
+    if (event === "SessionStart") {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "SessionStart",
+          additionalContext: warning,
+        },
+      };
+    }
+    if (event === "PostToolUse") return contextOutput(warning);
+    return undefined;
+  }
   if (event === "PreToolUse") {
     return denyOutput(`Agent Hub 协作检查失败，已按保护策略暂停写入：${message}`);
   }
@@ -1144,6 +1254,60 @@ function failureOutput(event: CodexHookEventName, message: string): Record<strin
     };
   }
   return undefined;
+}
+
+function isSoftIntegrationFailure(error: unknown): boolean {
+  if (error instanceof HookCleanupPendingError) return true;
+  if (error instanceof AgentHubHttpError) {
+    return error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  if (!(error instanceof Error)) return false;
+  return /(?:fetch failed|failed to fetch|network|socket|econn|etimedout|timed out|did not respond|connection reset|connection refused|aborted)/i.test(
+    error.message,
+  );
+}
+
+function createHookGatedFetch(
+  options: RunCodexHookOptions,
+  connectionId: string,
+): typeof fetch {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  return (async (input: string | URL | Request, init?: RequestInit) => {
+    await assertHookIntegrationActive(options, connectionId);
+    return fetchImpl(input, init);
+  }) as typeof fetch;
+}
+
+async function assertHookIntegrationActive(
+  options: RunCodexHookOptions,
+  connectionId: string,
+): Promise<void> {
+  const store = await openConnectionStore(options.userDataPath, options.protector);
+  const connection = await store.get(connectionId);
+  if (!connection) {
+    throw new HookIntegrationInactiveError();
+  }
+  const status = await getLocalIntegrationStatus(
+    options.userDataPath,
+    connection,
+    options.runtimePresencePath,
+  );
+  if (!status.active) throw new HookIntegrationInactiveError();
+  if (!status.remoteAllowed) throw new HookCleanupPendingError(status.diagnostic);
+}
+
+class HookIntegrationInactiveError extends Error {
+  constructor() {
+    super("Agent Hub Codex integration is inactive.");
+    this.name = "HookIntegrationInactiveError";
+  }
+}
+
+class HookCleanupPendingError extends Error {
+  constructor(diagnostic?: string) {
+    super(diagnostic ?? "Agent Hub is finishing an earlier remote cleanup.");
+    this.name = "HookCleanupPendingError";
+  }
 }
 
 function parseHookInput(raw: string): CodexHookInput {

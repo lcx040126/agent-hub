@@ -1,22 +1,33 @@
+import path from "node:path";
 import type { ConnectionStore } from "../desktop/connection-store.js";
 import type { SavedRoomConnection } from "../desktop/contracts.js";
 import { AgentHubClient, AgentHubHttpError } from "./hub-client.js";
+import {
+  IntegrationOperationTracker,
+  type ConnectionOperationTracker,
+} from "./integration-operations.js";
 import { inspectRepository, type RepositorySnapshot } from "./repository.js";
+import { hasPendingPauseForConnection } from "./pause-retry.js";
+import { hasPendingPausePreparationForConnection } from "./pause-preparation.js";
 
 export interface RepositoryScanSchedulerOptions {
   store: ConnectionStore;
   intervalMs?: number;
+  inspectTimeoutMs?: number;
   inspect?: typeof inspectRepository;
   fetchImpl?: typeof fetch;
+  integrationActive?: () => boolean | Promise<boolean>;
+  operationTracker?: Pick<ConnectionOperationTracker, "run">;
   onError?: (error: Error, connection?: SavedRoomConnection) => void;
 }
 
 export interface RepositoryScanScheduler {
   scanNow(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void>;
 }
 
 const DEFAULT_SCAN_INTERVAL_MS = 2 * 60_000;
+const DEFAULT_INSPECT_TIMEOUT_MS = 60_000;
 
 export function startRepositoryScanScheduler(
   options: RepositoryScanSchedulerOptions,
@@ -26,13 +37,15 @@ export function startRepositoryScanScheduler(
     throw new Error("The repository scan interval must be at least 10 seconds.");
   }
   const sessions = new Map<string, string>();
+  const operationTracker = options.operationTracker
+    ?? new IntegrationOperationTracker(path.dirname(options.store.filePath));
   let stopped = false;
   let running: Promise<void> | null = null;
 
   const scanNow = async () => {
     if (stopped) return;
     if (running) return running;
-    running = runAllScans(options, sessions).finally(() => {
+    running = runAllScans(options, sessions, operationTracker).finally(() => {
       running = null;
     });
     return running;
@@ -43,9 +56,10 @@ export function startRepositoryScanScheduler(
 
   return {
     scanNow,
-    stop() {
+    async stop() {
       stopped = true;
       clearInterval(timer);
+      await running;
     },
   };
 }
@@ -53,10 +67,11 @@ export function startRepositoryScanScheduler(
 async function runAllScans(
   options: RepositoryScanSchedulerOptions,
   sessions: Map<string, string>,
+  operationTracker: Pick<ConnectionOperationTracker, "run">,
 ): Promise<void> {
   let connections: SavedRoomConnection[];
   try {
-    connections = await options.store.list();
+    connections = (await options.store.list()).filter((connection) => connection.integrationEnabled !== false);
   } catch (error) {
     options.onError?.(asError(error));
     return;
@@ -64,8 +79,13 @@ async function runAllScans(
   await Promise.all(
     connections.map(async (connection) => {
       try {
-        await scanConnection(options, sessions, connection);
+        await operationTracker.run(connection.id, async () => {
+          const current = await options.store.get(connection.id);
+          if (!current || current.integrationEnabled === false) return;
+          await scanConnection(options, sessions, current);
+        });
       } catch (error) {
+        if (error instanceof ScanIntegrationInactiveError) return;
         options.onError?.(asError(error), connection);
       }
     }),
@@ -77,20 +97,28 @@ async function scanConnection(
   sessions: Map<string, string>,
   connection: SavedRoomConnection,
 ): Promise<void> {
-  const [memberToken, snapshot] = await Promise.all([
-    options.store.readMemberToken(connection.id),
-    (options.inspect ?? inspectRepository)(connection.repositoryPath),
-  ]);
+  const inspectTimeoutMs = positiveFinite(
+    options.inspectTimeoutMs ?? DEFAULT_INSPECT_TIMEOUT_MS,
+    "repository inspection timeout",
+  );
+  const snapshot = await withTimeout(
+    Promise.resolve((options.inspect ?? inspectRepository)(connection.repositoryPath)),
+    inspectTimeoutMs,
+    `Repository inspection did not finish within ${inspectTimeoutMs} ms.`,
+  );
+  const current = await activeConnection(options, connection.id);
+  if (!current) return;
+  const memberToken = await options.store.readMemberToken(current.id);
   const client = new AgentHubClient({
-    serverUrl: connection.serverUrl,
+    serverUrl: current.serverUrl,
     memberToken,
-    fetchImpl: options.fetchImpl,
+    fetchImpl: createScanGatedFetch(options, current.id),
     timeoutMs: 30_000,
   });
-  let sessionId = sessions.get(connection.id);
+  let sessionId = sessions.get(current.id);
   if (!sessionId) {
     sessionId = await openScanSession(client, snapshot);
-    sessions.set(connection.id, sessionId);
+    sessions.set(current.id, sessionId);
   }
 
   try {
@@ -100,9 +128,39 @@ async function scanConnection(
       throw error;
     }
     sessionId = await openScanSession(client, snapshot);
-    sessions.set(connection.id, sessionId);
+    sessions.set(current.id, sessionId);
     await uploadSnapshot(client, sessionId, snapshot);
   }
+}
+
+function createScanGatedFetch(
+  options: RepositoryScanSchedulerOptions,
+  connectionId: string,
+): typeof fetch {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  return (async (input: string | URL | Request, init?: RequestInit) => {
+    if (!(await activeConnection(options, connectionId))) {
+      throw new ScanIntegrationInactiveError();
+    }
+    return fetchImpl(input, init);
+  }) as typeof fetch;
+}
+
+async function activeConnection(
+  options: RepositoryScanSchedulerOptions,
+  connectionId: string,
+): Promise<SavedRoomConnection | undefined> {
+  if (options.integrationActive && !(await options.integrationActive())) return undefined;
+  const current = await options.store.get(connectionId);
+  if (!current || current.integrationEnabled === false) return undefined;
+  const userDataPath = path.dirname(options.store.filePath);
+  if (
+    await hasPendingPausePreparationForConnection(userDataPath, current.id)
+    || await hasPendingPauseForConnection(userDataPath, current.id)
+  ) {
+    return undefined;
+  }
+  return current;
 }
 
 async function openScanSession(client: AgentHubClient, snapshot: RepositorySnapshot): Promise<string> {
@@ -162,4 +220,29 @@ export function createBackgroundScanPayload(snapshot: RepositorySnapshot): Recor
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function positiveFinite(value: number, label: string): number {
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`The ${label} must be positive.`);
+  return value;
+}
+
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+class ScanIntegrationInactiveError extends Error {
+  constructor() {
+    super("Agent Hub repository scan stopped because the local integration is inactive.");
+    this.name = "ScanIntegrationInactiveError";
+  }
 }

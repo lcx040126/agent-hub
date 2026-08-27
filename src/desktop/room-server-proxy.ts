@@ -1,5 +1,9 @@
+import path from "node:path";
 import type { ConnectionStore } from "./connection-store.js";
 import type { RoomServerResponse } from "./contracts.js";
+import { IntegrationOperationTracker } from "../companion/integration-operations.js";
+import { hasPendingPauseForConnection } from "../companion/pause-retry.js";
+import { hasPendingPausePreparationForConnection } from "../companion/pause-preparation.js";
 
 const MAX_REQUEST_BYTES = 256 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -52,12 +56,14 @@ const SAVED_POST_ROUTES = [
 ];
 
 interface RoomConnectionLookup {
+  readonly filePath?: string;
   get(connectionId: string): ReturnType<ConnectionStore["get"]>;
   readMemberToken(connectionId: string): ReturnType<ConnectionStore["readMemberToken"]>;
 }
 
 interface RequestPlan {
   url: string;
+  pathname: string;
   method: "GET" | "POST";
   body?: string;
   memberToken?: string;
@@ -70,6 +76,39 @@ export async function requestRoomServer(
 ): Promise<RoomServerResponse> {
   const value = requireRecord(input, "A room server request object is required.");
   const connectionId = optionalString(value.connectionId, "connection ID", 128);
+  const savedMutation = Boolean(
+    connectionId
+    && typeof value.method === "string"
+    && value.method.trim().toUpperCase() === "POST",
+  );
+  if (connectionId && savedMutation && connections.filePath) {
+    return new IntegrationOperationTracker(path.dirname(connections.filePath)).run(
+      connectionId,
+      () => requestRoomServerResolved(
+        value,
+        connections,
+        fetchImplementation,
+        connectionId,
+        true,
+      ),
+    );
+  }
+  return requestRoomServerResolved(
+    value,
+    connections,
+    fetchImplementation,
+    connectionId,
+    savedMutation,
+  );
+}
+
+async function requestRoomServerResolved(
+  value: Record<string, unknown>,
+  connections: RoomConnectionLookup,
+  fetchImplementation: typeof fetch,
+  connectionId: string | undefined,
+  savedMutation: boolean,
+): Promise<RoomServerResponse> {
   let serverUrl: string;
   let memberToken: string | undefined;
   let savedConnection = false;
@@ -80,6 +119,21 @@ export async function requestRoomServer(
     }
     const connection = await connections.get(connectionId);
     if (!connection) throw new Error("The selected room connection does not exist.");
+    if (savedMutation && connection.integrationEnabled === false) {
+      throw new Error("Agent Hub room changes are disabled while this connection is paused.");
+    }
+    if (
+      savedMutation
+      && connections.filePath
+      && (
+        await hasPendingPausePreparationForConnection(path.dirname(connections.filePath), connectionId)
+        || await hasPendingPauseForConnection(path.dirname(connections.filePath), connectionId)
+      )
+    ) {
+      throw new Error(
+        "Agent Hub is finishing the previous shutdown cleanup before allowing new room changes.",
+      );
+    }
     serverUrl = connection.serverUrl;
     memberToken = await connections.readMemberToken(connectionId);
     savedConnection = true;
@@ -167,7 +221,7 @@ export function createRequestPlan(
     }
   }
 
-  return { url: target.toString(), method, body, memberToken };
+  return { url: target.toString(), pathname: target.pathname, method, body, memberToken };
 }
 
 function validateBootstrapRoute(method: "GET" | "POST", target: URL): void {

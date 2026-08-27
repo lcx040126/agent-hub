@@ -5,6 +5,8 @@ import {
   getDashboard,
   joinRoom,
   loadSession,
+  pauseSavedConnection,
+  resumeSavedConnection,
   saveSession,
   secureDesktopSession,
   type Session,
@@ -108,6 +110,8 @@ describe("desktop room transport", () => {
       roomId: "room-1",
       roomName: "先锋协作",
       memberName: "成员 B",
+      memberRole: "member" as const,
+      integrationEnabled: true,
       createdAt: "2026-08-25T12:00:00.000Z",
       updatedAt: "2026-08-25T12:00:00.000Z",
     }));
@@ -194,6 +198,7 @@ describe("desktop room transport", () => {
     expect(saveRoomConnection).toHaveBeenCalledWith(expect.objectContaining({
       memberToken: "secret-member-token",
       repositoryPath: "D:\\UGit\\projectvanguard",
+      memberRole: "member",
     }));
     expect(saved.memberToken).toBeUndefined();
     expect(saved.connectionId).toBe("connection-1");
@@ -218,6 +223,90 @@ describe("desktop room transport", () => {
     }));
     expect(JSON.stringify(requests.slice(1))).not.toContain("secret-member-token");
     expect(JSON.stringify(requests.slice(1))).not.toContain("192.168.1.25");
+  });
+
+  it("persists and restores the host role for a saved desktop room", async () => {
+    const saveRoomConnection = vi.fn(async (input: Record<string, unknown>) => ({
+      id: "host-connection",
+      serverUrl: input.serverUrl as string,
+      repositoryPath: input.repositoryPath as string,
+      roomId: input.roomId as string,
+      roomName: input.roomName as string,
+      memberName: input.memberName as string,
+      memberRole: input.memberRole as "host" | "member",
+      integrationEnabled: true,
+      createdAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+    }));
+    const pauseRoomConnection = vi.fn(async () => ({
+      queued: false,
+      requestId: "pause-host",
+      localRoomServerStopped: true,
+    }));
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { agentHubDesktop: { saveRoomConnection, pauseRoomConnection } },
+    });
+    const hostSession: Session = {
+      memberToken: "host-token",
+      room: {
+        id: "room-host",
+        name: "房主房间",
+        projectName: "Project Vanguard",
+        repository: "https://github.com/example/project-vanguard.git",
+        defaultBranch: "main",
+      },
+      member: {
+        id: "host-a",
+        name: "房主 A",
+        role: "host",
+        status: "online",
+        compatibility: "compatible",
+      },
+    };
+
+    const secured = await secureDesktopSession(
+      hostSession,
+      "http://127.0.0.1:4173",
+      "D:\\UGit\\projectvanguard",
+    );
+    expect(saveRoomConnection).toHaveBeenCalledWith(expect.objectContaining({ memberRole: "host" }));
+    const restored = resumeSavedConnection({
+      id: secured.connectionId!,
+      serverUrl: secured.serverUrl!,
+      repositoryPath: secured.repositoryPath!,
+      roomId: hostSession.room.id,
+      roomName: hostSession.room.name,
+      memberName: hostSession.member.name,
+      memberRole: "host",
+      integrationEnabled: true,
+      createdAt: "2026-08-27T00:00:00.000Z",
+      updatedAt: "2026-08-27T00:00:00.000Z",
+    });
+    expect(restored.member.role).toBe("host");
+    await pauseSavedConnection(restored.connectionId!);
+    expect(pauseRoomConnection).toHaveBeenCalledWith("host-connection");
+  });
+
+  it("returns a permanent cleanup diagnostic from the desktop bridge", async () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        agentHubDesktop: {
+          pauseRoomConnection: vi.fn(async () => ({
+            queued: false,
+            requestId: "pause-auth-failed",
+            cleanupError: "The member token is invalid.",
+            localRoomServerStopped: false,
+          })),
+        },
+      },
+    });
+
+    await expect(pauseSavedConnection("connection-a")).resolves.toMatchObject({
+      queued: false,
+      cleanupError: "The member token is invalid.",
+    });
   });
 });
 

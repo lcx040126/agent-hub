@@ -178,6 +178,7 @@ export type Session = {
   inviteServerUrl?: string;
   repositoryPath?: string;
   roomToken?: string;
+  integrationEnabled?: boolean;
   room: Room;
   member: Member;
 };
@@ -189,6 +190,8 @@ export type SavedRoomConnection = {
   roomId?: string;
   roomName?: string;
   memberName?: string;
+  memberRole?: "host" | "member";
+  integrationEnabled: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -220,8 +223,18 @@ type DesktopApi = {
     roomId?: string;
     roomName?: string;
     memberName?: string;
+    memberRole?: "host" | "member";
+    integrationEnabled?: boolean;
   }): Promise<SavedRoomConnection>;
   listRoomConnections(): Promise<SavedRoomConnection[]>;
+  pauseRoomConnection(connectionId: string): Promise<{
+    connection: SavedRoomConnection;
+    queued: boolean;
+    requestId: string;
+    cleanupError?: string;
+    localRoomServerStopped: boolean;
+  }>;
+  activateRoomConnection(connectionId: string): Promise<SavedRoomConnection>;
   requestRoomServer(input: RoomServerRequest): Promise<{ status: number; body: unknown }>;
   installCodexIntegration(connectionId: string): Promise<{
     configPath: string;
@@ -911,6 +924,7 @@ export function loadSession(): Session | null {
       roomToken,
       room: normalizeRoom(parsed.room, roomToken),
       member: normalizeMember(parsed.member),
+      integrationEnabled: parsed.integrationEnabled !== false,
     };
   } catch {
     return null;
@@ -927,6 +941,7 @@ export function saveSession(session: Session): void {
       repositoryPath: session.repositoryPath,
       room: { ...session.room, code: undefined },
       member: session.member,
+      integrationEnabled: session.integrationEnabled !== false,
     };
     localStorage.setItem(SESSION_POINTER_KEY, JSON.stringify(publicSession));
     sessionStorage.removeItem(SESSION_RUNTIME_KEY);
@@ -1004,8 +1019,37 @@ export function resumeSavedConnection(connection: SavedRoomConnection): Session 
     serverUrl: connection.serverUrl,
     repositoryPath: connection.repositoryPath,
     room: normalizeRoom({ id: connection.roomId, name: connection.roomName }),
-    member: normalizeMember({ name: connection.memberName }),
+    member: normalizeMember({ name: connection.memberName, role: connection.memberRole }),
+    integrationEnabled: connection.integrationEnabled !== false,
   };
+}
+
+export async function pauseSavedConnection(
+  connectionId: string,
+): Promise<{ queued: boolean; requestId: string; cleanupError?: string; localRoomServerStopped: boolean }> {
+  const desktop = window.agentHubDesktop;
+  if (!desktop) return { queued: false, requestId: "", localRoomServerStopped: false };
+  try {
+    const result = await desktop.pauseRoomConnection(connectionId);
+    return {
+      queued: result.queued,
+      requestId: result.requestId,
+      cleanupError: result.cleanupError,
+      localRoomServerStopped: result.localRoomServerStopped,
+    };
+  } catch (error) {
+    throw friendlyDesktopError(error);
+  }
+}
+
+export async function activateSavedConnection(connectionId: string): Promise<SavedRoomConnection | null> {
+  const desktop = window.agentHubDesktop;
+  if (!desktop) return null;
+  try {
+    return await desktop.activateRoomConnection(connectionId);
+  } catch (error) {
+    throw friendlyDesktopError(error);
+  }
 }
 
 export async function secureDesktopSession(
@@ -1024,6 +1068,8 @@ export async function secureDesktopSession(
       roomId: session.room.id,
       roomName: session.room.name,
       memberName: session.member.name,
+      memberRole: session.member.role === "host" ? "host" : "member",
+      integrationEnabled: session.integrationEnabled,
     });
     return {
       ...session,
@@ -1031,6 +1077,7 @@ export async function secureDesktopSession(
       connectionId: saved.id,
       serverUrl: saved.serverUrl,
       repositoryPath: saved.repositoryPath,
+      integrationEnabled: saved.integrationEnabled,
     };
   } catch (error) {
     throw friendlyDesktopError(error);

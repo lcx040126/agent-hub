@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startCodexSessionHeartbeatScheduler } from "./codex-session-heartbeat.js";
 import { CodexHookStateStore, type CodexHookSessionState } from "./hook-state.js";
+import { IntegrationOperationTracker } from "./integration-operations.js";
+import { PausePreparationQueue } from "./pause-preparation.js";
 
 const cleanup: string[] = [];
 
@@ -19,7 +21,7 @@ describe("Codex session heartbeat scheduler", () => {
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       expect(String(_url)).toContain(`/api/sessions/${state.hubSessionId}/heartbeat`);
       expect(JSON.parse(String(init?.body))).toMatchObject({
-        clientVersion: "0.2.0",
+        clientVersion: "0.2.1",
         protocolVersion: 1,
         schemaVersion: 3,
       });
@@ -32,7 +34,7 @@ describe("Codex session heartbeat scheduler", () => {
       intervalMs: 60_000,
     });
     await scheduler.scanNow();
-    scheduler.stop();
+    await scheduler.stop();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
@@ -51,7 +53,7 @@ describe("Codex session heartbeat scheduler", () => {
       intervalMs: 60_000,
     });
     await scheduler.scanNow();
-    scheduler.stop();
+    await scheduler.stop();
 
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(store.get).not.toHaveBeenCalled();
@@ -86,7 +88,7 @@ describe("Codex session heartbeat scheduler", () => {
       intervalMs: 60_000,
     });
     await pendingScheduler.scanNow();
-    pendingScheduler.stop();
+    await pendingScheduler.stop();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     await expect(stateStore.load(saved.codexSessionId)).resolves.toBeDefined();
 
@@ -98,7 +100,7 @@ describe("Codex session heartbeat scheduler", () => {
       intervalMs: 60_000,
     });
     await expiredScheduler.scanNow();
-    expiredScheduler.stop();
+    await expiredScheduler.stop();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     await expect(stateStore.load(saved.codexSessionId)).resolves.toBeUndefined();
   });
@@ -118,8 +120,67 @@ describe("Codex session heartbeat scheduler", () => {
       intervalMs: 60_000,
     });
     await scheduler.scanNow();
-    scheduler.stop();
+    await scheduler.stop();
     await expect(stateStore.load(state.codexSessionId)).resolves.toBeUndefined();
+  });
+
+  it("does not heartbeat or read credentials while exit cleanup is pending", async () => {
+    const userDataPath = await temporaryUserData();
+    const state = hookState();
+    await new CodexHookStateStore(userDataPath).save(state);
+    await new PausePreparationQueue({
+      filePath: path.join(userDataPath, "pause-preparation.json"),
+    }).enqueue({
+      connectionId: state.connectionId,
+      reason: "app-shutdown",
+      requestId: "pending-heartbeat-cleanup",
+    });
+    const store = connectionLookup();
+    const fetchImpl = vi.fn<typeof fetch>();
+    const scheduler = startCodexSessionHeartbeatScheduler({
+      userDataPath,
+      store,
+      fetchImpl,
+      intervalMs: 60_000,
+    });
+
+    await scheduler.scanNow();
+    await scheduler.stop();
+
+    expect(store.get).toHaveBeenCalled();
+    expect(store.readMemberToken).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("keeps an in-flight heartbeat registered until pause can drain it", async () => {
+    const userDataPath = await temporaryUserData();
+    const state = hookState();
+    await new CodexHookStateStore(userDataPath).save(state);
+    let releaseHeartbeat: (() => void) | undefined;
+    const fetchImpl = vi.fn(async () => {
+      await new Promise<void>((resolve) => { releaseHeartbeat = resolve; });
+      return jsonResponse(200, { session: { id: state.hubSessionId }, renewedLeases: [] });
+    }) as typeof fetch;
+    const scheduler = startCodexSessionHeartbeatScheduler({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl,
+      intervalMs: 60_000,
+    });
+    await vi.waitFor(() => expect(releaseHeartbeat).toBeTypeOf("function"));
+    let drained = false;
+    const drain = new IntegrationOperationTracker(userDataPath)
+      .drain(state.connectionId, { pollIntervalMs: 5 })
+      .then(() => { drained = true; });
+    await vi.waitFor(() => expect(drained).toBe(false));
+
+    releaseHeartbeat?.();
+    await scheduler.scanNow();
+    await scheduler.stop();
+    await drain;
+
+    expect(drained).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
 });
 
@@ -137,6 +198,7 @@ function connectionLookup() {
 }
 
 function hookState(): CodexHookSessionState {
+  const now = new Date().toISOString();
   return {
     version: 1,
     codexSessionId: "codex-session-1",
@@ -150,8 +212,8 @@ function hookState(): CodexHookSessionState {
     observedChangedPaths: [],
     observedChangedFingerprints: {},
     leases: [],
-    openedAt: "2026-08-26T00:00:00.000Z",
-    updatedAt: "2026-08-26T00:00:00.000Z",
+    openedAt: now,
+    updatedAt: now,
   };
 }
 

@@ -328,8 +328,14 @@ export class DesktopAppUpdater {
       return this.getStatus();
     } catch (error) {
       const normalized = asError(error);
-      await this.abortInstall(normalized, recoveryPrepared);
-      throw this.fail(this.installLaunchError ?? normalized);
+      let failure = this.installLaunchError ?? normalized;
+      try {
+        await this.abortInstall(failure, recoveryPrepared);
+      } catch (abortError) {
+        failure = asError(abortError);
+        this.installLaunchError = failure;
+      }
+      throw this.fail(this.installLaunchError ?? failure);
     } finally {
       this.busy = false;
     }
@@ -354,43 +360,59 @@ export class DesktopAppUpdater {
     }
     this.installLaunchError = error;
     this.fail(error);
-    void this.abortInstall(error, this.installRecoveryPrepared);
+    void this.abortInstall(error, this.installRecoveryPrepared).catch((abortError) => {
+      const failure = asError(abortError);
+      this.installLaunchError = failure;
+      this.fail(failure);
+    });
   }
 
   private abortInstall(error: Error, recoveryPrepared: boolean): Promise<void> {
     if (this.installAbortPromise) return this.installAbortPromise;
     this.installAbortPromise = (async () => {
-      if (recoveryPrepared) {
-        await this.options.recovery.markPendingFailed(error.message).catch(() => undefined);
-        let safeToAbandon = !this.installRecoveryArmed;
-        const targetVersion = this.verifiedManifest?.manifest.version ?? this.currentVersion;
-        if (this.installRecoveryArmed) {
-          try {
-            if (!this.options.recoveryExecutor) {
-              throw new Error("The desktop update recovery executor is not configured.");
+      try {
+        if (recoveryPrepared) {
+          await this.options.recovery.markPendingFailed(error.message).catch(() => undefined);
+          let safeToAbandon = !this.installRecoveryArmed;
+          const targetVersion = this.verifiedManifest?.manifest.version ?? this.currentVersion;
+          if (this.installRecoveryArmed) {
+            try {
+              if (!this.options.recoveryExecutor) {
+                throw new Error("The desktop update recovery executor is not configured.");
+              }
+              await withTimeout(
+                this.options.recoveryExecutor.disarm(targetVersion),
+                this.options.recoveryDisarmTimeoutMs ?? 5_000,
+                "The desktop update recovery guard did not disarm in time.",
+              );
+              safeToAbandon = true;
+              this.installRecoveryArmed = false;
+            } catch (disarmError) {
+              const retainedError = new Error(
+                `${error.message} Recovery protection could not be safely disarmed, so the pending update and recovery data were retained. ${asError(disarmError).message}`,
+              );
+              this.installLaunchError = retainedError;
+              await this.options.recovery.markPendingFailed(retainedError.message).catch(() => undefined);
+              this.fail(retainedError);
             }
-            await withTimeout(
-              this.options.recoveryExecutor.disarm(targetVersion),
-              this.options.recoveryDisarmTimeoutMs ?? 5_000,
-              "The desktop update recovery guard did not disarm in time.",
-            );
-            safeToAbandon = true;
-            this.installRecoveryArmed = false;
-          } catch (disarmError) {
-            const retainedError = new Error(
-              `${error.message} Recovery protection could not be safely disarmed, so the pending update and recovery data were retained. ${asError(disarmError).message}`,
-            );
-            this.installLaunchError = retainedError;
-            await this.options.recovery.markPendingFailed(retainedError.message).catch(() => undefined);
-            this.fail(retainedError);
+          }
+          if (safeToAbandon) {
+            await this.options.recovery.abandonPending().catch(() => undefined);
           }
         }
-        if (safeToAbandon) {
-          await this.options.recovery.abandonPending().catch(() => undefined);
+        try {
+          await this.options.installHooks?.onInstallAborted?.(this.installLaunchError ?? error);
+        } catch (hookError) {
+          const combinedError = combineInstallAbortErrors(
+            this.installLaunchError ?? error,
+            hookError,
+          );
+          this.installLaunchError = combinedError;
+          throw combinedError;
         }
+      } finally {
+        this.installRecoveryPrepared = false;
       }
-      await this.options.installHooks?.onInstallAborted?.(this.installLaunchError ?? error);
-      this.installRecoveryPrepared = false;
     })();
     return this.installAbortPromise;
   }
@@ -464,6 +486,14 @@ function boundedNumber(value: unknown, minimum: number, maximum: number): number
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function combineInstallAbortErrors(installError: Error, hookError: unknown): Error {
+  const normalizedHookError = asError(hookError);
+  return new AggregateError(
+    [installError, normalizedHookError],
+    `${installError.message} Agent Hub also could not restore local services after the failed install: ${normalizedHookError.message}`,
+  );
 }
 
 async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {

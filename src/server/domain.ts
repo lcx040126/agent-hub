@@ -498,6 +498,39 @@ export interface JoinRoomResult {
   memberToken: string;
 }
 
+/**
+ * Requests that the authenticated member's local integration is paused.
+ *
+ * `cutoffAt` is a client request timestamp used for idempotency. The applied
+ * cleanup boundary is captured from the room server clock on first handling;
+ * clients do not create new remote work while a delayed request is pending.
+ */
+export interface PauseMemberInput {
+  memberToken: string;
+  reason: string;
+  cutoffAt: string;
+  requestId: string;
+}
+
+export interface PauseMemberResult {
+  requestId: string;
+  roomId: string;
+  memberId: string;
+  memberRole: MemberRole;
+  reason: string;
+  cutoffAt: string;
+  appliedAt: string;
+  alreadyApplied: boolean;
+  closedSessionIds: string[];
+  releasedLeaseIds: string[];
+  cancelledReleaseRequestIds: string[];
+  expiredConfirmationIds: string[];
+  closedSessionCount: number;
+  releasedLeaseCount: number;
+  cancelledReleaseRequestCount: number;
+  expiredConfirmationCount: number;
+}
+
 export interface ClaimLeaseInput {
   memberToken: string;
   sessionId?: string;

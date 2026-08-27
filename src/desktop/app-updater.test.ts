@@ -149,6 +149,92 @@ describe("desktop app updater", () => {
     expect(recoveryExecutor.disarm).not.toHaveBeenCalled();
   });
 
+  it("reports both the preparation and service recovery failures when install preparation aborts", async () => {
+    const directory = await temporaryDirectory();
+    const installerPath = path.join(directory, "AgentHub-Setup-0.3.0-x64.exe");
+    const bytes = Buffer.from("verified installer");
+    await writeFile(installerPath, bytes);
+    const engine = new FakeEngine(installerPath, "0.3.0");
+    const preparationError = new Error("maintenance entry failed");
+    const serviceRecoveryError = new Error("service restart failed");
+    const prepareForInstall = vi.fn(async () => {
+      throw preparationError;
+    });
+    const onInstallAborted = vi.fn(async () => {
+      throw serviceRecoveryError;
+    });
+    const updater = new DesktopAppUpdater({
+      engine,
+      recovery: new FakeRecovery(),
+      enabled: true,
+      currentVersion: "0.2.0",
+      manifestLoader: async () => update(bytes),
+      installHooks: { prepareForInstall, onInstallAborted },
+    });
+
+    await updater.check();
+    await updater.download();
+    await expect(updater.install()).rejects.toThrow(
+      /maintenance entry failed.*could not restore local services.*service restart failed/i,
+    );
+
+    expect(prepareForInstall).toHaveBeenCalledOnce();
+    expect(onInstallAborted).toHaveBeenCalledWith(preparationError);
+    expect(engine.quitAndInstall).not.toHaveBeenCalled();
+    expect(updater.getStatus()).toMatchObject({
+      phase: "failed",
+      error: expect.stringMatching(
+        /maintenance entry failed.*could not restore local services.*service restart failed/i,
+      ),
+    });
+  });
+
+  it("handles a rejected service recovery hook when the update engine errors asynchronously", async () => {
+    const directory = await temporaryDirectory();
+    const installerPath = path.join(directory, "AgentHub-Setup-0.3.0-x64.exe");
+    const bytes = Buffer.from("verified installer");
+    await writeFile(installerPath, bytes);
+    const engine = new FakeEngine(installerPath, "0.3.0");
+    const recoveryExecutor = fakeRecoveryExecutor();
+    const serviceRecoveryError = new Error("service restart failed");
+    const onInstallAborted = vi.fn(async () => {
+      throw serviceRecoveryError;
+    });
+    const updater = new DesktopAppUpdater({
+      engine,
+      recovery: new FakeRecovery(),
+      recoveryExecutor,
+      enabled: true,
+      currentVersion: "0.2.0",
+      manifestLoader: async () => update(bytes),
+      installHooks: {
+        prepareForInstall: async () => [],
+        onInstallAborted,
+      },
+    });
+
+    await updater.check();
+    await updater.download();
+    await expect(updater.install()).resolves.toMatchObject({ phase: "installing" });
+
+    const engineError = new Error("NSIS failed after launch");
+    engine.emit("error", engineError);
+
+    await vi.waitFor(() => {
+      expect(updater.getStatus()).toMatchObject({
+        phase: "failed",
+        error: expect.stringMatching(
+          /NSIS failed after launch.*could not restore local services.*service restart failed/i,
+        ),
+      });
+    });
+    expect(onInstallAborted).toHaveBeenCalledWith(engineError);
+    expect(recoveryExecutor.disarm).toHaveBeenCalledWith("0.3.0");
+    expect(
+      (updater as unknown as { installRecoveryPrepared: boolean }).installRecoveryPrepared,
+    ).toBe(false);
+  });
+
   it("aborts recovery and restarts stopped services when NSIS immediately emits an error", async () => {
     const directory = await temporaryDirectory();
     const installerPath = path.join(directory, "AgentHub-Setup-0.3.0-x64.exe");

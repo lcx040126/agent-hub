@@ -11,7 +11,7 @@ export interface PendingReleaseRequestNotification {
 
 export interface ReleaseRequestNotificationScheduler {
   scanNow(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void>;
 }
 
 interface ConnectionLookup {
@@ -57,9 +57,10 @@ export function startReleaseRequestNotificationScheduler(
   timer.unref?.();
   return {
     scanNow,
-    stop() {
+    async stop() {
       stopped = true;
       clearInterval(timer);
+      await running;
     },
   };
 }
@@ -68,7 +69,7 @@ async function notifyPendingRequests(
   options: StartReleaseRequestNotifierOptions,
   notified: Set<string>,
 ): Promise<void> {
-  const connections = await options.store.list();
+  const connections = (await options.store.list()).filter((connection) => connection.integrationEnabled !== false);
   const requester = options.request ?? requestRoomServer;
   await Promise.all(connections.map(async (connection) => {
     try {

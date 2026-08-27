@@ -37,13 +37,36 @@ describe("release request notification scheduler", () => {
     });
     await scheduler.scanNow();
     await scheduler.scanNow();
-    scheduler.stop();
+    await scheduler.stop();
     expect(notify).toHaveBeenCalledTimes(1);
     expect(notify).toHaveBeenCalledWith(expect.objectContaining({
       id: "request-1",
       requesterName: "成员 B",
       requestedPaths: ["Assets/Vanguard/Inventory"],
     }), expect.objectContaining({ id: "connection-1" }));
+  });
+
+  it("waits for an in-flight notification scan before stopping", async () => {
+    let finishRequest!: (value: { status: number; body: object }) => void;
+    const request = vi.fn(() => new Promise<{ status: number; body: object }>((resolve) => {
+      finishRequest = resolve;
+    }));
+    const scheduler = startReleaseRequestNotificationScheduler({
+      store: connectionLookup(),
+      request,
+      notify: vi.fn(),
+      intervalMs: 60_000,
+    });
+    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+
+    let stopped = false;
+    const stopping = scheduler.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+
+    finishRequest({ status: 200, body: {} });
+    await stopping;
+    expect(stopped).toBe(true);
   });
 });
 

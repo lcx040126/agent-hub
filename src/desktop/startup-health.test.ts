@@ -4,14 +4,14 @@ import { verifyStartupHealthAndMark } from "./startup-health.js";
 const serviceHealth = {
   status: "ok",
   service: "agent-hub",
-  version: "0.2.0",
+  version: "0.2.1",
   protocolVersion: 1,
   schemaVersion: 3,
   database: { status: "ok", schemaVersion: 3 },
 };
 const localIntegrationHealth = {
   status: "ok",
-  version: "0.2.0",
+  version: "0.2.1",
   mcpBridge: "ok",
   codexHook: "ok",
 };
@@ -36,7 +36,7 @@ describe("desktop startup health", () => {
     })).resolves.toEqual({
       service: {
         status: "ok",
-        version: "0.2.0",
+        version: "0.2.1",
         protocolVersion: 1,
         schemaVersion: 3,
         database: "ok",
