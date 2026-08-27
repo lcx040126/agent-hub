@@ -364,9 +364,11 @@ v0.2.1 已确认功能：退出与后台关闭后的接入隔离
 - `pnpm build` 通过 Vite 客户端构建和服务端/桌面端 TypeScript 编译。
 - 生命周期重点测试覆盖连接状态、运行哨兵、在途操作、重试队列、Hook/MCP 恢复、房主转移与服务端暂停行为。
 - `git diff --check` 通过。
+- Windows x64 NSIS 发布候选已从提交 `3c6c5d2` 在 `D:\ah-v021` 短路径构建成功：`AgentHub-Setup-0.2.1-x64.exe`，119,673,769 字节，SHA-256 `A2490B36A2A8DF9334555D26FFE12B5689A2DD369A3D2A17AB548D8469EF0AF1`。
+- 发布候选的真实 `Agent Hub.exe` 与 `app.asar` 健康探针返回 v0.2.1、MCP bridge 和 Codex Hook 均为 `ok`。
+- 安装包 Authenticode 状态为 `NotSigned`；首次安装仍可能显示 Windows 未知发布者提示。
 
 发布前或发布后的验收缺口
-- 尚未完成 Windows x64 NSIS 短路径打包；以最终发布执行结果为准。
 - 尚未执行真实覆盖安装、托盘退出、房主退出、更新安装、更新失败回退和进程崩溃的桌面端端到端验收。
 - 尚未在两台真实电脑上验证退出后 Codex 写入完全不受影响、重启恢复、断网软失败和远端清理重试。
 - 尚未使用真实 GitHub Release 验证自动更新，也尚未核验 v0.2.1 草稿 Release 的 Setup、blockmap、`latest.yml`、更新清单、签名和 `SHA256SUMS.txt` 六项资产。
