@@ -117,6 +117,24 @@ interface HookRuntime {
   stateStore: CodexHookStateStore;
 }
 
+interface OpenHookSessionResponse {
+  session: {
+    id: string;
+    status: string;
+    currentTurnId?: string | null;
+    activityEpoch?: number;
+    turnStoppedAt?: string | null;
+    reused?: boolean;
+  };
+}
+
+class HookGenerationAdoptionError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "HookGenerationAdoptionError";
+  }
+}
+
 interface RoomSnapshotLike {
   room?: Record<string, unknown>;
   settings?: Record<string, unknown>;
@@ -326,25 +344,14 @@ async function handleUserPromptSubmit(
       if (runtime.state.currentTurnId === turnId) return undefined;
 
       const nextEpoch = Math.max(runtime.state.activityEpoch ?? 0, 0) + 1;
-      const response = await runtime.client.post<{ session: {
-        activityEpoch?: number;
-        currentTurnId?: string | null;
-      } }>("/api/sessions", {
-        clientVersion: AGENT_HUB_VERSION,
-        protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
-        schemaVersion: AGENT_HUB_SCHEMA_VERSION,
-        codexSessionId: input.session_id,
+      await registerAndAdoptHookGeneration(
+        runtime,
+        input,
         turnId,
-        activityEpoch: nextEpoch,
-        branch: runtime.git.branch,
-        baseCommit: runtime.git.headCommit,
-        repository: runtime.git.repositoryRoot,
-        worktree: runtime.git.repositoryRoot,
-        metadata: { source: "codex-hook", event: "UserPromptSubmit" },
-      });
-      runtime.state.activityEpoch = Math.max(nextEpoch, response.session.activityEpoch ?? 0);
-      runtime.state.currentTurnId = response.session.currentTurnId ?? turnId;
-      await runtime.stateStore.save(runtime.state);
+        nextEpoch,
+        "UserPromptSubmit",
+        options,
+      );
     } catch {
       // Prompt submission is advisory; PreToolUse performs the authoritative retry.
     }
@@ -668,24 +675,18 @@ async function handlePreToolUseExclusive(
       const currentEpoch = typeof details.currentActivityEpoch === "number"
         ? details.currentActivityEpoch
         : runtime.state.activityEpoch ?? 0;
-      runtime.state.activityEpoch = currentEpoch + 1;
-      runtime.state.currentTurnId = input.turn_id?.trim()
-        || completionTurnId(input, runtime.state.activityEpoch);
+      const recoveryEpoch = currentEpoch + 1;
+      const recoveryTurnId = input.turn_id?.trim()
+        || completionTurnId(input, recoveryEpoch);
       try {
-        await runtime.client.post("/api/sessions", {
-          clientVersion: AGENT_HUB_VERSION,
-          protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
-          schemaVersion: AGENT_HUB_SCHEMA_VERSION,
-          codexSessionId: input.session_id,
-          turnId: runtime.state.currentTurnId,
-          activityEpoch: runtime.state.activityEpoch,
-          branch: runtime.git.branch,
-          baseCommit: runtime.git.headCommit,
-          repository: runtime.git.repositoryRoot,
-          worktree: runtime.git.repositoryRoot,
-          metadata: { source: "codex-hook", event: "stale_activity_epoch_recovery" },
-        });
-        await runtime.stateStore.save(runtime.state);
+        await registerAndAdoptHookGeneration(
+          runtime,
+          input,
+          recoveryTurnId,
+          recoveryEpoch,
+          "stale_activity_epoch_recovery",
+          options,
+        );
         prepared = await runtime.client.post<PrepareEditsResponse>("/api/edits/prepare", {
           sessionId: runtime.state.hubSessionId,
           title: "Codex automatic write retry",
@@ -699,6 +700,11 @@ async function handlePreToolUseExclusive(
         });
         recoveredActivityEpoch = true;
       } catch (retryError) {
+        if (retryError instanceof HookGenerationAdoptionError) {
+          return denyOutput(
+            `Agent Hub 无法接管当前 Codex 任务的新会话代际：${retryError.message} 本次写入保持暂停。`,
+          );
+        }
         if (retryError instanceof AgentHubHttpError && retryError.code === "stale_activity_epoch") {
           if (monitorMode) {
             monitorWarnings.push("服务端仍报告旧 activity epoch；监测模式允许写入并保留待补登记状态。");
@@ -1536,13 +1542,7 @@ async function openHookRuntime(
   let state = existingState ?? (await stateStore.load(input.session_id));
   if (!state || refreshInitial) {
     let activityEpoch = state?.activityEpoch ?? 0;
-    const opened = await client.post<{ session: {
-      id: string;
-      currentTurnId?: string | null;
-      activityEpoch?: number;
-      turnStoppedAt?: string | null;
-      reused?: boolean;
-    } }>("/api/sessions", {
+    const opened = await client.post<OpenHookSessionResponse>("/api/sessions", {
       clientName: "Agent Hub Codex hook",
       agentName: "Codex",
       clientVersion: AGENT_HUB_VERSION,
@@ -1562,6 +1562,7 @@ async function openHookRuntime(
         startSource: input.source,
       },
     });
+    const openedSessionId = requireActiveHookSessionId(opened.session);
     activityEpoch = Math.max(activityEpoch, opened.session.activityEpoch ?? 0);
     const currentTurnId = opened.session.currentTurnId
       ?? completionTurnId(input, activityEpoch);
@@ -1570,7 +1571,7 @@ async function openHookRuntime(
       version: 1,
       codexSessionId: input.session_id,
       connectionId: resolved.connection.id,
-      hubSessionId: opened.session.id,
+      hubSessionId: openedSessionId,
       finalizationId: randomUUID(),
       repositoryPath: git.repositoryRoot,
       branch: git.branch,
@@ -1606,6 +1607,115 @@ async function openHookRuntime(
   };
   await uploadLightweightScan(runtime, refreshInitial ? "SessionStart" : "AutoOpen");
   return runtime;
+}
+
+async function adoptHookSessionGeneration(
+  runtime: HookRuntime,
+  opened: OpenHookSessionResponse["session"],
+  requestedTurnId: string,
+  requestedActivityEpoch: number,
+  options: Pick<RunCodexHookOptions, "gitExecutable">,
+): Promise<void> {
+  const sessionId = requireActiveHookSessionId(opened);
+  const responseEpoch = Number.isSafeInteger(opened.activityEpoch)
+    ? Number(opened.activityEpoch)
+    : requestedActivityEpoch;
+  const activityEpoch = Math.max(requestedActivityEpoch, responseEpoch);
+  const currentTurnId = opened.currentTurnId?.trim() || requestedTurnId;
+
+  if (sessionId === runtime.state.hubSessionId) {
+    runtime.state.activityEpoch = activityEpoch;
+    runtime.state.currentTurnId = currentTurnId;
+    try {
+      await runtime.stateStore.save(runtime.state);
+    } catch (error) {
+      throw new HookGenerationAdoptionError("无法持久化当前会话活动状态。", { cause: error });
+    }
+    return;
+  }
+
+  try {
+    // 新 generation 必须从当前 Git 状态重新起算，旧租约和归因证据不能跨会话代际继承。
+    const git = await inspectGitWorkingState(runtime.connection.repositoryPath, {
+      gitExecutable: options.gitExecutable,
+    });
+    const now = new Date().toISOString();
+    runtime.git = git;
+    runtime.state = {
+      version: 1,
+      codexSessionId: runtime.state.codexSessionId,
+      connectionId: runtime.state.connectionId,
+      hubSessionId: sessionId,
+      finalizationId: randomUUID(),
+      repositoryPath: git.repositoryRoot,
+      branch: git.branch,
+      baseCommit: git.headCommit,
+      initialChangedPaths: [...git.changedPaths],
+      initialChangedFingerprints: { ...git.changedPathFingerprints },
+      observedChangedPaths: [...git.changedPaths],
+      observedChangedFingerprints: { ...git.changedPathFingerprints },
+      attributedChangedPaths: [],
+      attributedPathsTruncated: false,
+      attributedPathEvidence: [],
+      activityEpoch,
+      currentTurnId,
+      pendingCompletion: opened.turnStoppedAt ? {
+        operationId: randomUUID(),
+        turnId: currentTurnId,
+        activityEpoch,
+        phase: "stopped",
+        recordedAt: opened.turnStoppedAt,
+      } : undefined,
+      leases: [],
+      leaseAttributionComplete: opened.reused === false,
+      openedAt: now,
+      updatedAt: now,
+    };
+    await runtime.stateStore.save(runtime.state);
+  } catch (error) {
+    if (error instanceof HookGenerationAdoptionError) throw error;
+    throw new HookGenerationAdoptionError(
+      "无法重新建立 Git 基线并持久化新会话代际。",
+      { cause: error },
+    );
+  }
+}
+
+async function registerAndAdoptHookGeneration(
+  runtime: HookRuntime,
+  input: CodexHookInput,
+  turnId: string,
+  activityEpoch: number,
+  event: "UserPromptSubmit" | "stale_activity_epoch_recovery",
+  options: Pick<RunCodexHookOptions, "gitExecutable">,
+): Promise<void> {
+  const response = await runtime.client.post<OpenHookSessionResponse>("/api/sessions", {
+    clientVersion: AGENT_HUB_VERSION,
+    protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+    schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+    codexSessionId: input.session_id,
+    turnId,
+    activityEpoch,
+    branch: runtime.git.branch,
+    baseCommit: runtime.git.headCommit,
+    repository: runtime.git.repositoryRoot,
+    worktree: runtime.git.repositoryRoot,
+    metadata: { source: "codex-hook", event },
+  });
+  await adoptHookSessionGeneration(runtime, response.session, turnId, activityEpoch, options);
+}
+
+function requireActiveHookSessionId(opened: OpenHookSessionResponse["session"]): string {
+  const sessionId = typeof opened.id === "string" ? opened.id.trim() : "";
+  if (!sessionId) {
+    throw new HookGenerationAdoptionError("房间服务没有返回有效的 session.id。");
+  }
+  if (opened.status !== "active") {
+    throw new HookGenerationAdoptionError(
+      `房间服务返回的会话状态为 ${opened.status || "unknown"}，不是 active。`,
+    );
+  }
+  return sessionId;
 }
 
 async function uploadLightweightScan(

@@ -366,6 +366,340 @@ describe("Codex hook integration", () => {
     );
   }, 20_000);
 
+  it("adopts a replacement Hub generation after the previous Hook session was closed", async () => {
+    const fixture = await createConnectedHookFixture("prompt-generation", "prompt-generation-session");
+    const prepareSessionIds: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (request, init) => {
+      const pathname = new URL(request instanceof Request ? request.url : String(request)).pathname;
+      if (pathname === "/api/edits/prepare" && typeof init?.body === "string") {
+        prepareSessionIds.push(String((JSON.parse(init.body) as Record<string, unknown>).sessionId));
+      }
+      return fetch(request, init);
+    });
+    const options = (eventName: RunCodexHookOptions["eventName"]) =>
+      fixture.options(eventName, fetchImpl);
+    const stateStore = new CodexHookStateStore(fixture.userDataPath);
+
+    await handleCodexHook(options("SessionStart"), fixture.input("SessionStart", {
+      turn_id: "generation-old-turn",
+      source: "startup",
+    }));
+    const oldState = (await stateStore.load(fixture.sessionId))!;
+    const oldFinalizationId = oldState.finalizationId;
+    oldState.attributedChangedPaths = ["src/old-attribution.ts"];
+    oldState.attributedPathEvidence = [{
+      path: "src/old-attribution.ts",
+      baseEntry: null,
+      attributedEntry: `blob:${"a".repeat(40)}`,
+    }];
+    oldState.leases = [{
+      id: "old-generation-lease",
+      paths: ["src/old-attribution.ts"],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }];
+    oldState.pendingWrite = {
+      proposalHash: "a".repeat(64),
+      toolName: "apply_patch",
+      proposedEdits: [{
+        path: "src/old-attribution.ts",
+        precision: "path",
+        symbols: [],
+        operation: "update",
+      }],
+      attributedSideEffects: false,
+      baselineChangedPaths: [],
+      baselineChangedFingerprints: {},
+      recordedAt: new Date().toISOString(),
+    };
+    oldState.passiveWriteBlock = {
+      leaseId: "old-holder-lease",
+      memberName: "Old holder",
+      paths: ["src/old-attribution.ts"],
+      requestedPaths: ["src/old-attribution.ts"],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    oldState.writeBlockSyncPending = {
+      dirty: true,
+      paths: ["src/old-attribution.ts"],
+      recordedAt: new Date().toISOString(),
+    };
+    oldState.quarantine = {
+      reason: "Old generation quarantine",
+      paths: ["src/old-attribution.ts"],
+      detectedAt: new Date().toISOString(),
+    };
+    await stateStore.save(oldState);
+    fixture.service.closeSession({
+      memberToken: fixture.room.memberToken,
+      sessionId: oldState.hubSessionId,
+      summary: "Close the old Hook generation.",
+    });
+    await writeFile(path.join(fixture.repository, "src", "value.ts"), "export const value = 2;\n", "utf8");
+
+    await handleCodexHook(options("UserPromptSubmit"), fixture.input("UserPromptSubmit", {
+      turn_id: "generation-new-turn",
+    }));
+    const adopted = (await stateStore.load(fixture.sessionId))!;
+    expect(adopted.hubSessionId).not.toBe(oldState.hubSessionId);
+    expect(adopted.finalizationId).not.toBe(oldFinalizationId);
+    expect(adopted).toMatchObject({
+      currentTurnId: "generation-new-turn",
+      activityEpoch: 1,
+      initialChangedPaths: ["src/value.ts"],
+      observedChangedPaths: ["src/value.ts"],
+      attributedChangedPaths: [],
+      attributedPathEvidence: [],
+      leases: [],
+      leaseAttributionComplete: true,
+    });
+    expect(adopted.pendingWrite).toBeUndefined();
+    expect(adopted.pendingCompletion).toBeUndefined();
+    expect(adopted.passiveWriteBlock).toBeUndefined();
+    expect(adopted.writeBlockSyncPending).toBeUndefined();
+    expect(adopted.quarantine).toBeUndefined();
+    expect(fixture.service.listRoomSessions(fixture.room.memberToken).sessions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: oldState.hubSessionId, status: "closed" }),
+        expect.objectContaining({
+          id: adopted.hubSessionId,
+          status: "active",
+          currentTurnId: "generation-new-turn",
+          activityEpoch: 1,
+        }),
+      ]),
+    );
+
+    await expect(handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      turn_id: "generation-new-turn",
+      tool_name: "apply_patch",
+      tool_input: {
+        command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch",
+      },
+    }))).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    expect(prepareSessionIds.at(-1)).toBe(adopted.hubSessionId);
+  }, 20_000);
+
+  it("adopts a replacement generation during stale recovery when prompt registration failed", async () => {
+    const fixture = await createConnectedHookFixture("pre-generation", "pre-generation-session");
+    const prepareSessionIds: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (request, init) => {
+      const pathname = new URL(request instanceof Request ? request.url : String(request)).pathname;
+      const body = typeof init?.body === "string"
+        ? JSON.parse(init.body) as Record<string, unknown>
+        : {};
+      const metadata = body.metadata as Record<string, unknown> | undefined;
+      if (pathname === "/api/sessions" && metadata?.event === "UserPromptSubmit") {
+        throw new TypeError("prompt registration offline");
+      }
+      if (pathname === "/api/edits/prepare") prepareSessionIds.push(String(body.sessionId));
+      return fetch(request, init);
+    });
+    const options = (eventName: RunCodexHookOptions["eventName"]) =>
+      fixture.options(eventName, fetchImpl);
+    const stateStore = new CodexHookStateStore(fixture.userDataPath);
+
+    await handleCodexHook(options("SessionStart"), fixture.input("SessionStart", {
+      turn_id: "pre-generation-old-turn",
+      source: "startup",
+    }));
+    const oldState = (await stateStore.load(fixture.sessionId))!;
+    fixture.service.closeSession({
+      memberToken: fixture.room.memberToken,
+      sessionId: oldState.hubSessionId,
+      summary: "Close before stale recovery.",
+    });
+    await handleCodexHook(options("UserPromptSubmit"), fixture.input("UserPromptSubmit", {
+      turn_id: "pre-generation-new-turn",
+    }));
+
+    await expect(handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      turn_id: "pre-generation-new-turn",
+      tool_name: "apply_patch",
+      tool_input: {
+        command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch",
+      },
+    }))).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    const adopted = (await stateStore.load(fixture.sessionId))!;
+    expect(adopted.hubSessionId).not.toBe(oldState.hubSessionId);
+    expect(prepareSessionIds).toEqual([oldState.hubSessionId, adopted.hubSessionId]);
+    expect(adopted).toMatchObject({
+      currentTurnId: "pre-generation-new-turn",
+      activityEpoch: 1,
+      leaseAttributionComplete: true,
+    });
+  }, 20_000);
+
+  it("preserves leases and attribution when prompt registration returns the same generation", async () => {
+    const fixture = await createConnectedHookFixture("same-generation", "same-generation-session");
+    const stateStore = new CodexHookStateStore(fixture.userDataPath);
+    await handleCodexHook(fixture.options("SessionStart"), fixture.input("SessionStart", {
+      turn_id: "same-generation-old-turn",
+      source: "startup",
+    }));
+    const before = (await stateStore.load(fixture.sessionId))!;
+    before.leaseAttributionComplete = false;
+    before.leases = [{
+      id: "same-generation-lease",
+      paths: ["src/value.ts"],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }];
+    before.attributedChangedPaths = ["src/value.ts"];
+    before.attributedPathEvidence = [{
+      path: "src/value.ts",
+      baseEntry: `blob:${"a".repeat(40)}`,
+      attributedEntry: `blob:${"b".repeat(40)}`,
+    }];
+    before.pendingWrite = {
+      proposalHash: "c".repeat(64),
+      toolName: "apply_patch",
+      proposedEdits: [{
+        path: "src/value.ts",
+        precision: "path",
+        symbols: [],
+        operation: "update",
+      }],
+      attributedSideEffects: false,
+      baselineChangedPaths: [],
+      baselineChangedFingerprints: {},
+      recordedAt: new Date().toISOString(),
+    };
+    await stateStore.save(before);
+
+    await handleCodexHook(fixture.options("UserPromptSubmit"), fixture.input("UserPromptSubmit", {
+      turn_id: "same-generation-new-turn",
+    }));
+
+    await expect(stateStore.load(fixture.sessionId)).resolves.toMatchObject({
+      hubSessionId: before.hubSessionId,
+      finalizationId: before.finalizationId,
+      currentTurnId: "same-generation-new-turn",
+      activityEpoch: 1,
+      leaseAttributionComplete: false,
+      leases: before.leases,
+      attributedChangedPaths: before.attributedChangedPaths,
+      attributedPathEvidence: before.attributedPathEvidence,
+      pendingWrite: before.pendingWrite,
+    });
+  }, 20_000);
+
+  it("keeps an invalid replacement generation blocked in protection mode", async () => {
+    const fixture = await createConnectedHookFixture("invalid-generation", "invalid-generation-session");
+    const stateStore = new CodexHookStateStore(fixture.userDataPath);
+    await handleCodexHook(fixture.options("SessionStart"), fixture.input("SessionStart", {
+      turn_id: "invalid-generation-old-turn",
+      source: "startup",
+    }));
+    fixture.service.updateRoomSettings({
+      memberToken: fixture.room.memberToken,
+      blockingProtectionEnabled: true,
+    });
+    const oldState = (await stateStore.load(fixture.sessionId))!;
+    fixture.service.closeSession({
+      memberToken: fixture.room.memberToken,
+      sessionId: oldState.hubSessionId,
+      summary: "Close before invalid generation recovery.",
+    });
+
+    const prepareSessionIds: string[] = [];
+    let prepareAttempts = 0;
+    const fetchImpl = vi.fn<typeof fetch>(async (request, init) => {
+      const pathname = new URL(request instanceof Request ? request.url : String(request)).pathname;
+      const body = typeof init?.body === "string"
+        ? JSON.parse(init.body) as Record<string, unknown>
+        : {};
+      const metadata = body.metadata as Record<string, unknown> | undefined;
+      if (pathname === "/api/edits/prepare") {
+        prepareSessionIds.push(String(body.sessionId));
+        prepareAttempts += 1;
+        if (prepareAttempts === 1) {
+          return new Response(JSON.stringify({
+            error: "stale_activity_epoch",
+            message: "The local Hook generation is stale.",
+            details: { currentActivityEpoch: 0 },
+          }), { status: 409, headers: { "content-type": "application/json" } });
+        }
+      }
+      if (pathname === "/api/sessions" && metadata?.event === "stale_activity_epoch_recovery") {
+        return jsonResponse({
+          session: {
+            id: "invalid-replacement-session",
+            status: "closed",
+            reused: false,
+            currentTurnId: "invalid-generation-new-turn",
+            activityEpoch: 1,
+          },
+        });
+      }
+      return fetch(request, init);
+    });
+
+    const result = await handleCodexHook(
+      fixture.options("PreToolUse", fetchImpl),
+      fixture.input("PreToolUse", {
+        turn_id: "invalid-generation-new-turn",
+        tool_name: "apply_patch",
+        tool_input: {
+          command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch",
+        },
+      }),
+    );
+
+    expect(result).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+      },
+    });
+    expect(JSON.stringify(result)).toContain("不是 active");
+    expect(prepareSessionIds).toEqual([oldState.hubSessionId]);
+    await expect(stateStore.load(fixture.sessionId)).resolves.toMatchObject({
+      hubSessionId: oldState.hubSessionId,
+      finalizationId: oldState.finalizationId,
+    });
+  }, 20_000);
+
+  it("keeps one Hook generation healthy across three prompt and Stop cycles", async () => {
+    const fixture = await createConnectedHookFixture("three-turns", "three-turns-session");
+    const options = (eventName: RunCodexHookOptions["eventName"]) => fixture.options(eventName);
+    const stateStore = new CodexHookStateStore(fixture.userDataPath);
+
+    await handleCodexHook(options("SessionStart"), fixture.input("SessionStart", {
+      turn_id: "three-turns-start",
+      source: "startup",
+    }));
+    const hubSessionId = (await stateStore.load(fixture.sessionId))!.hubSessionId;
+
+    for (let index = 1; index <= 3; index += 1) {
+      const turnId = `three-turns-${index}`;
+      await handleCodexHook(options("UserPromptSubmit"), fixture.input("UserPromptSubmit", { turn_id: turnId }));
+      await expect(handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+        turn_id: turnId,
+        tool_name: "apply_patch",
+        tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+      }))).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+      await handleCodexHook(options("PostToolUse"), fixture.input("PostToolUse", {
+        turn_id: turnId,
+        tool_name: "apply_patch",
+        tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+      }));
+      await expect(handleCodexHook(options("Stop"), fixture.input("Stop", {
+        turn_id: turnId,
+      }))).resolves.toEqual({ continue: true });
+    }
+
+    await expect(stateStore.load(fixture.sessionId)).resolves.toMatchObject({
+      hubSessionId,
+      currentTurnId: "three-turns-3",
+      activityEpoch: 3,
+    });
+    expect(fixture.service.listRoomSessions(fixture.room.memberToken).sessions.filter(
+      (session) => session.codexSessionId === fixture.sessionId && session.status === "active",
+    )).toHaveLength(1);
+  }, 30_000);
+
   it("lets the first write recover when prompt turn registration is offline", async () => {
     const fixture = await createConnectedHookFixture("prompt-fallback", "prompt-fallback-session");
     let promptAttempts = 0;

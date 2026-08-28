@@ -128,6 +128,9 @@ describe("Agent Hub Streamable HTTP MCP", () => {
     });
     expect(client.getInstructions()).toContain("reuse that exact Hook session");
     expect(client.getInstructions()).toContain("do not call session_open");
+    expect(client.getInstructions()).toContain("leave closing to SessionEnd");
+    expect(client.getInstructions()).toContain("never call session_close for that Hook session");
+    expect(client.getInstructions()).toContain("Only call session_close for a fallback session created by session_open");
     expect(client.getInstructions()).toContain("Only decision=deny stops writing");
     expect(client.getInstructions()).toContain("blocking severity but decision=warn is a writable high-risk warning");
     expect(client.getInstructions()).toContain("edit_check requires historical confirmation");

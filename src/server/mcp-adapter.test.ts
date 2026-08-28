@@ -67,23 +67,36 @@ describe("Agent Hub MCP session lifecycle", () => {
     expect(sessions.find((session) => session.id === hookSession.id)?.status).toBe("active");
   });
 
-  it("reuses and closes the exact SessionStart Hook session without opening a duplicate", async () => {
+  it("keeps the SessionStart Hook session and its lease under Hook lifecycle ownership", async () => {
     const { service, adapter, context } = setup();
     const hookSession = service.openSession({
       memberToken: context.memberToken,
       clientName: "Agent Hub Codex hook",
       metadata: { source: "codex-hook" },
     });
+    const hookLease = service.claimLease({
+      memberToken: context.memberToken,
+      sessionId: hookSession.id,
+      title: "Hook-owned scope",
+      paths: ["src/hook-owned.ts"],
+      mode: "write",
+    });
+    expect(hookLease.acquired).toBe(true);
 
     const countBefore = service.listRoomSessions(context.memberToken).sessions.length;
-    const closed = await adapter.sessionClose(context, {
+    expect(() => adapter.sessionClose(context, {
       sessionId: hookSession.id,
       status: "cancelled",
-    }) as CloseResult;
-    expect(closed.session).toMatchObject({ id: hookSession.id, status: "closed" });
+    })).toThrow(expect.objectContaining({
+      code: "hook_session_lifecycle_owned",
+      status: 409,
+    }));
     expect(
       service.listRoomSessions(context.memberToken).sessions.find((session) => session.id === hookSession.id)?.status,
-    ).toBe("closed");
+    ).toBe("active");
+    expect(service.getDashboard(context.memberToken).leases.find(
+      (lease) => lease.id === (hookLease.acquired ? hookLease.lease.id : ""),
+    )).toMatchObject({ status: "active", sessionId: hookSession.id });
     expect(service.listRoomSessions(context.memberToken).sessions).toHaveLength(countBefore);
   });
 

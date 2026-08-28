@@ -12,7 +12,7 @@ const SERVER_INSTRUCTIONS = [
   "3. Call edit_check with the same sessionId before touching newly discovered paths, and call lease_renew with it while long-running work is active.",
   "4. Use event_append with the same sessionId to record decisions, verification evidence, risks, and handoffs as they occur.",
   "5. Use feature_context_query during planning and before related edits. When protection is enabled and edit_check requires historical confirmation, ask the current member and call feature_change_confirm only after an explicit answer. In monitor-only mode historical confirmation is advisory: report the warning, but do not stop writing for that confirmation. Lease conflicts remain governed by step 2's decision=deny rule.",
-  "6. Submit a structured feature revision before closing completed coding work, then call session_close even when work is incomplete. Never claim compatibility without relevant verification.",
+  "6. Submit a structured feature revision before finishing coding work. When the session came from Codex SessionStart, record the outcome with event_append and leave closing to SessionEnd; never call session_close for that Hook session. Only call session_close for a fallback session created by session_open, including when fallback work is incomplete. Never claim compatibility without relevant verification.",
   "Handle technical coordination automatically. Ask a human only when requirements or business rules genuinely conflict.",
 ].join("\n");
 

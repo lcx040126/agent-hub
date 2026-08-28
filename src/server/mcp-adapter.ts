@@ -53,7 +53,7 @@ export function createMcpServiceAdapter(service: AgentHubService): AgentHubServi
     },
 
     leaseAcquire(context, input) {
-      requireActiveMcpSession(service, context, input.sessionId);
+      requireActiveCoordinationSession(service, context, input.sessionId);
       return service.claimLease({
         memberToken: context.memberToken,
         sessionId: input.sessionId,
@@ -69,17 +69,17 @@ export function createMcpServiceAdapter(service: AgentHubService): AgentHubServi
     },
 
     leaseRenew(context, input) {
-      requireActiveMcpSession(service, context, input.sessionId);
+      requireActiveCoordinationSession(service, context, input.sessionId);
       return renewLease(service, context.memberToken, input);
     },
 
     editCheck(context, input) {
-      requireActiveMcpSession(service, context, input.sessionId);
+      requireActiveCoordinationSession(service, context, input.sessionId);
       return checkEdits(service, context.memberToken, input);
     },
 
     featureContextQuery(context, input) {
-      requireActiveMcpSession(service, context, input.sessionId);
+      requireActiveCoordinationSession(service, context, input.sessionId);
       return queryFeatureContext(
         service,
         featureMemory,
@@ -91,27 +91,27 @@ export function createMcpServiceAdapter(service: AgentHubService): AgentHubServi
     },
 
     featureHistory(context, input) {
-      requireActiveMcpSession(service, context, input.sessionId);
+      requireActiveCoordinationSession(service, context, input.sessionId);
       return service.getFeatureHistory(context.memberToken, input.featureId);
     },
 
     featureRevisionSubmit(context, input) {
-      requireActiveMcpSession(service, context, input.sessionId);
+      requireActiveCoordinationSession(service, context, input.sessionId);
       return submitFeatureRevision(service, context.memberToken, input);
     },
 
     featureRollback(context, input) {
-      requireActiveMcpSession(service, context, input.sessionId);
+      requireActiveCoordinationSession(service, context, input.sessionId);
       return rollbackFeatureRevision(service, context.memberToken, input);
     },
 
     featureChangeConfirm(context, input) {
-      requireActiveMcpSession(service, context, input.sessionId);
+      requireActiveCoordinationSession(service, context, input.sessionId);
       return confirmFeatureChange(service, context.memberToken, input);
     },
 
     eventAppend(context, input) {
-      requireActiveMcpSession(service, context, input.sessionId);
+      requireActiveCoordinationSession(service, context, input.sessionId);
       return appendEvent(service, context.memberToken, input);
     },
 
@@ -742,7 +742,7 @@ function closeSession(
   context: { memberToken: string; member: AgentHubMemberIdentity },
   input: SessionCloseInput,
 ) {
-  requireActiveMcpSession(service, context, input.sessionId);
+  requireClosableMcpSession(service, context, input.sessionId);
   const memberToken = context.memberToken;
   if (input.leaseId) {
     const result = service.closeLease({
@@ -796,11 +796,11 @@ function closeSession(
   };
 }
 
-function requireActiveMcpSession(
+function requireActiveCoordinationSession(
   service: AgentHubService,
   context: { memberToken: string; member: AgentHubMemberIdentity },
   sessionId: string,
-): void {
+): ReturnType<AgentHubService["listRoomSessions"]>["sessions"][number] {
   const session = service.listRoomSessions(context.memberToken).sessions.find((item) => item.id === sessionId);
   if (
     !session
@@ -814,4 +814,19 @@ function requireActiveMcpSession(
       409,
     );
   }
+  return session;
+}
+
+function requireClosableMcpSession(
+  service: AgentHubService,
+  context: { memberToken: string; member: AgentHubMemberIdentity },
+  sessionId: string,
+): void {
+  const session = requireActiveCoordinationSession(service, context, sessionId);
+  if (session.metadata.source === "mcp") return;
+  throw new AgentHubError(
+    "hook_session_lifecycle_owned",
+    "A Codex Hook session can only be closed by its SessionEnd lifecycle.",
+    409,
+  );
 }

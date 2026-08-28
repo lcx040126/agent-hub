@@ -608,3 +608,13 @@ MCP、发布门禁与版本
 当前验证与发布边界
 - 两套 TypeScript 配置检查通过；62 个测试文件共 555 项串行全量测试通过；生产构建和 `git diff --check` 通过。覆盖服务端风险/租约矩阵、保护开关往返与申请重建、Hook 异常降级与共享上下文收尾、界面 severity/decision 分离、MCP 协议、成员升级门槛和纯监测发布门禁。
 - 本轮仅创建本地功能提交，不执行 push、tag、GitHub Release 或正式资产发布；`docs/releases/v0.2.6.md` 仅记录源码候选，不能据此声称已经发布。正式打包、恢复探针、打包数据库迁移探针、正式安装升级和双机协作仍未执行。
+
+v0.2.6 会话生命周期修复与发布记录（2026-08-29）
+
+- 根因：MCP 在复用 SessionStart 创建的 `source=codex-hook` 会话时仍按 MCP 自建会话流程调用 `session_close`，关闭了下一轮 Hook 继续使用的 `hubSessionId`；后续写入因此命中 inactive/stale 会话而被拒绝。
+- 关闭权规则：查询、租约、编辑检查、功能修订和事件记录继续接受活动 MCP 或 Hook session；`session_close` 只允许 `source=mcp` 会话。尝试关闭 Hook session 返回 HTTP 409 `hook_session_lifecycle_owned`，不会释放租约、改变会话状态或创建重复会话。Hook session 的最终关闭只由 `SessionEnd` 完成。
+- MCP 说明已改为：Hook session 只复用 SessionStart 返回的 ID，不调用 `session_open` 或 `session_close`；结果用功能修订和事件记录登记。只有 MCP 自建 fallback session 才执行 `session_close`。
+- Hook generation 接管统一校验 `session.id`、`status`、`reused`、`currentTurnId` 和 `activityEpoch`。同一 ID 只同步 turn/epoch；新 ID 原子替换本地状态、生成新的 finalization ID、重新建立 Git 基线并清空旧租约、待写入、等待围栏、隔离、归因和完成状态。旧 Stop、completion 和 heartbeat 结果按旧 session/finalization 身份隔离，不能覆盖新 generation。
+- `UserPromptSubmit` 和 `stale_activity_epoch` 恢复共用接管流程，恢复后的 `/api/edits/prepare` 使用新 ID。纯检测模式继续保留原有风险告警/放行语义，但不会把无效或非 active generation 当作成功接管；保护模式下该错误保持拒绝并返回诊断。
+- 自动化验证：两套 TypeScript 配置检查通过；62 个测试文件共 560 项串行全量测试通过；生产构建通过；`git diff --check` 通过。新增生命周期测试覆盖 Hook 关闭 409、MCP fallback 正常关闭、替换 generation 清理、同 ID 状态保留、stale 恢复、三轮提示/Stop/继续写入和无效 generation 保护。
+- 发布边界：已整理最终 `docs/releases/v0.2.6.md`，不修改数据库 schema、MCP 输入结构或协议兼容字段；提交、推送、标签、Windows 资产、GitHub Release 和真实安装/Codex 多轮验收在本次授权下继续执行并分别记录结果。
