@@ -22,7 +22,7 @@ describe("Codex session heartbeat scheduler", () => {
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       expect(String(_url)).toContain(`/api/sessions/${state.hubSessionId}/heartbeat`);
       expect(JSON.parse(String(init?.body))).toMatchObject({
-        clientVersion: "0.2.3",
+        clientVersion: "0.2.4",
         protocolVersion: 1,
         schemaVersion: 4,
         activityEpoch: 0,

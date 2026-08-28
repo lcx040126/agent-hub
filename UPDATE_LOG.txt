@@ -493,3 +493,16 @@ v0.2.3 正式发布验证（2026-08-27）
 - 正式 blockmap SHA-256 `0AEBF754E501F590C27D96D451EF504DF91B81044191D110600DE9CBDDA90060`；更新清单 `8FEE3DF25FACEA1FC3803ACDDFFAD27D6D28936B1B5C39278F6899D520CFD092`；签名文件 `42813A3714E247ACAC99C3A5CB85B674234D7EBDCF0FA59E18889B468697977C`；`latest.yml` `7302B87954F2B11FFDF9147E26C4270661665E3100B09E3C5E9A1446CDEAC59D`；`SHA256SUMS.txt` `59DBA66951EABECFECCC03B12236966B45F6681D66AB011C3C55BC52FBFFD759`。
 - 六项资产的独立下载 SHA-256、GitHub asset digest 和校验文件一致；Ed25519 签名通过，更新清单的 v0.2.3、协议 1、schema 2 到 4、Setup URL/大小/SHA-256 和发布正文均正确；`latest.yml` 的大小及 SHA-512 与 Setup 一致。
 - 匿名访问 `releases/latest`、latest 更新清单和正式 Setup 下载地址均返回 HTTP 200 并解析到 v0.2.3。
+
+v0.2.4 已确认更新：旧数据库升级热修复
+- 本版本只修复旧房间数据库升级失败，不混入错误日志、watchdog 或其他功能改造。
+- v0.2.3 的 schema 3 到 4 迁移曾在 `local_scans.finalization_id` 尚不存在时先创建 `scans_finalization_idx`，SQLite 因 `no such column: finalization_id` 终止语句；外层事务随后回滚，因此数据库通常仍保持 schema 3 和原数据，但应用无法完成启动。
+- 现有修复提交 `774c4c8` 调整为先检查并补齐 `local_scans.finalization_id`，再幂等创建依赖索引。已失败回滚的 schema 3、已手工补列但 `user_version` 仍为 3、已成功迁移的 schema 4 均可安全重试或重复打开。
+- 兼容测试使用正式历史结构覆盖 v0.1.0 schema 2，v0.2.0/v0.2.1/v0.2.2 共用 schema 3，v0.2.3 失败回滚状态、手工补列恢复状态、已迁移 schema 4 和全新数据库；升级断言房间、成员、会话、租约和扫描记录保留，最终 `user_version=4`、目标字段与索引存在，SQLite 完整性与外键检查通过。
+- 应用版本升至 `0.2.4`；协议版本保持 1，数据库 schema 保持 4，最低可读取来源 schema 保持 2。
+- v0.2.2 在正式发布后可应用内更新；v0.2.0/v0.2.1 必须使用 v0.2.4 Setup 原目录覆盖安装；无法启动的 v0.2.3 必须手动覆盖；已修复或已正常迁移到 schema 4 的 v0.2.3 可正常更新。所有情况都禁止先卸载或删除 `%APPDATA%\agent-hub`。
+- 当前只准备本地安装候选并验证，不覆盖安装到本机，不推送、不打标签、不创建 GitHub Release、不生成正式签名清单，也不修改 GitHub latest Release。
+- 两套 TypeScript 配置检查、57 个测试文件共 444 项串行全量测试、生产构建和 `git diff --check` 已通过。
+- Windows x64 NSIS 本地候选 `AgentHub-Setup-0.2.4-x64.exe` 已在短路径临时工作树构建成功：119,721,531 字节，SHA-256 `3CE08DE4B58F8C4E6A3376B0E229AEEB372F4D418EAFF73445A0E11C40D9DF8B`，Authenticode 状态为 `NotSigned`。
+- 打包恢复探针已通过：`app.asar` 为 46,699,120 字节，SHA-256 `DF2F9AD17803A59AAE55C12420159A835BCA4C3394EED7FC12FBE4C09D7471C6`，备份健康返回 v0.2.4 和 `ok`；打包后的 MCP bridge 与 Codex Hook 健康检查均为 `ok`。
+- 打包后的真实服务已使用隔离数据库验证 schema 2、普通 schema 3、v0.2.3 失败回滚、手工补列和全新数据库；每种状态均成功升级或创建到 schema 4，并在第二次启动时继续通过数据保留、目标字段/索引、SQLite 完整性和外键检查。

@@ -27,7 +27,7 @@ describe("Agent Hub REST API", () => {
     expect(health.body).toMatchObject({
       status: "ok",
       service: "agent-hub",
-      version: "0.2.3",
+      version: "0.2.4",
       protocolVersion: 1,
       schemaVersion: 4,
       database: { status: "ok", schemaVersion: 4 },
