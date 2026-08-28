@@ -618,3 +618,11 @@ v0.2.6 会话生命周期修复与发布记录（2026-08-29）
 - `UserPromptSubmit` 和 `stale_activity_epoch` 恢复共用接管流程，恢复后的 `/api/edits/prepare` 使用新 ID。纯检测模式继续保留原有风险告警/放行语义，但不会把无效或非 active generation 当作成功接管；保护模式下该错误保持拒绝并返回诊断。
 - 自动化验证：两套 TypeScript 配置检查通过；62 个测试文件共 560 项串行全量测试通过；生产构建通过；`git diff --check` 通过。新增生命周期测试覆盖 Hook 关闭 409、MCP fallback 正常关闭、替换 generation 清理、同 ID 状态保留、stale 恢复、三轮提示/Stop/继续写入和无效 generation 保护。
 - 发布边界：已整理最终 `docs/releases/v0.2.6.md`，不修改数据库 schema、MCP 输入结构或协议兼容字段；提交、推送、标签、Windows 资产、GitHub Release 和真实安装/Codex 多轮验收在本次授权下继续执行并分别记录结果。
+
+v0.2.6 正式发布审计（2026-08-29）
+
+- 提交 `6e91c0726f16c029e4ab4ad5555d42286d608bd8` 已推送到 `main`，annotated tag `v0.2.6` 已推送到 origin。
+- GitHub Actions `Windows Release` run `33199693404` 成功完成类型检查、560 项串行测试、Windows NSIS 打包、更新恢复探针、数据库迁移探针、Ed25519 更新清单签名、SHA-256 校验和及六项资产上传；Agent Hub publication gate 按仓库显式 ungated override 跳过。
+- GitHub Release `378691606` 已于 `2026-08-29 02:41:03`（Asia/Shanghai）正式公开并设为 latest：https://github.com/lcx040126/agent-hub/releases/tag/v0.2.6
+- 正式资产：`AgentHub-Setup-0.2.6-x64.exe` 119,754,894 字节，SHA-256 `f0a9db4363dbc06f0d7e3aec01c1427d28de8ca8573d55bc66d25993282fe03d`；`AgentHub-Setup-0.2.6-x64.exe.blockmap` 126,391 字节，SHA-256 `ba44465f84557e10c1b98aa3108e3cfc1654fbd595f5b2f4f07405be6ad67e92`；`latest.yml` 353 字节，SHA-256 `557c08e2f6049443bf1a23e14027e904e41a3bd98a9dcc705318a3a8309aa4ca`；`agent-hub-update.json` 3,987 字节，SHA-256 `165ee013f94e571e99327bae098a62c15e3e6ab26befee7e39b6004b0b36ef62`；`agent-hub-update.sig` 89 字节，SHA-256 `ffa8452cf373048fddca94eab684dbb45d808a5df413174059ee6bd38f5cd2be`；`SHA256SUMS.txt` 456 字节，SHA-256 `a08a7f902a29d6f7eb764ca3d684d19815bd96ce07a6ae2fcdaa5ed8249a8426`。已下载的五项被清单覆盖资产与 SHA256SUMS.txt 逐项匹配。
+- 正式安装目录覆盖升级、真实 Codex 多轮写入、长时间房间轮询和双机协作仍未完成，不能以本次自动化和远端发布替代实机验收。

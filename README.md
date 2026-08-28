@@ -4,7 +4,7 @@ Agent Hub 是一个面向多人、多 Agent 开发的协作房间。房主创建
 
 它不会合并不同模型的内部记忆，也不会上传私人聊天或隐藏思考。它共享的是成员、会话、路径、租约、项目结构、功能行为、决定、验证、风险和 Git 证据等可审计信息。
 
-> 当前源码目标为 v0.2.6：协议版本 2、数据库 schema 5、最低来源协议 1、最低来源 schema 2。v0.2.6 尚未发布正式安装资产；当前已公开安装版仍以 GitHub Releases 为准。任何升级都不要先卸载或删除 `%APPDATA%\agent-hub`；房主退出、关机或离开网络时，其他成员会暂时无法同步。
+> 当前正式版本为 v0.2.6：协议版本 2、数据库 schema 5、最低来源协议 1、最低来源 schema 2。正式安装资产见 [GitHub Release v0.2.6](https://github.com/lcx040126/agent-hub/releases/tag/v0.2.6)。任何升级都不要先卸载或删除 `%APPDATA%\agent-hub`；房主退出、关机或离开网络时，其他成员会暂时无法同步。
 
 ## 工作原理
 
@@ -123,15 +123,15 @@ v0.2.5 针对三条已确认故障链做了窄范围修复：`SessionStart` 缺�
 
 ## v0.2.5 验证状态
 
-当前源码验证（2026-08-28）：
+当前源码与发布验证（2026-08-29）：
 
-- `pnpm typecheck`、61 个测试文件共 527 项的串行全量测试、`pnpm build`、`node --check scripts/verify-packaged-database-migrations.mjs` 和 `git diff --check` 均已通过。
+- `pnpm typecheck`、62 个测试文件共 560 项的串行全量测试、`pnpm build`、`node --check scripts/verify-packaged-database-migrations.mjs` 和 `git diff --check` 均已通过。
 - 数据库回归覆盖 schema 2/3/4 到 schema 5、全新 schema 5、部分回填恢复和重复 Codex session 双列同步；自动租约的 `coordination_state` 与旧 `automatic_phase` 一起迁移。schema 4 双代 fixture 同时验证 `finalizing + active` generation 并存与 `active + active` 重复归并；schema 5 的 `sessions_codex_identity_idx` 使用 `codex_session_id IS NOT NULL AND closed_at IS NULL AND finalizing_at IS NULL` 部分唯一索引谓词。
 - 桌面调度器回归覆盖全暂停启动后激活、重复补启动不创建副本，以及后续启动器失败时保留已成功启动的实例。
-- 正式 Windows Release 工作流在公开前必须重新执行类型检查、串行全量测试、NSIS 打包、更新恢复探针、schema 2/3/4 到 5 的打包迁移探针、Ed25519 清单签名和六项资产上传。
+- Windows Release 工作流已在公开前执行类型检查、串行全量测试、NSIS 打包、更新恢复探针、schema 2/3/4 到 5 的打包迁移探针、Ed25519 清单签名和六项资产上传。
 - 尚未执行当前正式安装目录上的覆盖升级、真实 Codex 首轮写入、长时间房间轮询和双机协作；这些不因自动化测试或 Release 的存在而计为通过。
 
-v0.2.6 的当前源码验证和未完成项见 [v0.2.6 候选发布说明](docs/releases/v0.2.6.md)。该文档不代表 v0.2.6 已发布，也不提供正式资产、哈希或发布审计。
+v0.2.6 的更新内容、验证结果和实机验收边界见 [v0.2.6 发布说明](docs/releases/v0.2.6.md)。
 
 ## 日常工作流程
 
@@ -233,7 +233,7 @@ v0.2.0 和 v0.2.1 的更新恢复代码使用 Electron 改写过的 `node:fs` �
 
 该缺陷存在于正在执行更新的旧客户端中，因此 v0.2.0/v0.2.1 用户必须手动运行 `AgentHub-Setup-0.2.5-x64.exe`，选择原安装目录覆盖安装。无法启动的 v0.2.3 没有可用的应用内更新入口，也必须采用相同方式覆盖；已修复或已正常迁移到 schema 4 的 v0.2.3、v0.2.2 和 v0.2.4 可以正常使用应用内更新。任何情况都不要先卸载，不要删除 `%APPDATA%\agent-hub`，也不要手工删除房间数据库。
 
-覆盖安装和后续更新的目标是保留房间数据库、成员与项目连接、加密凭证、房间设置、协作记录、功能记忆、租约和待处理申请。v0.2.0 的历史验证结果见 [v0.2.0 发布说明](docs/releases/v0.2.0.md)，生命周期隔离见 [v0.2.1 发布说明](docs/releases/v0.2.1.md)，本机恢复修复见 [v0.2.2 发布说明](docs/releases/v0.2.2.md)，Stop 与提交后释放、持久化收尾及升级配置校正见 [v0.2.3 发布说明](docs/releases/v0.2.3.md)，旧数据库升级热修复见 [v0.2.4 发布说明](docs/releases/v0.2.4.md)，新任务协调与仪表盘容量修复见 [v0.2.5 发布说明](docs/releases/v0.2.5.md)，风险决定分离与纯监测模式见 [v0.2.6 候选发布说明](docs/releases/v0.2.6.md)。
+覆盖安装和后续更新的目标是保留房间数据库、成员与项目连接、加密凭证、房间设置、协作记录、功能记忆、租约和待处理申请。v0.2.0 的历史验证结果见 [v0.2.0 发布说明](docs/releases/v0.2.0.md)，生命周期隔离见 [v0.2.1 发布说明](docs/releases/v0.2.1.md)，本机恢复修复见 [v0.2.2 发布说明](docs/releases/v0.2.2.md)，Stop 与提交后释放、持久化收尾及升级配置校正见 [v0.2.3 发布说明](docs/releases/v0.2.3.md)，旧数据库升级热修复见 [v0.2.4 发布说明](docs/releases/v0.2.4.md)，新任务协调与仪表盘容量修复见 [v0.2.5 发布说明](docs/releases/v0.2.5.md)，风险决定分离、纯监测模式和 Hook 会话生命周期修复见 [v0.2.6 发布说明](docs/releases/v0.2.6.md)。
 
 ## 对 Git 的影响
 
