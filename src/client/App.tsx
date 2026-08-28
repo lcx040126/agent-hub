@@ -90,6 +90,7 @@ import {
   type SavedRoomConnection,
   type Session,
 } from "./api";
+import { AGENT_HUB_PROTOCOL_VERSION } from "../shared/version";
 
 type View = "work" | "records" | "connection" | "management";
 type Notice = { tone: "success" | "warning" | "danger"; message: string };
@@ -157,6 +158,43 @@ export function dashboardSyncStateForPartialSections(
     "settings",
   ]);
   return sections.some((section) => coordinationSections.has(section)) ? "partial" : "online";
+}
+
+export function monitorModeUpgradeGuidance(members: Dashboard["members"]): string | null {
+  const membersToUpgrade = members.filter((member) =>
+    member.protocolVersion !== AGENT_HUB_PROTOCOL_VERSION
+  );
+  if (membersToUpgrade.length === 0) return null;
+  const labels = membersToUpgrade.map((member) =>
+    `${member.name}${member.clientVersion ? `（v${member.clientVersion}）` : "（未上报版本）"}`
+  );
+  return `关闭前请先让 ${labels.join("、")} 升级到支持协议 ${AGENT_HUB_PROTOCOL_VERSION} 的 Agent Hub 并重新连接。房间服务会在保存时再次校验。`;
+}
+
+export function roomSettingsErrorMessage(error: unknown): string {
+  if (!(error instanceof ApiError) || error.code !== "monitor_mode_upgrade_required") {
+    return error instanceof Error ? error.message : "操作失败。";
+  }
+  const details = error.details && typeof error.details === "object"
+    ? error.details as Record<string, unknown>
+    : {};
+  const requiredProtocolVersion = typeof details.requiredProtocolVersion === "number"
+    ? details.requiredProtocolVersion
+    : AGENT_HUB_PROTOCOL_VERSION;
+  const members = Array.isArray(details.members) ? details.members : [];
+  const labels = members.flatMap((value) => {
+    if (!value || typeof value !== "object") return [];
+    const member = value as Record<string, unknown>;
+    const name = typeof member.displayName === "string" && member.displayName.trim()
+      ? member.displayName.trim()
+      : "未识别成员";
+    const version = typeof member.clientVersion === "string" && member.clientVersion.trim()
+      ? `（v${member.clientVersion.trim()}）`
+      : "（未上报版本）";
+    return [`${name}${version}`];
+  });
+  const subject = labels.length > 0 ? labels.join("、") : "房间中的未升级成员";
+  return `开启纯监测模式前，请先让 ${subject} 升级到支持协议 ${requiredProtocolVersion} 的 Agent Hub 并重新连接。房间服务已拒绝本次切换。`;
 }
 
 export type DashboardModal =
@@ -849,7 +887,7 @@ export function EntryScreen({
   );
 }
 
-function AppNav({ view, onChange, open, onClose }: { view: View; onChange: (view: View) => void; open: boolean; onClose: () => void }) {
+function AppNav({ view, onChange, open, onClose, blockingProtectionEnabled }: { view: View; onChange: (view: View) => void; open: boolean; onClose: () => void; blockingProtectionEnabled: boolean }) {
   const items: Array<{ id: View; label: string; icon: ReactNode }> = [
     { id: "work", label: "当前协作", icon: <Activity aria-hidden="true" /> },
     { id: "records", label: "团队记录", icon: <FileClock aria-hidden="true" /> },
@@ -877,11 +915,11 @@ function AppNav({ view, onChange, open, onClose }: { view: View; onChange: (view
             </button>
           ))}
         </nav>
-        <div className="automation-note">
+        <div className={`automation-note ${blockingProtectionEnabled ? "" : "monitoring"}`}>
           <ShieldCheck aria-hidden="true" />
           <div>
-            <strong>自动保护已开启</strong>
-            <span>日常无需手动维护范围</span>
+            <strong>{blockingProtectionEnabled ? "写入保护已开启" : "纯监测模式"}</strong>
+            <span>{blockingProtectionEnabled ? "日常无需手动维护范围" : "自动与普通范围只记录风险"}</span>
           </div>
         </div>
       </aside>
@@ -889,7 +927,7 @@ function AppNav({ view, onChange, open, onClose }: { view: View; onChange: (view
   );
 }
 
-function ManagementView({ dashboard, session, onRefresh, onNotice }: { dashboard: Dashboard; session: Session; onRefresh: () => Promise<void>; onNotice: (message: string, tone?: Notice["tone"]) => void }) {
+export function ManagementView({ dashboard, session, onRefresh, onNotice }: { dashboard: Dashboard; session: Session; onRefresh: () => Promise<void>; onNotice: (message: string, tone?: Notice["tone"]) => void }) {
   const canManageMembers = dashboard.currentMember.role === "host" || dashboard.currentMember.isAdmin;
   const isOwner = dashboard.currentMember.role === "host";
   const [busy, setBusy] = useState(false);
@@ -903,7 +941,7 @@ function ManagementView({ dashboard, session, onRefresh, onNotice }: { dashboard
       onNotice(success);
       await onRefresh();
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : "操作失败。", "danger");
+      onNotice(roomSettingsErrorMessage(error), "danger");
     } finally {
       setBusy(false);
     }
@@ -931,6 +969,9 @@ function ManagementView({ dashboard, session, onRefresh, onNotice }: { dashboard
   const customRules = settings.riskRules
     .map((rule, index) => ({ rule, index }))
     .filter(({ rule }) => rule.kind !== "category");
+  const upgradeGuidance = dashboard.settings.blockingProtectionEnabled
+    ? monitorModeUpgradeGuidance(dashboard.members)
+    : null;
   const saveSettings = () => run(
     () => updateRoomSettings(session, {
       blockingProtectionEnabled: settings.blockingProtectionEnabled,
@@ -949,8 +990,9 @@ function ManagementView({ dashboard, session, onRefresh, onNotice }: { dashboard
           <span className="quiet-count">策略 v{settings.riskPolicyVersion}</span>
         </div>
         <div className="management-settings">
+          {upgradeGuidance && <div className="monitor-upgrade-guidance" role="status"><AlertTriangle aria-hidden="true" /><span><strong>切换前需要成员升级</strong><small>{upgradeGuidance}</small></span></div>}
           <label className="toggle-row">
-            <span><strong>关键范围阻塞保护</strong><small>关闭后，普通范围重叠都降为黄色警告；手动独占范围仍会阻止写入。</small></span>
+            <span><strong>写入阻塞保护</strong><small>关闭后，自动与普通范围进入纯监测：黄色普通警告、红色高风险警告都只记录；其他成员的手动独占范围仍需持有人批准。</small></span>
             <input type="checkbox" checked={settings.blockingProtectionEnabled} disabled={!isOwner || busy} onChange={(event) => setSettings({ ...settings, blockingProtectionEnabled: event.target.checked, autoLockAfterAutoClaim: event.target.checked })} />
           </label>
           <div className="setting-row">
@@ -967,14 +1009,14 @@ function ManagementView({ dashboard, session, onRefresh, onNotice }: { dashboard
           </label>
         </div>
 
-        <div className="subsection-heading"><div><strong>文件重叠规则</strong><small>黄色只提醒，红色会在 Agent 写入前阻止并发出释放申请。</small></div></div>
+        <div className="subsection-heading"><div><strong>文件重叠规则</strong><small>黄色表示普通警告，红色表示高风险；红色本身不等于已阻止。</small></div></div>
         <div className="risk-rule-list">
           {categoryRules.map(({ rule, index }) => (
             <div className="risk-rule-row" key={rule.selector}>
               <span><strong>{RISK_CATEGORY_LABELS[rule.selector] ?? rule.selector}</strong><small>预设分类</small></span>
               <div className="segmented-control compact">
                 <button type="button" disabled={!isOwner || busy} className={rule.level === "warning" ? "active warning" : ""} onClick={() => updateRule(index, { level: "warning" })}>黄色警告</button>
-                <button type="button" disabled={!isOwner || busy} className={rule.level === "blocking" ? "active danger" : ""} onClick={() => updateRule(index, { level: "blocking" })}>红色阻塞</button>
+                <button type="button" disabled={!isOwner || busy} className={rule.level === "blocking" ? "active danger" : ""} onClick={() => updateRule(index, { level: "blocking" })}>红色高风险</button>
               </div>
             </div>
           ))}
@@ -985,7 +1027,7 @@ function ManagementView({ dashboard, session, onRefresh, onNotice }: { dashboard
               </select>
               <input aria-label="匹配内容" value={rule.selector} disabled={!isOwner || busy} placeholder={rule.kind === "extension" ? ".cs" : "Assets/Vanguard/Inventory"} onChange={(event) => updateRule(index, { selector: event.target.value })} />
               <select aria-label="处理方式" value={rule.level} disabled={!isOwner || busy} onChange={(event) => updateRule(index, { level: event.target.value as RiskRule["level"] })}>
-                <option value="warning">黄色警告</option><option value="blocking">红色阻塞</option>
+                <option value="warning">黄色警告</option><option value="blocking">红色高风险</option>
               </select>
               {isOwner && <IconButton label="删除这条规则" disabled={busy} onClick={() => setSettings((current) => ({ ...current, riskRules: current.riskRules.filter((_, ruleIndex) => ruleIndex !== index) }))}><X aria-hidden="true" /></IconButton>}
             </div>
@@ -1207,7 +1249,8 @@ function DesktopUpdateControl({ onNotice }: { onNotice: (message: string, tone?:
 
 export function StatusSummary({ dashboard, syncState, now, conflicts }: { dashboard: Dashboard; syncState: DashboardSyncState; now: number; conflicts?: Conflict[] }) {
   const activeLeases = dashboard.leases.filter((lease) => isValidLease(lease, now));
-  const blockers = (conflicts ?? dashboard.conflicts).filter((item) => item.severity === "blocking");
+  // 红色只表示高风险；只有服务端明确返回 deny 才计入阻塞。
+  const blockers = (conflicts ?? dashboard.conflicts).filter((item) => item.decision === "deny");
   const onlineMembers = dashboard.members.filter((member) => member.status === "online").length;
   const connected = syncState === "online" || syncState === "partial";
   const statusTitle = syncState === "offline"
@@ -1377,7 +1420,14 @@ function SystemImpact({ dashboard, now }: { dashboard: Dashboard; now: number })
   );
 }
 
-function ConflictList({ conflicts }: { conflicts: Conflict[] }) {
+export function conflictStatusLabel(conflict: Pick<Conflict, "severity" | "decision">): string {
+  if (conflict.decision === "deny") return "已阻止";
+  if (conflict.severity === "blocking") return "高风险警告";
+  if (conflict.severity === "warning") return "普通警告";
+  return "提示";
+}
+
+export function ConflictList({ conflicts }: { conflicts: Conflict[] }) {
   return (
     <section className="section-block" aria-labelledby="conflict-title">
       <div className="section-heading">
@@ -1385,19 +1435,19 @@ function ConflictList({ conflicts }: { conflicts: Conflict[] }) {
           <span className="section-kicker">风险控制</span>
           <h2 id="conflict-title">冲突与阻塞</h2>
         </div>
-        {conflicts.length > 0 && <span className="quiet-count danger">{conflicts.length} 项</span>}
+        {conflicts.length > 0 && <span className={`quiet-count ${conflicts.some((item) => item.severity === "blocking") ? "danger" : ""}`}>{conflicts.length} 项</span>}
       </div>
       {conflicts.length ? (
         <div className="conflict-list">
           {conflicts.map((conflict) => (
             <article className={`conflict-item ${conflict.severity}`} key={conflict.id}>
               <span className="conflict-icon">
-                {conflict.severity === "blocking" ? <XCircle aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}
+                {conflict.decision === "deny" ? <XCircle aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}
               </span>
               <div>
                 <div className="conflict-title-line">
                   <strong>{conflict.title}</strong>
-                  <span>{conflict.severity === "blocking" ? "已阻止" : "需要关注"}</span>
+                  <span>{conflictStatusLabel(conflict)}</span>
                 </div>
                 <p>{conflict.summary}</p>
                 {conflict.paths.length > 0 && <div className="scope-list compact">{conflict.paths.map((path) => <span key={path}>{path}</span>)}</div>}
@@ -2128,8 +2178,10 @@ function DashboardApp({
     setTransientConflicts(result.conflicts);
     if (result.decision === "wait") {
       setNotice({ tone: "warning", message: `已进入等待队列，优先租约由 ${result.waitingFor?.memberName ?? "较早会话"} 持有；当前任务不会反向阻塞它。` });
-    } else if (!result.acquired || result.decision === "deny") {
+    } else if (result.decision === "deny") {
       setNotice({ tone: "danger", message: result.releaseRequests.length ? "范围已被占用，释放申请已经发送给当前持有人。" : "范围已被占用，工作没有被登记。冲突详情已显示在当前页面。" });
+    } else if (!result.acquired) {
+      setNotice({ tone: "warning", message: "范围暂未登记，但服务端没有返回阻止决定；本次只显示风险提醒。" });
     } else {
       setNotice({ tone: result.decision === "warn" ? "warning" : "success", message: result.decision === "warn" ? "范围已登记，同时发现需要关注的重叠。" : "工作范围已登记并开始保护。" });
     }
@@ -2213,7 +2265,7 @@ function DashboardApp({
         </div>
       </header>
       <div className="app-body">
-        <AppNav view={view} onChange={setView} open={navOpen} onClose={() => setNavOpen(false)} />
+        <AppNav view={view} onChange={setView} open={navOpen} onClose={() => setNavOpen(false)} blockingProtectionEnabled={dashboard.settings.blockingProtectionEnabled} />
         <main className="workspace">
           {ownedReleaseRequests.length > 0 && <div className="release-request-banner" role="status"><Bell aria-hidden="true" /><div><strong>{ownedReleaseRequests.length} 个范围交接申请等待你处理</strong><span>{ownedReleaseRequests[0].requesterName} 需要修改你正在保护的路径。</span></div><button type="button" className="primary-button" onClick={() => openModal({ type: "release", requestId: ownedReleaseRequests[0].id })}>查看申请</button></div>}
           <StatusSummary dashboard={dashboard} syncState={syncState} now={leaseNow} conflicts={[...transientConflicts, ...dashboard.conflicts]} />

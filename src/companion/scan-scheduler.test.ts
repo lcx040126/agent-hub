@@ -1,9 +1,19 @@
+import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionStore } from "../desktop/connection-store.js";
 import type { SavedRoomConnection } from "../desktop/contracts.js";
+import {
+  AGENT_HUB_PROTOCOL_VERSION,
+  AGENT_HUB_SCHEMA_VERSION,
+  AGENT_HUB_VERSION,
+} from "../shared/version.js";
+import { createAgentHubApp } from "../server/app.js";
+import { AgentHubDatabase } from "../server/db.js";
 import { IntegrationOperationTracker } from "./integration-operations.js";
 import { PausePreparationQueue } from "./pause-preparation.js";
 import type { RepositorySnapshot } from "./repository.js";
@@ -17,6 +27,76 @@ afterEach(async () => {
 });
 
 describe("repository scan lifecycle", () => {
+  it("upgrades an existing v0.2.5 member presence on the first background scan", async () => {
+    const userDataPath = await temporaryDirectory();
+    const database = new AgentHubDatabase({ path: ":memory:" });
+    const app = createAgentHubApp({ database });
+    const owner = await request(app).post("/api/rooms").send({
+      roomName: "Scanner upgrade",
+      projectName: "Scanner upgrade",
+      repository: "https://example.test/scanner-upgrade.git",
+      defaultBranch: "main",
+      ownerName: "Owner",
+      clientVersion: AGENT_HUB_VERSION,
+      protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+    });
+    const legacy = await request(app).post("/api/rooms/join").send({
+      inviteCode: owner.body.inviteCode,
+      memberName: "Legacy member",
+      clientVersion: "0.2.5",
+      protocolVersion: 1,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+    });
+    expect(legacy.status, JSON.stringify(legacy.body)).toBe(201);
+
+    const server = app.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    const connection = {
+      ...savedConnection(userDataPath),
+      serverUrl: `http://127.0.0.1:${port}`,
+    };
+    const store = {
+      filePath: path.join(userDataPath, "connections.json"),
+      list: vi.fn(async () => [connection]),
+      get: vi.fn(async () => connection),
+      readMemberToken: vi.fn(async () => legacy.body.token as string),
+    } as unknown as ConnectionStore;
+    const scheduler = startRepositoryScanScheduler({
+      store,
+      inspect: vi.fn(async () => repositorySnapshot(userDataPath)),
+      intervalMs: 60_000,
+    });
+
+    try {
+      await scheduler.stop();
+
+      const dashboard = await request(app).get("/api/dashboard")
+        .set("Authorization", `Bearer ${owner.body.token as string}`);
+      expect(dashboard.body.members).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: legacy.body.member.id,
+          clientVersion: AGENT_HUB_VERSION,
+          protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+          schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+        }),
+      ]));
+
+      const monitorOnly = await request(app).post("/api/room/settings")
+        .set("Authorization", `Bearer ${owner.body.token as string}`)
+        .send({ blockingProtectionEnabled: false });
+      expect(monitorOnly.status, JSON.stringify(monitorOnly.body)).toBe(200);
+      expect(monitorOnly.body.settings.blockingProtectionEnabled).toBe(false);
+    } finally {
+      await scheduler.stop();
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+      database.close();
+    }
+  }, 15_000);
+
   it("keeps a delayed scan registered but does not upload after the connection is paused", async () => {
     const userDataPath = await temporaryDirectory();
     let connection = savedConnection(userDataPath);

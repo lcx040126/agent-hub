@@ -19,6 +19,7 @@ import {
   type CreateRoomResult,
   type Decision,
   type EditCheckResult,
+  type EditIssue,
   type Handoff,
   type JoinRoomInput,
   type JoinRoomResult,
@@ -467,7 +468,7 @@ export class AgentHubService {
     const protocolVersion = optionalVersionNumber(input.protocolVersion, "Protocol version");
     const schemaVersion = optionalVersionNumber(input.schemaVersion, "Schema version");
     const row = this.database.connection
-      .prepare("SELECT id FROM rooms WHERE code = ? COLLATE NOCASE")
+      .prepare("SELECT id, blocking_protection_enabled FROM rooms WHERE code = ? COLLATE NOCASE")
       .get(code) as Row | undefined;
     if (!row) {
       throw new AgentHubError("invite_not_found", "The invitation code is invalid.", 404);
@@ -478,6 +479,29 @@ export class AgentHubService {
     const token = createMemberToken();
     const createdAt = this.timestamp();
     this.database.transaction(() => {
+      const currentRoom = this.database.connection.prepare(`
+        SELECT blocking_protection_enabled FROM rooms WHERE id = ?
+      `).get(roomId) as Row | undefined;
+      if (
+        currentRoom
+        && Number(currentRoom.blocking_protection_enabled ?? 1) === 0
+        && protocolVersion !== AGENT_HUB_PROTOCOL_VERSION
+      ) {
+        throw new AgentHubError(
+          "monitor_mode_upgrade_required",
+          `Monitor-only rooms require protocol ${AGENT_HUB_PROTOCOL_VERSION}.`,
+          409,
+          {
+            requiredProtocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+            members: [{
+              id: null,
+              displayName,
+              clientVersion,
+              protocolVersion,
+            }],
+          },
+        );
+      }
       this.database.connection
         .prepare(`
           INSERT INTO members
@@ -885,6 +909,31 @@ export class AgentHubService {
     }
     const now = this.timestamp();
     this.database.transaction(() => {
+      if (!blockingProtectionEnabled && previous.blockingProtectionEnabled) {
+        const incompatibleRows = this.database.connection.prepare(`
+          SELECT id, name, client_version, protocol_version
+          FROM members
+          WHERE room_id = ? AND removed_at IS NULL
+            AND (protocol_version IS NULL OR protocol_version <> ?)
+          ORDER BY created_at, id
+        `).all(auth.room.id, AGENT_HUB_PROTOCOL_VERSION) as Row[];
+        if (incompatibleRows.length > 0) {
+          throw new AgentHubError(
+            "monitor_mode_upgrade_required",
+            `Every room member must report protocol ${AGENT_HUB_PROTOCOL_VERSION} before monitor-only mode can be enabled.`,
+            409,
+            {
+              requiredProtocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+              members: incompatibleRows.map((row) => ({
+                id: asString(row.id),
+                displayName: asString(row.name),
+                clientVersion: nullableString(row.client_version),
+                protocolVersion: nullableNumber(row.protocol_version),
+              })),
+            },
+          );
+        }
+      }
       this.database.connection.prepare(`
         UPDATE rooms SET
           auto_lock_after_auto_claim = ?, blocking_protection_enabled = ?,
@@ -909,6 +958,60 @@ export class AgentHubService {
             (room_id, version, rules_json, author_member_id, created_at)
           VALUES (?, ?, ?, ?, ?)
         `).run(auth.room.id, riskPolicyVersion, json(riskRules), auth.member.id, now);
+      }
+      if (!blockingProtectionEnabled && previous.blockingProtectionEnabled) {
+        // 监测模式解除旧写入围栏，但保留 Stop/SessionEnd 已进入的 awaiting_commit 生命周期。
+        this.database.connection.prepare(`
+          UPDATE leases SET
+            coordination_state = CASE
+              WHEN automatic_phase = 'awaiting_commit' THEN 'awaiting_commit'
+              ELSE 'working'
+            END,
+            decision = CASE WHEN decision = 'deny' THEN 'warn' ELSE decision END,
+            updated_at = ?
+          WHERE room_id = ? AND status = 'active' AND kind = 'automatic'
+            AND coordination_state IN ('blocked', 'waiting')
+        `).run(now, auth.room.id);
+        this.database.connection.prepare(`
+          UPDATE leases SET decision = 'warn', updated_at = ?
+          WHERE room_id = ? AND status = 'active' AND kind <> 'exclusive'
+            AND decision = 'deny'
+        `).run(now, auth.room.id);
+        this.database.connection.prepare(`
+          UPDATE conflicts SET decision = 'warn'
+          WHERE room_id = ? AND decision = 'deny'
+            AND existing_lease_id IN (
+              SELECT id FROM leases WHERE room_id = ? AND kind <> 'exclusive'
+            )
+        `).run(auth.room.id, auth.room.id);
+        this.database.connection.prepare(`
+          UPDATE release_requests SET
+            status = 'cancelled', decision_member_id = ?, resolved_at = ?
+          WHERE room_id = ? AND status = 'pending'
+            AND requested_kind <> 'exclusive'
+            AND conflicting_lease_id IN (
+              SELECT id FROM leases WHERE room_id = ? AND kind <> 'exclusive'
+            )
+        `).run(auth.member.id, now, auth.room.id, auth.room.id);
+        this.restorePendingExclusiveClaimConflicts(auth.room.id);
+      }
+      if (blockingProtectionEnabled && !previous.blockingProtectionEnabled) {
+        // 旧模式下的 conflict 不能只按 severity 反推保护决定；清除普通投影后由实时检查重建。
+        this.database.connection.prepare(`
+          UPDATE conflicts SET decision = 'warn'
+          WHERE room_id = ?
+            AND existing_lease_id IN (
+              SELECT id FROM leases WHERE room_id = ? AND kind <> 'exclusive'
+            )
+        `).run(auth.room.id, auth.room.id);
+        this.restorePendingExclusiveClaimConflicts(auth.room.id);
+        this.database.connection.prepare(`
+          DELETE FROM conflicts
+          WHERE room_id = ? AND decision = 'warn'
+            AND existing_lease_id IN (
+              SELECT id FROM leases WHERE room_id = ? AND kind <> 'exclusive'
+            )
+        `).run(auth.room.id, auth.room.id);
       }
       this.auditRecord(
         auth,
@@ -1115,7 +1218,10 @@ export class AgentHubService {
 
   claimLease(input: ClaimLeaseInput): LeaseClaimResult {
     const auth = this.authenticateMemberToken(input.memberToken);
-    const sessionId = this.activeOwnedSessionId(input.sessionId, auth);
+    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    const sessionId = settings.blockingProtectionEnabled
+      ? this.activeOwnedSessionId(input.sessionId, auth)
+      : this.monitorOwnedSessionId(input.sessionId, auth);
     const title = requiredString(input.title, "Lease title", 200);
     const objective = optionalString(input.objective, "Lease intent", 4000) ?? "";
     const branch = optionalString(input.branch, "Branch", 255);
@@ -1126,8 +1232,7 @@ export class AgentHubService {
       throw new AgentHubError("invalid_lease_kind", "A manual exclusive lease must use write mode.");
     }
     const overrideReason = optionalString(input.overrideReason, "Override reason", 1000);
-    const paths = normalizePathList(input.paths);
-    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    const paths = normalizeCoordinationPathList(input.paths, !settings.blockingProtectionEnabled);
     const requestedMinutes = input.ttlMinutes
       ?? (input.ttlMs === undefined ? undefined : input.ttlMs / 60_000);
     let durationMinutes: number;
@@ -1144,7 +1249,7 @@ export class AgentHubService {
 
     return this.database.transaction(() => {
       this.expireLeases(auth.room.id, false);
-      const blockedSessionLease = kind === "automatic" && sessionId
+      const blockedSessionLease = settings.blockingProtectionEnabled && kind === "automatic" && sessionId
         ? this.listLeases(auth.room.id, true).find((lease) =>
             lease.sessionId === sessionId
             && lease.memberId === auth.member.id
@@ -1159,7 +1264,7 @@ export class AgentHubService {
           { leaseId: blockedSessionLease.id, expiresAt: blockedSessionLease.expiresAt },
         );
       }
-      const coordinationWait = kind === "automatic" && mode === "write"
+      const coordinationWait = settings.blockingProtectionEnabled && kind === "automatic" && mode === "write"
         ? this.coordinateAutomaticLeaseClaim(
             auth.room.id,
             auth.member.id,
@@ -1214,10 +1319,11 @@ export class AgentHubService {
             reusableLease ? [reusableLease.id] : [],
           )
         : [];
-      const hasBlocking = conflicts.some((conflict) => conflict.severity === "blocking");
-      const hasWarning = conflicts.some((conflict) => conflict.severity === "warning");
-      const decision = hasBlocking ? "deny" : hasWarning ? "warn" : "allow";
-      const canAcquire = !hasBlocking;
+      // severity 只决定黄/红展示；只有 decision=deny 才能拒绝登记。
+      const hasDenied = conflicts.some((conflict) => conflict.decision === "deny");
+      const hasWarning = conflicts.some((conflict) => conflict.decision === "warn");
+      const decision = hasDenied ? "deny" : hasWarning ? "warn" : "allow";
+      const canAcquire = !hasDenied;
       const leaseId = canAcquire ? reusableLease?.id ?? randomUUID() : null;
       const effectiveExpiresAt = reusableLease && !shouldHeartbeatRenew(reusableLease.kind)
         ? reusableLease.expiresAt
@@ -1284,7 +1390,7 @@ export class AgentHubService {
           );
       }
 
-      const releaseRequests = hasBlocking
+      const releaseRequests = hasDenied
         ? this.ensureReleaseRequests(auth, {
             sessionId,
             requesterLeaseId: null,
@@ -1356,7 +1462,10 @@ export class AgentHubService {
 
   renewLease(input: RenewLeaseInput): Lease {
     const auth = this.authenticateMemberToken(input.memberToken);
-    const sessionId = this.activeOwnedSessionId(input.sessionId, auth);
+    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    const sessionId = settings.blockingProtectionEnabled
+      ? this.activeOwnedSessionId(input.sessionId, auth)
+      : this.monitorOwnedSessionId(input.sessionId, auth);
     const updatedAt = this.timestamp();
     return this.database.transaction(() => {
       this.expireLeases(auth.room.id, false);
@@ -1365,14 +1474,17 @@ export class AgentHubService {
       if (lease.status !== "active") {
         throw new AgentHubError("lease_not_active", "Only an active lease can be renewed.", 409);
       }
-      if (lease.kind === "automatic" && lease.phase === "blocked") {
+      if (
+        settings.blockingProtectionEnabled
+        && lease.kind === "automatic"
+        && lease.phase === "blocked"
+      ) {
         throw new AgentHubError(
           "lease_blocked",
           "This automatic lease is blocked by an unresolved overlap and will remain until its original TTL expires.",
           409,
         );
       }
-      const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
       const requestedMinutes = input.ttlMinutes
         ?? (input.ttlMs === undefined ? undefined : input.ttlMs / 60_000);
       let durationMinutes: number;
@@ -1691,9 +1803,43 @@ export class AgentHubService {
 
   checkEdits(input: CheckEditsInput): EditCheckResult {
     const auth = this.authenticateMemberToken(input.memberToken);
-    const sessionId = this.activeOwnedSessionId(input.sessionId, auth);
+    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    const monitorOnly = !settings.blockingProtectionEnabled;
+    const sessionId = monitorOnly
+      ? this.monitorOwnedSessionId(input.sessionId, auth)
+      : this.activeOwnedSessionId(input.sessionId, auth);
     this.expireLeases(auth.room.id);
-    const paths = normalizePathList(input.paths);
+    const normalizationWarnings: EditIssue[] = [];
+    const unnormalizedPaths: string[] = [];
+    let paths: ReturnType<typeof normalizePathList>;
+    try {
+      paths = normalizeCoordinationPathList(input.paths, monitorOnly);
+    } catch (error) {
+      if (!monitorOnly) throw error;
+      const normalized = new Map<string, ReturnType<typeof normalizePathList>[number]>();
+      for (const rawPath of input.paths) {
+        try {
+          const path = normalizePathList([rawPath])[0];
+          normalized.set(pathComparisonKey(path.path), path);
+        } catch (pathError) {
+          unnormalizedPaths.push(rawPath);
+          normalizationWarnings.push({
+            code: "coordination_warning",
+            path: rawPath,
+            message: `This path could not be normalized for coordination, so monitor-only mode allowed writing: ${errorMessage(pathError)}`,
+          });
+        }
+      }
+      if (input.paths.length === 0) {
+        unnormalizedPaths.push(".");
+        normalizationWarnings.push({
+          code: "coordination_warning",
+          path: ".",
+          message: `The path set could not be normalized for coordination, so monitor-only mode allowed writing: ${errorMessage(error)}`,
+        });
+      }
+      paths = [...normalized.values()];
+    }
     const leases = this.listLeases(auth.room.id, true);
     const blockedOwnedLeases = leases.filter((lease) =>
       lease.memberId === auth.member.id
@@ -1705,26 +1851,35 @@ export class AgentHubService {
         lease.memberId === auth.member.id &&
         lease.mode === "write" &&
         lease.sessionId === sessionId &&
-        (lease.kind !== "automatic" || lease.phase === "working") &&
+        (monitorOnly || lease.kind !== "automatic" || lease.phase === "working") &&
         (!input.leaseId || lease.id === input.leaseId),
     );
-    if (input.leaseId && ownedLeases.length === 0) {
+    if (!monitorOnly && input.leaseId && ownedLeases.length === 0) {
       throw new AgentHubError("lease_not_found", "The active lease was not found for this member.", 404);
     }
 
     const blockers: EditCheckResult["blockers"] = [];
-    const warnings: EditCheckResult["warnings"] = [];
+    const warnings: EditCheckResult["warnings"] = [...normalizationWarnings];
     const coveredPaths: string[] = [];
-    const uncoveredPaths: string[] = [];
-    const blockingConflicts: LeaseConflict[] = [];
-    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    const uncoveredPaths: string[] = [...unnormalizedPaths];
+    const deniedConflicts: LeaseConflict[] = [];
+    if (monitorOnly && input.leaseId && ownedLeases.length === 0) {
+      warnings.push(...paths.map((candidate) => ({
+        code: "uncovered_path" as const,
+        path: candidate.path,
+        message: "The requested lease is not active for this session; monitor-only mode allows writing and will continue recording available evidence.",
+      })));
+    }
     for (const candidate of paths) {
       if (blockedOwnedLeases.length > 0) {
-        blockers.push({
+        const issue: EditIssue = {
           code: "session_write_blocked",
           path: candidate.path,
-          message: "This Agent session has unresolved attributed changes; its automatic leases will not renew and new writes remain blocked until cleanup or TTL expiry.",
-        });
+          message: monitorOnly
+            ? "This Agent session has unresolved attributed changes; monitor-only mode allows writing while the previous state remains visible."
+            : "This Agent session has unresolved attributed changes; its automatic leases will not renew and new writes remain blocked until cleanup or TTL expiry.",
+        };
+        (monitorOnly ? warnings : blockers).push(issue);
       }
       const covered = ownedLeases.some((lease) =>
         lease.paths.some((scope) => pathScopeCovers(scope.path, candidate.path)),
@@ -1733,11 +1888,14 @@ export class AgentHubService {
         coveredPaths.push(candidate.path);
       } else {
         uncoveredPaths.push(candidate.path);
-        blockers.push({
+        const issue: EditIssue = {
           code: "uncovered_path",
           path: candidate.path,
-          message: "No active write lease owned by this member covers the path.",
-        });
+          message: monitorOnly
+            ? "No active write lease covers this path yet; monitor-only mode allows writing and will attempt to register it."
+            : "No active write lease owned by this member covers the path.",
+        };
+        (monitorOnly ? warnings : blockers).push(issue);
       }
 
       const conflicts = this.findLeaseConflicts(
@@ -1756,15 +1914,15 @@ export class AgentHubService {
           message: conflict.reason,
           conflict,
         };
-        if (conflict.severity === "blocking") {
+        if (conflict.decision === "deny") {
           blockers.push(issue);
-          blockingConflicts.push(conflict);
+          deniedConflicts.push(conflict);
         }
         else warnings.push(issue);
       }
     }
     const requestLease = ownedLeases[0];
-    const releaseRequests = blockingConflicts.length > 0
+    const releaseRequests = deniedConflicts.length > 0
       ? this.database.transaction(() => this.ensureReleaseRequests(auth, {
           sessionId,
           requesterLeaseId: requestLease?.id ?? null,
@@ -1775,8 +1933,8 @@ export class AgentHubService {
           kind: requestLease?.kind === "exclusive" ? "automatic" : requestLease?.kind ?? "automatic",
           mode: "write",
           requestedTtlMinutes: null,
-          paths: blockingConflicts.map((conflict) => conflict.requestedPath),
-          conflicts: blockingConflicts,
+          paths: deniedConflicts.map((conflict) => conflict.requestedPath),
+          conflicts: deniedConflicts,
           createdAt: this.timestamp(),
         }))
       : [];
@@ -1784,26 +1942,36 @@ export class AgentHubService {
     let featureConfirmation: EditCheckResult["featureConfirmation"];
     if (sessionId) {
       const session = this.requireOwnedSession(sessionId, auth);
-      const historical = this.featureMemoryCall(() => this.featureMemory.checkHistoricalImpacts({
-        actor: this.featureActor(auth),
-        session: this.featureSession(session),
-        paths: paths.map((path) => path.path),
-        proposedEdits: input.proposedEdits,
-      }));
-      historicalImpacts = historical.impacts;
-      featureConfirmation = historical.confirmation;
-      if (!historical.authorized && historical.confirmation) {
-        for (const impact of historical.impacts) {
-          blockers.push({
-            code: "feature_confirmation_required",
-            path: impact.path,
-            message:
-              `Changing ${impact.featureName} may alter an established behavior contract. `
-              + "The current member must explicitly confirm this exact proposal before writing.",
-            featureImpact: impact,
-            confirmationId: historical.confirmation.id,
-          });
+      try {
+        const historical = this.featureMemoryCall(() => this.featureMemory.checkHistoricalImpacts({
+          actor: this.featureActor(auth),
+          session: this.featureSession(session),
+          paths: paths.map((path) => path.path),
+          proposedEdits: input.proposedEdits,
+        }));
+        historicalImpacts = historical.impacts;
+        featureConfirmation = historical.confirmation;
+        if (!historical.authorized && historical.confirmation) {
+          for (const impact of historical.impacts) {
+            const issue: EditIssue = {
+              code: "feature_confirmation_required",
+              path: impact.path,
+              message: monitorOnly
+                ? `Changing ${impact.featureName} may alter an established behavior contract; monitor-only mode allows writing and records this risk.`
+                : `Changing ${impact.featureName} may alter an established behavior contract. The current member must explicitly confirm this exact proposal before writing.`,
+              featureImpact: impact,
+              confirmationId: historical.confirmation.id,
+            };
+            (monitorOnly ? warnings : blockers).push(issue);
+          }
         }
+      } catch (error) {
+        if (!monitorOnly) throw error;
+        warnings.push(...paths.map((candidate) => ({
+          code: "coordination_warning" as const,
+          path: candidate.path,
+          message: `Historical-impact detection was unavailable, so monitor-only mode allowed writing: ${errorMessage(error)}`,
+        })));
       }
     }
     return {
@@ -1825,64 +1993,106 @@ export class AgentHubService {
     activity?: SessionActivityOperationResult;
   } {
     return this.database.transaction(() => {
+      const auth = this.authenticateMemberToken(input.memberToken);
+      const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+      const monitorOnly = !settings.blockingProtectionEnabled;
+      const diagnosticWarnings: EditIssue[] = [];
+      const warn = (message: string) => {
+        for (const path of input.paths.length > 0 ? input.paths : ["."]) {
+          diagnosticWarnings.push({ code: "coordination_warning", path, message });
+        }
+      };
       const hasActivityFence = input.turnId !== undefined || input.activityEpoch !== undefined;
-      if (
+      const incompleteFence = (
         (hasActivityFence || input.operationId !== undefined)
         && (
           !input.sessionId
           || input.turnId === undefined
           || input.activityEpoch === undefined
         )
-      ) {
+      );
+      if (incompleteFence && !monitorOnly) {
         throw new AgentHubError(
           "activity_fence_required",
           "A fenced prepare requires sessionId, turnId, and activityEpoch.",
         );
       }
-      const activity = input.operationId !== undefined
-        ? this.resumeSessionActivity({
+      if (incompleteFence) {
+        warn("The write activity fence is incomplete; monitor-only mode allows writing and records the missing lifecycle evidence.");
+      }
+      let activity: SessionActivityOperationResult | undefined;
+      if (input.operationId !== undefined && !incompleteFence) {
+        try {
+          activity = this.resumeSessionActivity({
             memberToken: input.memberToken,
             sessionId: input.sessionId as string,
-            operationId: input.operationId as string,
+            operationId: input.operationId,
             turnId: input.turnId as string,
             activityEpoch: input.activityEpoch as number,
-          })
-        : undefined;
-      if (activity?.result === "superseded") {
-        throw new AgentHubError(
-          "stale_activity_epoch",
-          "This write belongs to an activity epoch that has already been superseded.",
-          409,
-          { activityEpoch: input.activityEpoch, turnId: input.turnId },
-        );
+          });
+        } catch (error) {
+          if (!monitorOnly) throw error;
+          warn(`The session activity could not be resumed, so monitor-only mode allowed writing: ${errorMessage(error)}`);
+        }
       }
-      if (hasActivityFence) {
-        const auth = this.authenticateMemberToken(input.memberToken);
-        this.requireCurrentActivityFence(
-          input.sessionId as string,
-          auth,
-          input.turnId as string,
-          input.activityEpoch as number,
-        );
+      if (activity?.result === "superseded") {
+        if (!monitorOnly) {
+          throw new AgentHubError(
+            "stale_activity_epoch",
+            "This write belongs to an activity epoch that has already been superseded.",
+            409,
+            { activityEpoch: input.activityEpoch, turnId: input.turnId },
+          );
+        }
+        warn("This write belongs to an older activity epoch; monitor-only mode allows it and keeps the stale-epoch warning visible.");
+      }
+      if (hasActivityFence && !incompleteFence) {
+        try {
+          this.requireCurrentActivityFence(
+            input.sessionId as string,
+            auth,
+            input.turnId as string,
+            input.activityEpoch as number,
+          );
+        } catch (error) {
+          if (!monitorOnly) throw error;
+          warn(`The activity fence is no longer current; monitor-only mode allowed writing: ${errorMessage(error)}`);
+        }
       }
       let renewedLeases: Lease[] = [];
       if (input.sessionId) {
-        this.syncSessionBranch({
-          memberToken: input.memberToken,
-          sessionId: input.sessionId,
-          branch: input.branch,
-          baseCommit: input.baseCommit,
-        });
-        renewedLeases = this.heartbeatSession({
-          memberToken: input.memberToken,
-          sessionId: input.sessionId,
-        }).renewedLeases;
+        try {
+          this.syncSessionBranch({
+            memberToken: input.memberToken,
+            sessionId: input.sessionId,
+            branch: input.branch,
+            baseCommit: input.baseCommit,
+          });
+        } catch (error) {
+          if (!monitorOnly) throw error;
+          warn(`Branch tracking could not be refreshed; monitor-only mode allowed writing: ${errorMessage(error)}`);
+        }
+        try {
+          renewedLeases = this.heartbeatSession({
+            memberToken: input.memberToken,
+            sessionId: input.sessionId,
+          }).renewedLeases;
+        } catch (error) {
+          if (!monitorOnly) throw error;
+          warn(`The session heartbeat could not renew its leases; monitor-only mode allowed writing: ${errorMessage(error)}`);
+        }
       }
       let check = this.checkEdits(input);
+      check.warnings.unshift(...diagnosticWarnings);
       const onlyUncovered = !check.allowed
         && check.blockers.length > 0
         && check.blockers.every((blocker) => blocker.code === "uncovered_path");
-      if (!onlyUncovered) return { check, renewedLeases, activity };
+      const shouldAutoClaim = monitorOnly
+        ? check.blockers.length === 0
+          && check.uncoveredPaths.length > 0
+          && canNormalizeCoordinationPaths(input.paths, true)
+        : onlyUncovered;
+      if (!shouldAutoClaim) return { check, renewedLeases, activity };
       const claim = this.claimLease({
         memberToken: input.memberToken,
         sessionId: input.sessionId,
@@ -1894,7 +2104,10 @@ export class AgentHubService {
         mode: "write",
         autoClaim: true,
       });
-      if (claim.acquired) check = this.checkEdits(input);
+      if (claim.acquired) {
+        check = this.checkEdits(input);
+        check.warnings.unshift(...diagnosticWarnings);
+      }
       return { check, claim, renewedLeases, activity };
     });
   }
@@ -1902,6 +2115,31 @@ export class AgentHubService {
   markWriteBlocked(input: MarkWriteBlockedInput): { releasedLeaseIds: string[]; blockedLeaseIds: string[] } {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
+    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    if (!settings.blockingProtectionEnabled) {
+      this.database.transaction(() => {
+        this.database.connection.prepare(`
+          UPDATE leases SET
+            coordination_state = CASE
+              WHEN automatic_phase = 'awaiting_commit' THEN 'awaiting_commit'
+              ELSE 'working'
+            END,
+            decision = CASE WHEN decision = 'deny' THEN 'warn' ELSE decision END,
+            updated_at = ?
+          WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+            AND coordination_state IN ('blocked', 'waiting')
+        `).run(this.timestamp(), session.id);
+        this.auditRecord(
+          auth,
+          "lease.write_warning",
+          "session",
+          session.id,
+          "A passive write-block signal was recorded without creating a write fence because the room is monitor-only.",
+          { dirty: input.dirty, paths: input.paths, reason: input.reason ?? null },
+        );
+      });
+      return { releasedLeaseIds: [], blockedLeaseIds: [] };
+    }
     const now = this.timestamp();
     const reason = input.reason?.trim() || "Write was passively blocked by another active lease.";
     return this.database.transaction(() => {
@@ -2338,14 +2576,17 @@ export class AgentHubService {
       "Client version",
       80,
     );
-    const protocolVersion = optionalVersionNumber(
+    const reportedProtocolVersion = optionalVersionNumber(
       input.protocolVersion ?? metadata.protocolVersion,
       "Protocol version",
     );
-    const schemaVersion = optionalVersionNumber(
+    const reportedSchemaVersion = optionalVersionNumber(
       input.schemaVersion ?? metadata.schemaVersion,
       "Schema version",
     );
+    const protocolVersion = reportedProtocolVersion ?? auth.member.protocolVersion;
+    const schemaVersion = reportedSchemaVersion ?? auth.member.schemaVersion;
+    this.requireMonitorProtocol(auth, protocolVersion, clientVersion);
     const codexSessionId = optionalString(
       input.codexSessionId ?? metadata.codexSessionId,
       "Codex session id",
@@ -2520,29 +2761,46 @@ export class AgentHubService {
   } {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
+    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    const monitorOnly = !settings.blockingProtectionEnabled;
     const hasActivityFence = input.turnId !== undefined || input.activityEpoch !== undefined;
-    if (hasActivityFence && (input.turnId === undefined || input.activityEpoch === undefined)) {
+    if (!monitorOnly && hasActivityFence && (input.turnId === undefined || input.activityEpoch === undefined)) {
       throw new AgentHubError(
         "activity_fence_required",
         "A fenced heartbeat requires turnId and activityEpoch.",
       );
     }
-    if (hasActivityFence) {
-      this.requireCurrentActivityFence(
-        session.id,
-        auth,
-        input.turnId as string,
-        input.activityEpoch as number,
-      );
+    if (hasActivityFence && input.turnId !== undefined && input.activityEpoch !== undefined) {
+      if (monitorOnly) {
+        try {
+          this.requireCurrentActivityFence(
+            session.id,
+            auth,
+            input.turnId,
+            input.activityEpoch,
+          );
+        } catch {
+          // 监测模式继续更新在线状态，旧回合只由写前检查显示风险。
+        }
+      } else {
+        this.requireCurrentActivityFence(
+          session.id,
+          auth,
+          input.turnId as string,
+          input.activityEpoch as number,
+        );
+      }
     }
-    if (session.status !== "active" || session.turnStoppedAt) {
+    if (!monitorOnly && (session.status !== "active" || session.turnStoppedAt)) {
       throw new AgentHubError("session_not_active", "The work session is not active.", 409);
     }
     const clientVersion = optionalString(input.clientVersion, "Client version", 80);
-    const protocolVersion = optionalVersionNumber(input.protocolVersion, "Protocol version");
-    const schemaVersion = optionalVersionNumber(input.schemaVersion, "Schema version");
+    const reportedProtocolVersion = optionalVersionNumber(input.protocolVersion, "Protocol version");
+    const reportedSchemaVersion = optionalVersionNumber(input.schemaVersion, "Schema version");
+    const protocolVersion = reportedProtocolVersion ?? session.protocolVersion ?? auth.member.protocolVersion;
+    const schemaVersion = reportedSchemaVersion ?? session.schemaVersion ?? auth.member.schemaVersion;
+    this.requireMonitorProtocol(auth, protocolVersion, clientVersion ?? session.clientVersion);
     const heartbeatAt = this.timestamp();
-    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
     const expiresAt = new Date(
       this.now().getTime() + settings.automaticLeaseTtlMinutes * 60_000,
     ).toISOString();
@@ -2589,6 +2847,10 @@ export class AgentHubService {
 
   syncSessionBranch(input: SyncSessionBranchInput): WorkSession {
     const auth = this.authenticateMemberToken(input.memberToken);
+    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    if (!settings.blockingProtectionEnabled) {
+      return this.trackSessionBranchForMonitoring(input, auth);
+    }
     const session = this.requireOwnedSession(input.sessionId, auth);
     const branch = optionalString(input.branch, "Branch", 255) ?? null;
     const baseCommit = optionalString(input.baseCommit, "Base commit", 255) ?? null;
@@ -3320,7 +3582,8 @@ export class AgentHubService {
       }
       const recent = this.database.connection.prepare(`
         SELECT id, last_requested_at FROM release_requests
-        WHERE dedupe_key = ? ORDER BY last_requested_at DESC LIMIT 1
+        WHERE dedupe_key = ? AND status <> 'cancelled'
+        ORDER BY last_requested_at DESC LIMIT 1
       `).get(dedupeKey) as Row | undefined;
       if (
         recent
@@ -3377,6 +3640,47 @@ export class AgentHubService {
       requests.push(this.mapReleaseRequest(this.requireReleaseRequestRow(id, auth.room.id)));
     }
     return requests;
+  }
+
+  private restorePendingExclusiveClaimConflicts(roomId: string): void {
+    const requests = this.database.connection.prepare(`
+      SELECT rowid AS request_rowid, requester_member_id, conflicting_lease_id,
+        overlap_paths_json, last_requested_at
+      FROM release_requests
+      WHERE room_id = ? AND status = 'pending' AND requested_kind = 'exclusive'
+      ORDER BY last_requested_at DESC, request_rowid DESC
+    `).all(roomId) as Row[];
+    const findConflicts = this.database.connection.prepare(`
+      SELECT id FROM conflicts
+      WHERE room_id = ? AND requester_member_id = ? AND existing_lease_id = ?
+        AND requested_path = ? COLLATE NOCASE
+        AND existing_path = ? COLLATE NOCASE
+      ORDER BY CASE WHEN created_at = ? THEN 0 ELSE 1 END, created_at DESC, rowid DESC
+    `);
+    const restoreDecision = this.database.connection.prepare(`
+      UPDATE conflicts SET decision = 'deny' WHERE id = ?
+    `);
+    const restoredConflictIds = new Set<string>();
+
+    // schema 5 没有保存 requested_kind；按申请时间为每个 pending 独占申请分配不同冲突投影。
+    for (const request of requests) {
+      for (const overlap of parseOverlapPaths(request.overlap_paths_json)) {
+        const conflicts = findConflicts.all(
+          roomId,
+          asString(request.requester_member_id),
+          asString(request.conflicting_lease_id),
+          overlap.requestedPath,
+          overlap.existingPath,
+          asString(request.last_requested_at),
+        ) as Row[];
+        const conflictId = conflicts
+          .map((conflict) => asString(conflict.id))
+          .find((id) => id && !restoredConflictIds.has(id));
+        if (!conflictId) continue;
+        restoredConflictIds.add(conflictId);
+        restoreDecision.run(conflictId);
+      }
+    }
   }
 
   private requireReleaseRequestRow(id: string, roomId: string): Row {
@@ -4392,6 +4696,74 @@ export class AgentHubService {
     return session.id;
   }
 
+  private monitorOwnedSessionId(
+    value: string | undefined,
+    auth: AuthenticatedMember,
+  ): string | null {
+    if (value === undefined) return null;
+    // 监测模式仍校验房间和成员归属，但不把停止、冻结或旧回合状态变成写入门禁。
+    return this.requireOwnedSession(value, auth).id;
+  }
+
+  private requireMonitorProtocol(
+    auth: AuthenticatedMember,
+    protocolVersion: number | null,
+    clientVersion: string | null,
+  ): void {
+    const settings = this.readRoomSettings(auth.room.id, auth.room.createdAt, auth.member.displayName);
+    if (settings.blockingProtectionEnabled || protocolVersion === AGENT_HUB_PROTOCOL_VERSION) return;
+    throw new AgentHubError(
+      "monitor_mode_upgrade_required",
+      `Monitor-only rooms require protocol ${AGENT_HUB_PROTOCOL_VERSION}.`,
+      409,
+      {
+        requiredProtocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+        members: [{
+          id: auth.member.id,
+          displayName: auth.member.displayName,
+          clientVersion,
+          protocolVersion,
+        }],
+      },
+    );
+  }
+
+  private trackSessionBranchForMonitoring(
+    input: SyncSessionBranchInput,
+    auth: AuthenticatedMember,
+  ): WorkSession {
+    const session = this.requireOwnedSession(input.sessionId, auth);
+    const branch = optionalString(input.branch, "Branch", 255) ?? null;
+    const baseCommit = optionalString(input.baseCommit, "Base commit", 255) ?? null;
+    const now = this.timestamp();
+    const branchChanged = session.branch !== branch;
+    this.database.transaction(() => {
+      this.database.connection.prepare(`
+        UPDATE work_sessions SET
+          branch = ?, base_commit = ?,
+          branch_epoch = branch_epoch + ?,
+          frozen_reason = NULL, last_seen_at = ?
+        WHERE id = ?
+      `).run(branch, baseCommit, branchChanged ? 1 : 0, now, session.id);
+      if (branchChanged) {
+        this.auditRecord(
+          auth,
+          "session.branch_observed",
+          "session",
+          session.id,
+          "Observed a branch change without creating a write fence because the room is monitor-only.",
+          {
+            previousBranch: session.branch,
+            branch,
+            previousBaseCommit: session.baseCommit,
+            baseCommit,
+          },
+        );
+      }
+    });
+    return this.requireSessionById(session.id);
+  }
+
   private requireCurrentActivityFence(
     sessionId: string,
     auth: AuthenticatedMember,
@@ -5367,4 +5739,32 @@ function stringListField(record: Record<string, unknown>, key: string): string[]
 function stringListValue(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) return null;
   return value.map((item) => item.trim()).filter(Boolean);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown coordination error.";
+}
+
+function normalizeCoordinationPathList(
+  paths: string[],
+  allowLargeMonitorSet: boolean,
+): ReturnType<typeof normalizePathList> {
+  if (!allowLargeMonitorSet || paths.length <= 100) return normalizePathList(paths);
+  // 100 条是单次保护计算预算，不应在纯监测模式中变成写入门禁；分片规范化后再去重。
+  const normalized = new Map<string, ReturnType<typeof normalizePathList>[number]>();
+  for (let index = 0; index < paths.length; index += 100) {
+    for (const path of normalizePathList(paths.slice(index, index + 100))) {
+      normalized.set(pathComparisonKey(path.path), path);
+    }
+  }
+  return [...normalized.values()];
+}
+
+function canNormalizeCoordinationPaths(paths: string[], allowLargeMonitorSet: boolean): boolean {
+  try {
+    normalizeCoordinationPathList(paths, allowLargeMonitorSet);
+    return true;
+  } catch {
+    return false;
+  }
 }

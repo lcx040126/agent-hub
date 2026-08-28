@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   DeleteConnectionModal,
   EntryScreen,
+  ConflictList,
+  ManagementView,
   SavedConnectionList,
   WorkItem,
   WorkView,
@@ -17,10 +19,12 @@ import {
   nextPendingReleaseRequestId,
   noticeForActivatedConnection,
   noticeForDeletedConnection,
+  monitorModeUpgradeGuidance,
   protectedSystemsForDashboard,
+  roomSettingsErrorMessage,
   splitVisibleLeases,
 } from "./App";
-import { ApiError, type Dashboard, type Lease, type SavedRoomConnection } from "./api";
+import { ApiError, type Conflict, type Dashboard, type Lease, type SavedRoomConnection, type Session } from "./api";
 
 const originalWindow = globalThis.window;
 const LEASE_NOW = Date.parse("2026-08-27T08:00:00.000Z");
@@ -156,6 +160,104 @@ describe("dashboard refresh state", () => {
     expect(markup).toContain("房间保持在线");
     expect(markup).not.toContain("团队数据暂未刷新");
     expect(markup).not.toContain("正在重新连接房间");
+  });
+});
+
+describe("risk presentation semantics", () => {
+  const redWarning: Conflict = {
+    id: "red-warning",
+    title: "重点文件重叠",
+    summary: "该范围是高风险，但服务端允许继续。",
+    severity: "blocking",
+    decision: "warn",
+    paths: ["ProjectSettings/ProjectSettings.asset"],
+    memberNames: ["成员 B"],
+  };
+  const yellowDenial: Conflict = {
+    id: "yellow-denial",
+    title: "明确拒绝",
+    summary: "颜色普通，但服务端明确拒绝。",
+    severity: "warning",
+    decision: "deny",
+    paths: ["src/shared.ts"],
+    memberNames: ["成员 C"],
+  };
+
+  it("uses severity for color and decision=deny alone for blocked labels and counts", () => {
+    const listMarkup = renderToStaticMarkup(<ConflictList conflicts={[redWarning, yellowDenial]} />);
+    expect(listMarkup).toContain("conflict-item blocking");
+    expect(listMarkup).toContain("高风险警告");
+    expect(listMarkup).toContain("conflict-item warning");
+    expect(listMarkup).toContain("已阻止");
+
+    const summaryMarkup = renderToStaticMarkup(
+      <StatusSummary
+        dashboard={dashboard({ conflicts: [redWarning, yellowDenial] })}
+        syncState="online"
+        now={LEASE_NOW}
+      />,
+    );
+    expect(summaryMarkup).toContain("1 项阻塞尚未解决");
+    expect(summaryMarkup).toContain("<b>1</b> 阻塞");
+  });
+
+  it("describes pure monitoring and names members that must upgrade before switching", () => {
+    const owner: Dashboard["currentMember"] = {
+      id: "owner",
+      name: "房主",
+      role: "host",
+      status: "online",
+      compatibility: "compatible",
+      protocolVersion: 2,
+    };
+    const state = dashboard({
+      currentMember: owner,
+      members: [
+        owner,
+        { id: "old", name: "旧客户端", role: "member", status: "online", compatibility: "incompatible", clientVersion: "0.2.5", protocolVersion: 1 },
+        { id: "unknown", name: "未上报成员", role: "member", status: "away", compatibility: "unknown", protocolVersion: undefined },
+      ],
+      settings: {
+        ...dashboard().settings,
+        riskRules: [{ kind: "category", selector: "normal_source", level: "blocking" }],
+      },
+    });
+    const session: Session = { room: state.room, member: owner, memberToken: "owner-token" };
+    const markup = renderToStaticMarkup(
+      <ManagementView
+        dashboard={state}
+        session={session}
+        onRefresh={async () => undefined}
+        onNotice={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("自动与普通范围进入纯监测");
+    expect(markup).toContain("红色高风险警告都只记录");
+    expect(markup).toContain("红色高风险");
+    expect(markup).toContain("切换前需要成员升级");
+    expect(markup).toContain("旧客户端（v0.2.5）");
+    expect(markup).toContain("未上报成员（未上报版本）");
+    expect(monitorModeUpgradeGuidance(state.members)).toContain("协议 2");
+  });
+
+  it("uses preserved server details in the monitor-mode upgrade error", () => {
+    const message = roomSettingsErrorMessage(new ApiError(
+      "升级后再试。",
+      409,
+      "monitor_mode_upgrade_required",
+      {
+        requiredProtocolVersion: 2,
+        members: [
+          { displayName: "成员 B", clientVersion: "0.2.5", protocolVersion: 1 },
+          { displayName: "成员 C", clientVersion: null, protocolVersion: null },
+        ],
+      },
+    ));
+    expect(message).toContain("成员 B（v0.2.5）");
+    expect(message).toContain("成员 C（未上报版本）");
+    expect(message).toContain("协议 2");
+    expect(message).toContain("服务已拒绝本次切换");
   });
 });
 

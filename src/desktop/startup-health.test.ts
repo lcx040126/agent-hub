@@ -1,17 +1,22 @@
 import { describe, expect, it, vi } from "vitest";
+import {
+  AGENT_HUB_PROTOCOL_VERSION,
+  AGENT_HUB_SCHEMA_VERSION,
+  AGENT_HUB_VERSION,
+} from "../shared/version.js";
 import { verifyStartupHealthAndMark } from "./startup-health.js";
 
 const serviceHealth = {
   status: "ok",
   service: "agent-hub",
-  version: "0.2.5",
-  protocolVersion: 1,
-  schemaVersion: 5,
-  database: { status: "ok", schemaVersion: 5 },
+  version: AGENT_HUB_VERSION,
+  protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+  schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+  database: { status: "ok", schemaVersion: AGENT_HUB_SCHEMA_VERSION },
 };
 const localIntegrationHealth = {
   status: "ok",
-  version: "0.2.5",
+  version: AGENT_HUB_VERSION,
   mcpBridge: "ok",
   codexHook: "ok",
 };
@@ -36,9 +41,9 @@ describe("desktop startup health", () => {
     })).resolves.toEqual({
       service: {
         status: "ok",
-        version: "0.2.5",
-        protocolVersion: 1,
-        schemaVersion: 5,
+        version: AGENT_HUB_VERSION,
+        protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+        schemaVersion: AGENT_HUB_SCHEMA_VERSION,
         database: "ok",
       },
       localIntegration: localIntegrationHealth,

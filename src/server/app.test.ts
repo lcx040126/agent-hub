@@ -7,6 +7,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createAgentHubApp } from "./app.js";
 import { AgentHubDatabase } from "./db.js";
 import { AgentHubService } from "./service.js";
+import {
+  AGENT_HUB_PROTOCOL_VERSION,
+  AGENT_HUB_SCHEMA_VERSION,
+  AGENT_HUB_VERSION,
+} from "../shared/version.js";
 
 const databases: AgentHubDatabase[] = [];
 const temporaryDirectories: string[] = [];
@@ -27,10 +32,10 @@ describe("Agent Hub REST API", () => {
     expect(health.body).toMatchObject({
       status: "ok",
       service: "agent-hub",
-      version: "0.2.5",
-      protocolVersion: 1,
-      schemaVersion: 5,
-      database: { status: "ok", schemaVersion: 5 },
+      version: AGENT_HUB_VERSION,
+      protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+      database: { status: "ok", schemaVersion: AGENT_HUB_SCHEMA_VERSION },
     });
   });
 
@@ -415,7 +420,186 @@ describe("Agent Hub REST API", () => {
     expect(kicked.status).toBe(401);
   });
 
-  it("downgrades critical automatic overlap when blocking protection is disabled", async () => {
+  it("requires protocol 2 presence before enabling monitor-only mode and rejects later legacy clients", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const legacy = await request(app).post("/api/rooms/join").send({
+      inviteCode: owner.body.inviteCode,
+      memberName: "Legacy Bob",
+      clientVersion: "0.2.5",
+      protocolVersion: 1,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+    });
+    expect(legacy.status).toBe(201);
+
+    const blockedToggle = await auth(request(app).post("/api/room/settings").send({
+      blockingProtectionEnabled: false,
+    }), owner.body.token);
+    expect(blockedToggle.status).toBe(409);
+    expect(blockedToggle.body).toMatchObject({
+      error: "monitor_mode_upgrade_required",
+      details: {
+        requiredProtocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+        members: [expect.objectContaining({
+          id: legacy.body.member.id,
+          displayName: "Legacy Bob",
+          protocolVersion: 1,
+        })],
+      },
+    });
+
+    const upgraded = await auth(request(app).post("/api/sessions").send({
+      clientVersion: AGENT_HUB_VERSION,
+      protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+      task: "Report upgraded presence",
+    }), legacy.body.token);
+    expect(upgraded.status).toBe(201);
+    expect((await auth(request(app).post("/api/room/settings").send({
+      blockingProtectionEnabled: false,
+    }), owner.body.token)).status).toBe(200);
+
+    const rejectedJoin = await request(app).post("/api/rooms/join").send({
+      inviteCode: owner.body.inviteCode,
+      memberName: "Legacy Carol",
+      clientVersion: "0.2.5",
+      protocolVersion: 1,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+    });
+    expect(rejectedJoin.status).toBe(409);
+    expect(rejectedJoin.body.error).toBe("monitor_mode_upgrade_required");
+
+    const rejectedOpen = await auth(request(app).post("/api/sessions").send({
+      clientVersion: "0.2.5",
+      protocolVersion: 1,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+    }), owner.body.token);
+    expect(rejectedOpen.status).toBe(409);
+    expect(rejectedOpen.body.error).toBe("monitor_mode_upgrade_required");
+    const rejectedHeartbeat = await auth(request(app)
+      .post(`/api/sessions/${upgraded.body.session.id}/heartbeat`)
+      .send({ clientVersion: "0.2.5", protocolVersion: 1 }), legacy.body.token);
+    expect(rejectedHeartbeat.status).toBe(409);
+    expect(rejectedHeartbeat.body.error).toBe("monitor_mode_upgrade_required");
+  });
+
+  it("keeps critical overlaps red but allows every non-exclusive write in monitor-only mode", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    await auth(request(app).post("/api/room/settings").send({
+      blockingProtectionEnabled: false,
+      riskRules: [{ kind: "extension", selector: ".ts", level: "blocking" }],
+    }), owner.body.token);
+
+    await auth(request(app).post("/api/leases").send({
+      title: "Owner critical work",
+      kind: "standard",
+      paths: ["src/shared.ts"],
+    }), owner.body.token);
+    const criticalWarning = await auth(request(app).post("/api/leases").send({
+      title: "Bob critical work",
+      autoClaim: true,
+      paths: ["src/shared.ts"],
+    }), bob.body.token);
+    expect(criticalWarning.body).toMatchObject({
+      acquired: true,
+      decision: "warn",
+      conflicts: [expect.objectContaining({ severity: "critical", decision: "warn" })],
+      releaseRequests: [],
+    });
+
+    await auth(request(app).post("/api/leases").send({
+      title: "Owner ordinary notes",
+      kind: "standard",
+      paths: ["docs/notes.md"],
+    }), owner.body.token);
+    const ordinaryWarning = await auth(request(app).post("/api/leases").send({
+      title: "Bob ordinary notes",
+      autoClaim: true,
+      paths: ["docs/notes.md"],
+    }), bob.body.token);
+    expect(ordinaryWarning.body.conflicts[0]).toMatchObject({
+      severity: "warning",
+      decision: "warn",
+    });
+
+    const exclusive = await auth(request(app).post("/api/leases").send({
+      title: "Owner manual exclusive",
+      kind: "exclusive",
+      ttlMinutes: 60,
+      paths: ["src/locked"],
+    }), owner.body.token);
+    expect(exclusive.body.acquired).toBe(true);
+    const ownExclusiveWarning = await auth(request(app).post("/api/leases").send({
+      title: "Owner Agent inside own exclusive",
+      autoClaim: true,
+      paths: ["src/locked/file.ts"],
+    }), owner.body.token);
+    expect(ownExclusiveWarning.body).toMatchObject({
+      acquired: true,
+      decision: "warn",
+      conflicts: [expect.objectContaining({ severity: "critical", decision: "warn" })],
+    });
+    const otherMemberDenied = await auth(request(app).post("/api/leases").send({
+      title: "Bob inside owner exclusive",
+      autoClaim: true,
+      paths: ["src/locked/file.ts"],
+    }), bob.body.token);
+    expect(otherMemberDenied.body).toMatchObject({ acquired: false, decision: "deny" });
+
+    const exclusiveClaimDenied = await auth(request(app).post("/api/leases").send({
+      title: "Bob requests exclusive over active work",
+      kind: "exclusive",
+      ttlMinutes: 60,
+      paths: ["src/shared.ts"],
+    }), bob.body.token);
+    expect(exclusiveClaimDenied.body).toMatchObject({ acquired: false, decision: "deny" });
+
+    const uncovered = await auth(request(app).post("/api/edits/check").send({
+      paths: ["src/uncovered-only.ts"],
+    }), bob.body.token);
+    expect(uncovered.body).toMatchObject({
+      allowed: true,
+      blockers: [],
+      warnings: [expect.objectContaining({ code: "uncovered_path" })],
+    });
+
+    const manyPaths = Array.from({ length: 101 }, (_, index) => `src/bulk/file-${index}.ts`);
+    const bulkPrepared = await auth(request(app).post("/api/edits/prepare").send({
+      title: "Large monitor-only path set",
+      paths: manyPaths,
+    }), bob.body.token);
+    expect(bulkPrepared.status).toBe(200);
+    expect(bulkPrepared.body).toMatchObject({
+      check: { allowed: true, blockers: [] },
+      claim: { acquired: true },
+    });
+
+    const unknownPath = await auth(request(app).post("/api/edits/check").send({
+      paths: ["C:/outside/repository.ts"],
+    }), bob.body.token);
+    expect(unknownPath.body).toMatchObject({
+      allowed: true,
+      blockers: [],
+      warnings: [expect.objectContaining({ code: "coordination_warning" })],
+    });
+    const mixedExclusive = await auth(request(app).post("/api/edits/check").send({
+      paths: ["C:/outside/repository.ts", "src/locked/file.ts"],
+    }), bob.body.token);
+    expect(mixedExclusive.body.allowed).toBe(false);
+    expect(mixedExclusive.body.blockers).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "lease_conflict",
+        conflict: expect.objectContaining({ decision: "deny", existingLeaseKind: "exclusive" }),
+      }),
+    ]));
+    expect(mixedExclusive.body.warnings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "coordination_warning" }),
+    ]));
+  });
+
+  it("allows critical automatic overlap without downgrading its severity when protection is disabled", async () => {
     const { app } = testApp();
     const owner = await createRoom(app);
     const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
@@ -425,7 +609,12 @@ describe("Agent Hub REST API", () => {
     expect(denied.body.releaseRequests).toHaveLength(1);
     await auth(request(app).post("/api/room/settings").send({ blockingProtectionEnabled: false }), owner.body.token);
     const warning = await auth(request(app).post("/api/leases").send({ title: "Automatic work", paths: ["Assets/Scenes/Raid.unity"], mode: "write", branch: "main", autoClaim: true }), bob.body.token);
-    expect(warning.body).toMatchObject({ acquired: true, decision: "warn", lease: { kind: "automatic" } });
+    expect(warning.body).toMatchObject({
+      acquired: true,
+      decision: "warn",
+      lease: { kind: "automatic" },
+      conflicts: [expect.objectContaining({ severity: "critical", decision: "warn" })],
+    });
   });
 
   it("freezes a session and cancels its leases when the branch changes", async () => {
@@ -795,6 +984,197 @@ describe("Agent Hub REST API", () => {
       .post(`/api/sessions/${blockedSession.body.session.id}/write-blocked`)
       .send({ dirty: true, paths: ["src/new.ts"], reason: "Recheck after the blocked lease TTL." }), owner.body.token);
     expect(expiredSync.body).toEqual({ releasedLeaseIds: [], blockedLeaseIds: [] });
+  });
+
+  it("clears legacy non-exclusive fences while preserving finalization and exclusive requests", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    const session = await auth(request(app).post("/api/sessions").send({
+      codexSessionId: "codex-monitor-transition",
+      turnId: "turn-current",
+      activityEpoch: 3,
+      branch: "feature/original",
+    }), owner.body.token);
+    const automatic = await auth(request(app).post("/api/leases").send({
+      sessionId: session.body.session.id,
+      title: "Dirty automatic work",
+      autoClaim: true,
+      paths: ["src/dirty.ts"],
+    }), owner.body.token);
+    await auth(request(app)
+      .post(`/api/sessions/${session.body.session.id}/write-blocked`)
+      .send({ dirty: true, paths: ["src/dirty.ts"], reason: "Legacy passive fence." }), owner.body.token);
+
+    await auth(request(app).post("/api/leases").send({
+      title: "Critical standard holder",
+      kind: "standard",
+      paths: ["Assets/Scenes/Shared.unity"],
+    }), owner.body.token);
+    const ordinaryDenied = await auth(request(app).post("/api/leases").send({
+      title: "Ordinary blocked request",
+      autoClaim: true,
+      paths: ["Assets/Scenes/Shared.unity"],
+    }), bob.body.token);
+    expect(ordinaryDenied.body.conflicts[0]).toMatchObject({
+      severity: "critical",
+      decision: "deny",
+      existingLeaseKind: "standard",
+    });
+    expect(ordinaryDenied.body.releaseRequests[0]).toMatchObject({ conflictingLeaseKind: "standard" });
+    const exclusiveClaimDenied = await auth(request(app).post("/api/leases").send({
+      title: "Manual exclusive request over ordinary work",
+      kind: "exclusive",
+      ttlMinutes: 60,
+      paths: ["Assets/Scenes/Shared.unity"],
+    }), bob.body.token);
+    expect(exclusiveClaimDenied.body).toMatchObject({ acquired: false, decision: "deny" });
+    expect(exclusiveClaimDenied.body.releaseRequests[0]).toMatchObject({
+      requestedKind: "exclusive",
+      conflictingLeaseKind: "standard",
+    });
+    const secondExclusiveClaimDenied = await auth(request(app).post("/api/leases").send({
+      title: "Second manual exclusive request over ordinary work",
+      kind: "exclusive",
+      ttlMinutes: 30,
+      paths: ["Assets/Scenes/Shared.unity"],
+    }), bob.body.token);
+    expect(secondExclusiveClaimDenied.body).toMatchObject({ acquired: false, decision: "deny" });
+    expect(secondExclusiveClaimDenied.body.releaseRequests[0].id)
+      .not.toBe(exclusiveClaimDenied.body.releaseRequests[0].id);
+
+    await auth(request(app).post("/api/leases").send({
+      title: "Manual exclusive holder",
+      kind: "exclusive",
+      ttlMinutes: 60,
+      paths: ["src/exclusive"],
+    }), owner.body.token);
+    const exclusiveDenied = await auth(request(app).post("/api/leases").send({
+      title: "Exclusive blocked request",
+      autoClaim: true,
+      paths: ["src/exclusive/file.ts"],
+    }), bob.body.token);
+    expect(exclusiveDenied.body.conflicts[0]).toMatchObject({
+      severity: "critical",
+      decision: "deny",
+      existingLeaseKind: "exclusive",
+    });
+    expect(exclusiveDenied.body.releaseRequests[0]).toMatchObject({ conflictingLeaseKind: "exclusive" });
+
+    const finalizationId = "monitor_transition_finalize";
+    expect((await auth(request(app)
+      .post(`/api/sessions/${session.body.session.id}/finalize/start`)
+      .send({ finalizationId }), owner.body.token)).body.session.status).toBe("finalizing");
+    expect((await auth(request(app).post("/api/room/settings").send({
+      blockingProtectionEnabled: false,
+    }), owner.body.token)).status).toBe(200);
+
+    let dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.sessions.find(
+      (item: { id: string }) => item.id === session.body.session.id,
+    )).toMatchObject({ status: "finalizing" });
+    expect(dashboard.body.leases.find(
+      (item: { id: string }) => item.id === automatic.body.lease.id,
+    )).toMatchObject({ phase: "awaiting_commit", decision: "warn" });
+    expect(dashboard.body.conflicts.find(
+      (item: { id: string }) => item.id === ordinaryDenied.body.conflicts[0].id,
+    )).toMatchObject({
+      severity: "critical",
+      decision: "warn",
+      existingLeaseKind: "standard",
+    });
+    expect(dashboard.body.conflicts.find(
+      (item: { id: string }) => item.id === exclusiveClaimDenied.body.conflicts[0].id,
+    )).toMatchObject({
+      severity: "critical",
+      decision: "deny",
+      existingLeaseKind: "standard",
+    });
+    expect(dashboard.body.conflicts.find(
+      (item: { id: string }) => item.id === secondExclusiveClaimDenied.body.conflicts[0].id,
+    )).toMatchObject({
+      severity: "critical",
+      decision: "deny",
+      existingLeaseKind: "standard",
+    });
+    expect(dashboard.body.conflicts.find(
+      (item: { id: string }) => item.id === exclusiveDenied.body.conflicts[0].id,
+    )).toMatchObject({
+      severity: "critical",
+      decision: "deny",
+      existingLeaseKind: "exclusive",
+    });
+
+    const allRequests = await auth(request(app).get("/api/release-requests?status=all"), owner.body.token);
+    expect(allRequests.body.releaseRequests.find(
+      (item: { id: string }) => item.id === ordinaryDenied.body.releaseRequests[0].id,
+    )).toMatchObject({ status: "cancelled", conflictingLeaseKind: "standard" });
+    expect(allRequests.body.releaseRequests.find(
+      (item: { id: string }) => item.id === exclusiveClaimDenied.body.releaseRequests[0].id,
+    )).toMatchObject({
+      status: "pending",
+      requestedKind: "exclusive",
+      conflictingLeaseKind: "standard",
+    });
+    expect(allRequests.body.releaseRequests.find(
+      (item: { id: string }) => item.id === secondExclusiveClaimDenied.body.releaseRequests[0].id,
+    )).toMatchObject({ status: "pending", requestedKind: "exclusive" });
+    expect(allRequests.body.releaseRequests.find(
+      (item: { id: string }) => item.id === exclusiveDenied.body.releaseRequests[0].id,
+    )).toMatchObject({ status: "pending", conflictingLeaseKind: "exclusive" });
+
+    const prepared = await auth(request(app).post("/api/edits/prepare").send({
+      sessionId: session.body.session.id,
+      title: "Continue finalizing generation in monitor mode",
+      branch: "feature/observed",
+      baseCommit: "bbbb2222",
+      paths: ["src/dirty.ts"],
+      turnId: "turn-stale",
+      activityEpoch: 1,
+    }), owner.body.token);
+    expect(prepared.status).toBe(200);
+    expect(prepared.body.check).toMatchObject({ allowed: true, blockers: [] });
+    expect(prepared.body.check.warnings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "coordination_warning" }),
+    ]));
+    expect((await auth(request(app)
+      .post(`/api/sessions/${session.body.session.id}/write-blocked`)
+      .send({ dirty: true, paths: ["src/dirty.ts"] }), owner.body.token)).body).toEqual({
+      releasedLeaseIds: [],
+      blockedLeaseIds: [],
+    });
+
+    dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.sessions.find(
+      (item: { id: string }) => item.id === session.body.session.id,
+    )).toMatchObject({ status: "finalizing", branch: "feature/observed" });
+
+    expect((await auth(request(app).post("/api/room/settings").send({
+      blockingProtectionEnabled: true,
+    }), owner.body.token)).status).toBe(200);
+    dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.conflicts.find(
+      (item: { id: string }) => item.id === ordinaryDenied.body.conflicts[0].id,
+    )).toBeUndefined();
+    expect(dashboard.body.conflicts.find(
+      (item: { id: string }) => item.id === exclusiveClaimDenied.body.conflicts[0].id,
+    )).toMatchObject({ severity: "critical", decision: "deny" });
+    expect(dashboard.body.conflicts.find(
+      (item: { id: string }) => item.id === secondExclusiveClaimDenied.body.conflicts[0].id,
+    )).toMatchObject({ severity: "critical", decision: "deny" });
+
+    const deniedAgain = await auth(request(app).post("/api/leases").send({
+      title: "Ordinary blocked request",
+      autoClaim: true,
+      paths: ["Assets/Scenes/Shared.unity"],
+    }), bob.body.token);
+    expect(deniedAgain.body).toMatchObject({ acquired: false, decision: "deny" });
+    expect(deniedAgain.body.releaseRequests[0]).toMatchObject({ status: "pending" });
+    expect(deniedAgain.body.releaseRequests[0].id).not.toBe(ordinaryDenied.body.releaseRequests[0].id);
+    dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.releaseRequests).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: deniedAgain.body.releaseRequests[0].id, status: "pending" }),
+    ]));
   });
 
   it("keeps dashboard scan polling compact regardless of stored scan evidence", async () => {
@@ -1394,9 +1774,9 @@ describe("Agent Hub REST API", () => {
       maximumExclusiveLeaseMinutes: 60,
     }), owner.body.token);
     const session = await auth(request(app).post("/api/sessions").send({
-      clientVersion: "0.2.0",
-      protocolVersion: 1,
-      schemaVersion: 3,
+      clientVersion: AGENT_HUB_VERSION,
+      protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
     }), owner.body.token);
     const automatic = await auth(request(app).post("/api/leases").send({
       sessionId: session.body.session.id,
@@ -1422,7 +1802,11 @@ describe("Agent Hub REST API", () => {
     currentTime += 4 * 60_000;
     const heartbeat = await auth(request(app)
       .post(`/api/sessions/${session.body.session.id}/heartbeat`)
-      .send({ clientVersion: "0.2.0", protocolVersion: 1, schemaVersion: 3 }), owner.body.token);
+      .send({
+        clientVersion: AGENT_HUB_VERSION,
+        protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+        schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+      }), owner.body.token);
     expect(heartbeat.body.renewedLeases.map((lease: { id: string }) => lease.id)).toContain(automatic.body.lease.id);
     expect(heartbeat.body.renewedLeases.map((lease: { id: string }) => lease.id)).not.toContain(exclusive.body.lease.id);
     currentTime += 2 * 60_000;
@@ -1754,6 +2138,20 @@ describe("Agent Hub REST API", () => {
       historicalImpacts: [expect.objectContaining({ confidence: "exact" })],
       featureConfirmation: expect.objectContaining({ status: "pending" }),
     });
+    await auth(request(app).post("/api/room/settings").send({
+      blockingProtectionEnabled: false,
+    }), token);
+    const advisory = await auth(request(app).post("/api/edits/check").send(proposal), token);
+    expect(advisory.body).toMatchObject({
+      allowed: true,
+      blockers: [],
+      historicalImpacts: [expect.objectContaining({ confidence: "exact" })],
+      featureConfirmation: expect.objectContaining({ status: "pending" }),
+      warnings: [expect.objectContaining({ code: "feature_confirmation_required" })],
+    });
+    await auth(request(app).post("/api/room/settings").send({
+      blockingProtectionEnabled: true,
+    }), token);
 
     const missingDecision = await auth(
       request(app)
@@ -1890,11 +2288,20 @@ function createRoom(app: ReturnType<typeof createAgentHubApp>) {
     repository: "https://github.com/example/projectvanguard.git",
     defaultBranch: "develop",
     ownerName: "Alice",
+    clientVersion: AGENT_HUB_VERSION,
+    protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+    schemaVersion: AGENT_HUB_SCHEMA_VERSION,
   });
 }
 
 function joinRoom(app: ReturnType<typeof createAgentHubApp>, inviteCode: string, memberName: string) {
-  return request(app).post("/api/rooms/join").send({ inviteCode, memberName });
+  return request(app).post("/api/rooms/join").send({
+    inviteCode,
+    memberName,
+    clientVersion: AGENT_HUB_VERSION,
+    protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+    schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+  });
 }
 
 function createLease(

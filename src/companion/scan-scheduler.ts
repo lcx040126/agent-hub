@@ -5,6 +5,11 @@ import {
 } from "../desktop/connection-store.js";
 import type { SavedRoomConnection } from "../desktop/contracts.js";
 import { AGENT_HUB_SCAN_METADATA_MAX_LENGTH } from "../shared/limits.js";
+import {
+  AGENT_HUB_PROTOCOL_VERSION,
+  AGENT_HUB_SCHEMA_VERSION,
+  AGENT_HUB_VERSION,
+} from "../shared/version.js";
 import { AgentHubClient, AgentHubHttpError } from "./hub-client.js";
 import {
   IntegrationOperationTracker,
@@ -203,6 +208,9 @@ async function openScanSession(client: AgentHubClient, snapshot: RepositorySnaps
     worktree: snapshot.repository.root,
     baseCommit: snapshot.repository.headCommit,
     task: "Synchronize project structure and rules; external file changes stay local.",
+    clientVersion: AGENT_HUB_VERSION,
+    protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+    schemaVersion: AGENT_HUB_SCHEMA_VERSION,
     metadata: {
       source: "desktop-companion",
       repositoryFingerprint: snapshot.repository.fingerprint,

@@ -2,6 +2,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  AGENT_HUB_PROTOCOL_VERSION,
+  AGENT_HUB_SCHEMA_VERSION,
+  AGENT_HUB_VERSION,
+} from "../shared/version.js";
 import { startCodexSessionHeartbeatScheduler } from "./codex-session-heartbeat.js";
 import { CodexHookStateStore, type CodexHookSessionState } from "./hook-state.js";
 import { IntegrationOperationTracker } from "./integration-operations.js";
@@ -39,9 +44,9 @@ describe("Codex session heartbeat scheduler", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(requestUrl).toContain(`/api/sessions/${state.hubSessionId}/heartbeat`);
     expect(requestBody).toMatchObject({
-      clientVersion: "0.2.5",
-      protocolVersion: 1,
-      schemaVersion: 5,
+      clientVersion: AGENT_HUB_VERSION,
+      protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
       activityEpoch: 0,
     });
     expect(onError).not.toHaveBeenCalled();

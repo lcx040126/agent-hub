@@ -28,6 +28,7 @@ export interface PublicationBlocker {
 export interface PublicationGateEvaluation {
   allowed: boolean;
   blockers: PublicationBlocker[];
+  blockingProtectionEnabled: boolean | null;
 }
 
 export interface PublicationGateOptions {
@@ -60,7 +61,13 @@ export async function runPublicationGate(
   }
   if (!matchesSharedBranch(branch, sharedBranches)) {
     log(`Agent Hub 发布门禁：当前分支 \"${branch}\" 不是共享分支，跳过检查。`);
-    return { allowed: true, blockers: [], exitCode: 0, skipped: true };
+    return {
+      allowed: true,
+      blockers: [],
+      blockingProtectionEnabled: null,
+      exitCode: 0,
+      skipped: true,
+    };
   }
 
   const serviceUrl = normalizeServiceUrl(options.serviceUrl);
@@ -86,11 +93,34 @@ export async function runPublicationGate(
       Accept: "application/json",
       Authorization: `Bearer ${memberToken}`,
     };
-    const [dashboard, snapshot] = await Promise.all([
-      fetchJson(`${serviceUrl}/api/dashboard`, headers, signal, fetchImpl),
-      fetchJson(`${serviceUrl}/api/snapshot`, headers, signal, fetchImpl),
-    ]);
+    const dashboard = await fetchJson(`${serviceUrl}/api/dashboard`, headers, signal, fetchImpl);
+    let snapshot: unknown;
+    let snapshotError: string | undefined;
+    try {
+      snapshot = await fetchJson(`${serviceUrl}/api/snapshot`, headers, signal, fetchImpl);
+    } catch (caught) {
+      snapshotError = caught instanceof Error ? caught.message : "未知快照错误";
+    }
     const evaluation = evaluatePublicationGate(dashboard, snapshot);
+    if (snapshotError && evaluation.blockingProtectionEnabled !== false) {
+      error(
+        `Agent Hub 发布门禁失败：房间快照不可用（${snapshotError}），且写入阻塞保护未明确关闭。共享分支保持默认拒绝策略。`,
+      );
+      reportFindings(evaluation.blockers, error);
+      return { ...evaluation, allowed: false, exitCode: 2, skipped: false };
+    }
+    if (evaluation.blockingProtectionEnabled === null) {
+      error(
+        `Agent Hub 发布门禁失败：无法确认房间阻塞保护设置${snapshotError ? `（${snapshotError}）` : ""}。共享分支保持默认拒绝策略。`,
+      );
+      reportFindings(evaluation.blockers, error);
+      return { ...evaluation, allowed: false, exitCode: 2, skipped: false };
+    }
+    if (!evaluation.blockingProtectionEnabled) {
+      log(`Agent Hub 发布门禁：房间处于纯监测模式，以下发现仅报告，不阻止共享分支 \"${branch}\"：`);
+      reportFindings(evaluation.blockers, log);
+      return { ...evaluation, allowed: true, exitCode: 0, skipped: false };
+    }
     if (evaluation.allowed) {
       log(`Agent Hub 发布门禁通过：共享分支 \"${branch}\" 没有未解决的发布阻塞项。`);
       return { ...evaluation, exitCode: 0, skipped: false };
@@ -116,6 +146,13 @@ export function evaluatePublicationGate(
 ): PublicationGateEvaluation {
   const dashboard = asObject(dashboardValue);
   const snapshot = asObject(snapshotValue);
+  const snapshotSettings = asObject(snapshot.settings);
+  const dashboardSettings = asObject(dashboard.settings);
+  const blockingProtectionEnabled = typeof snapshotSettings.blockingProtectionEnabled === "boolean"
+    ? snapshotSettings.blockingProtectionEnabled
+    : typeof dashboardSettings.blockingProtectionEnabled === "boolean"
+      ? dashboardSettings.blockingProtectionEnabled
+      : null;
   const blockers = new Map<string, PublicationBlocker>();
 
   const records = newestByKey(
@@ -163,9 +200,8 @@ export function evaluatePublicationGate(
 
   for (const conflictValue of asArray(dashboard.conflicts)) {
     const conflict = asObject(conflictValue);
-    const severity = normalizedWord(conflict.severity);
     const decision = normalizedWord(conflict.decision);
-    if (!["critical", "blocking", "high"].includes(severity) && decision !== "deny") continue;
+    if (decision !== "deny") continue;
     putBlocker(blockers, {
       kind: "blocking_conflict",
       id: stableId(conflict, "conflict"),
@@ -181,7 +217,11 @@ export function evaluatePublicationGate(
   const values = [...blockers.values()].sort((left, right) =>
     `${left.kind}:${left.title}`.localeCompare(`${right.kind}:${right.title}`),
   );
-  return { allowed: values.length === 0, blockers: values };
+  return {
+    allowed: blockingProtectionEnabled === false || (blockingProtectionEnabled === true && values.length === 0),
+    blockers: values,
+    blockingProtectionEnabled,
+  };
 }
 
 export function matchesSharedBranch(branchValue: string, patterns: string[]): boolean {
@@ -279,7 +319,7 @@ const HELP_TEXT = `Agent Hub 共享分支发布门禁
   AGENT_HUB_SHARED_BRANCHES 逗号分隔的共享分支；默认 main,master,develop,development,release/*
 
 该命令不会安装或执行本地 commit Hook。仅在共享分支推送、合并或 CI 发布前调用。
-共享分支上服务不可达、令牌缺失或状态无法验证时默认拒绝发布。`;
+共享分支上服务不可达、令牌缺失或无法确认阻塞保护设置时默认拒绝发布。只有房间明确设置为纯监测模式时，才只报告发现并返回成功。`;
 
 async function fetchJson(
   url: string,
@@ -339,6 +379,19 @@ function blockerLabel(kind: PublicationBlockerKind): string {
   if (kind === "critical_risk") return "critical 风险";
   if (kind === "blocking_conflict") return "阻塞冲突";
   return "失败验证";
+}
+
+function reportFindings(
+  blockers: PublicationBlocker[],
+  report: (message: string) => void,
+): void {
+  if (blockers.length === 0) {
+    report("- 没有发现未解决的 critical 风险、deny 冲突或最新失败验证。");
+    return;
+  }
+  for (const blocker of blockers) {
+    report(`- [${blockerLabel(blocker.kind)}] ${blocker.title}：${blocker.summary}`);
+  }
 }
 
 function normalizeSharedBranches(values: string[] | undefined): string[] {
@@ -418,7 +471,13 @@ function nullableDisplayString(value: unknown): string | null {
 }
 
 function failedRun(exitCode: 1 | 2): PublicationGateRunResult {
-  return { allowed: false, blockers: [], exitCode, skipped: false };
+  return {
+    allowed: false,
+    blockers: [],
+    blockingProtectionEnabled: null,
+    exitCode,
+    skipped: false,
+  };
 }
 
 const entryPath = process.argv[1] ? resolve(process.argv[1]) : "";

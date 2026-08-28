@@ -260,7 +260,12 @@ export interface RoomSnapshot {
 }
 
 export interface EditIssue {
-  code: "uncovered_path" | "lease_conflict" | "feature_confirmation_required" | "session_write_blocked";
+  code:
+    | "uncovered_path"
+    | "lease_conflict"
+    | "feature_confirmation_required"
+    | "session_write_blocked"
+    | "coordination_warning";
   path: string;
   message: string;
   conflict?: LeaseConflict;

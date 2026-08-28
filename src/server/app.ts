@@ -773,7 +773,7 @@ function conflictResponse(conflict: ReturnType<AgentHubService["claimLease"]>["c
   const severity = conflict.severity === "blocking" ? "critical" : "warning";
   return {
     id: conflict.id,
-    title: conflict.severity === "blocking" ? "Exclusive scope overlap" : "Registered scope overlap",
+    title: conflict.severity === "blocking" ? "Critical scope risk" : "Registered scope overlap",
     summary: conflict.reason,
     severity,
     decision: conflict.decision,

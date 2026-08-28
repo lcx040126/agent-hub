@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -13,6 +13,11 @@ import { AgentHubDatabase } from "../server/db.js";
 import { FeatureMemoryStore } from "../server/feature-memory.js";
 import { AgentHubService } from "../server/service.js";
 import { ConnectionStore, type SecretProtector } from "../desktop/connection-store.js";
+import {
+  AGENT_HUB_PROTOCOL_VERSION,
+  AGENT_HUB_SCHEMA_VERSION,
+  AGENT_HUB_VERSION,
+} from "../shared/version.js";
 import { handleCodexHook, runCodexHook, type CodexHookInput, type RunCodexHookOptions } from "./codex-hook.js";
 import { CodexHookStateStore } from "./hook-state.js";
 import { IntegrationOperationTracker } from "./integration-operations.js";
@@ -102,12 +107,16 @@ describe("Codex hook integration", () => {
       const pathname = new URL(String(input)).pathname;
       if (pathname === "/api/sessions") {
         expect(JSON.parse(String(init?.body))).toMatchObject({
+          clientVersion: AGENT_HUB_VERSION,
+          protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+          schemaVersion: AGENT_HUB_SCHEMA_VERSION,
           codexSessionId: "reused-codex-session",
           activityEpoch: 0,
         });
         return jsonResponse({
           session: {
             id: "hub-reused",
+            status: "active",
             reused: true,
             currentTurnId: "turn-9",
             activityEpoch: 9,
@@ -115,7 +124,9 @@ describe("Codex hook integration", () => {
           },
         });
       }
-      if (pathname === "/api/snapshot") return jsonResponse({});
+      if (pathname === "/api/snapshot") {
+        return jsonResponse({ settings: { blockingProtectionEnabled: false } });
+      }
       if (pathname === "/api/features/query") return jsonResponse({ cards: [] });
       if (pathname.endsWith("/scan")) return jsonResponse({});
       throw new Error(`Unexpected request: ${pathname}`);
@@ -140,6 +151,7 @@ describe("Codex hook integration", () => {
         activityEpoch: 9,
         currentTurnId: "turn-9",
         pendingCompletion: { phase: "stopped", activityEpoch: 9, recordedAt: stoppedAt },
+        blockingProtectionEnabled: false,
     });
   }, 10_000);
 
@@ -225,13 +237,12 @@ describe("Codex hook integration", () => {
     expect(JSON.stringify(pathlessWrite)).toContain("缺少该会话的完整租约状态");
 
     const verifiedCommand = "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch";
-    await expect(handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+    const verifiedWrite = await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
       turn_id: turnId,
       tool_name: "apply_patch",
       tool_input: { command: verifiedCommand },
-    }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
-    });
+    }));
+    expect(verifiedWrite?.hookSpecificOutput).not.toMatchObject({ permissionDecision: "deny" });
     await expect(stateStore.load(fixture.sessionId)).resolves.toMatchObject({
       leaseAttributionComplete: false,
     });
@@ -403,7 +414,7 @@ describe("Codex hook integration", () => {
     });
   }, 20_000);
 
-  it("denies the stale-epoch write when its authoritative retry goes offline", async () => {
+  it("warns and allows the stale-epoch write when its authoritative retry goes offline", async () => {
     const fixture = await createConnectedHookFixture("prompt-retry-offline", "prompt-retry-offline-session");
     let prepareAttempts = 0;
     const fetchImpl = vi.fn<typeof fetch>(async (request, init) => {
@@ -415,6 +426,16 @@ describe("Codex hook integration", () => {
       }
       if (pathname === "/api/edits/prepare") {
         prepareAttempts += 1;
+        if (prepareAttempts === 1) {
+          return new Response(JSON.stringify({
+            error: "stale_activity_epoch",
+            message: "The first monitor-only check used a stale activity epoch.",
+            details: { currentActivityEpoch: 1 },
+          }), {
+            status: 409,
+            headers: { "content-type": "application/json" },
+          });
+        }
         if (prepareAttempts === 2) {
           return new Response(JSON.stringify({
             error: "rate_limited",
@@ -433,6 +454,10 @@ describe("Codex hook integration", () => {
     await handleCodexHook(options("SessionStart"), fixture.input("SessionStart", {
       source: "startup",
     }));
+    fixture.service.updateRoomSettings({
+      memberToken: fixture.room.memberToken,
+      blockingProtectionEnabled: false,
+    });
     await handleCodexHook(options("UserPromptSubmit"), fixture.input("UserPromptSubmit", {
       turn_id: "retry-offline-real-turn",
     }));
@@ -455,15 +480,15 @@ describe("Codex hook integration", () => {
       stdin: Readable.from([JSON.stringify(hookInput)]),
       stdout,
     })).resolves.toBe(0);
-    const denied = JSON.parse(output) as Record<string, unknown>;
-    expect(denied).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "deny" },
+    const allowed = JSON.parse(output) as Record<string, unknown>;
+    expect(allowed).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
     });
-    expect(JSON.stringify(denied)).toContain("权威恢复未能完整完成");
+    expect(JSON.stringify(allowed)).toContain("权威恢复未完成");
     expect(prepareAttempts).toBe(2);
   }, 20_000);
 
-  it("denies through the real Hook entry when stale-epoch session recovery returns 503", async () => {
+  it("warns and allows through the real Hook entry when stale-epoch session recovery returns 503", async () => {
     const fixture = await createConnectedHookFixture("prompt-recovery-503", "prompt-recovery-503-session");
     const fetchImpl = vi.fn<typeof fetch>(async (request, init) => {
       const pathname = new URL(request instanceof Request ? request.url : String(request)).pathname;
@@ -471,6 +496,16 @@ describe("Codex hook integration", () => {
       const metadata = body.metadata as Record<string, unknown> | undefined;
       if (pathname === "/api/sessions" && metadata?.event === "UserPromptSubmit") {
         throw new TypeError("prompt registration offline");
+      }
+      if (pathname === "/api/edits/prepare") {
+        return new Response(JSON.stringify({
+          error: "stale_activity_epoch",
+          message: "The monitor-only check used a stale activity epoch.",
+          details: { currentActivityEpoch: 1 },
+        }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
       }
       if (pathname === "/api/sessions" && metadata?.event === "stale_activity_epoch_recovery") {
         return new Response(JSON.stringify({
@@ -486,6 +521,10 @@ describe("Codex hook integration", () => {
     const options = (eventName: RunCodexHookOptions["eventName"]) =>
       fixture.options(eventName, fetchImpl);
     await handleCodexHook(options("SessionStart"), fixture.input("SessionStart", { source: "startup" }));
+    fixture.service.updateRoomSettings({
+      memberToken: fixture.room.memberToken,
+      blockingProtectionEnabled: false,
+    });
     await handleCodexHook(options("UserPromptSubmit"), fixture.input("UserPromptSubmit", {
       turn_id: "recovery-503-real-turn",
     }));
@@ -510,9 +549,9 @@ describe("Codex hook integration", () => {
       stdout,
     })).resolves.toBe(0);
     expect(JSON.parse(output)).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "deny" },
+      hookSpecificOutput: { permissionDecision: "allow" },
     });
-    expect(output).toContain("权威恢复未能完整完成");
+    expect(output).toContain("权威恢复未完成");
   }, 20_000);
 
   it("resumes pending completion for a new prompt without a second epoch advance", async () => {
@@ -1418,7 +1457,7 @@ describe("Codex hook integration", () => {
       const pathname = new URL(String(input)).pathname;
       if (pathname === "/api/sessions") {
         await new Promise<void>((resolve) => { releaseSession = resolve; });
-        return jsonResponse({ session: { id: "late-session" } });
+        return jsonResponse({ session: { id: "late-session", status: "active" } });
       }
       if (pathname.endsWith("/scan")) return jsonResponse({ scan: { id: "scan-a" } });
       if (pathname === "/api/snapshot") return jsonResponse({});
@@ -1615,12 +1654,12 @@ describe("Codex hook integration", () => {
     expect(JSON.parse(output)).toMatchObject({
       hookSpecificOutput: {
         permissionDecision: "allow",
-        additionalContext: expect.stringContaining("本次操作不会因网络故障被阻止"),
+        additionalContext: expect.stringContaining("不会被 Agent Hub 阻止"),
       },
     });
   }, 10_000);
 
-  it("denies a new write until resume is confirmed and preserves a following Stop", async () => {
+  it("allows an unconfirmed monitor-mode generation and preserves a following Stop", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-resume-unconfirmed-"));
     temporaryDirectories.push(root);
     const repository = path.join(root, "repository");
@@ -1662,7 +1701,13 @@ describe("Codex hook integration", () => {
       openedAt: "2026-08-27T00:00:00.000Z",
       updatedAt: "2026-08-27T00:00:00.000Z",
     });
-    const fetchImpl = vi.fn<typeof fetch>(async () => { throw new TypeError("fetch failed"); });
+    const fetchImpl = vi.fn<typeof fetch>(async (request) => {
+      const pathname = new URL(String(request)).pathname;
+      if (pathname === "/api/room/settings") {
+        return jsonResponse({ settings: { blockingProtectionEnabled: false } });
+      }
+      throw new TypeError("fetch failed");
+    });
     const sharedOptions = { userDataPath, protector, fetchImpl };
     const pre = await handleCodexHook({
       ...sharedOptions,
@@ -1676,7 +1721,7 @@ describe("Codex hook integration", () => {
       tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
     });
     expect(pre).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "deny" },
+      hookSpecificOutput: { permissionDecision: "allow" },
     });
     const resuming = (await stateStore.load("resume-unconfirmed-session"))!;
     expect(resuming.pendingCompletion).toMatchObject({
@@ -1750,6 +1795,9 @@ describe("Codex hook integration", () => {
     const stopRelease = new Promise<void>((resolve) => { releaseStop = resolve; });
     const fetchImpl = vi.fn<typeof fetch>(async (request) => {
       const pathname = new URL(String(request)).pathname;
+      if (pathname === "/api/room/settings") {
+        return jsonResponse({ settings: { blockingProtectionEnabled: true } });
+      }
       if (pathname.endsWith("/stop")) {
         signalStopEntered();
         await stopRelease;
@@ -1791,7 +1839,7 @@ describe("Codex hook integration", () => {
       tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
     });
     await expect(stop).resolves.toEqual({ continue: true });
-    expect(pre).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    expect(pre?.hookSpecificOutput).not.toMatchObject({ permissionDecision: "deny" });
     await expect(stateStore.load("stop-pre-race-session")).resolves.toMatchObject({
       activityEpoch: 1,
       currentTurnId: "turn-new",
@@ -1930,6 +1978,9 @@ describe("Codex hook integration", () => {
     const prepareRelease = new Promise<void>((resolve) => { releasePrepare = resolve; });
     const fetchImpl = vi.fn<typeof fetch>(async (request) => {
       const pathname = new URL(String(request)).pathname;
+      if (pathname === "/api/room/settings") {
+        return jsonResponse({ settings: { blockingProtectionEnabled: true } });
+      }
       if (pathname === "/api/edits/prepare") {
         signalPrepareEntered();
         await prepareRelease;
@@ -2930,6 +2981,448 @@ describe("Codex hook integration", () => {
       expect.objectContaining({ kind: "path", path: "src/value.ts" }),
     ]));
   }, 30_000);
+
+  it("keeps monitor-mode red overlaps advisory and blocks only another member's manual exclusive", async () => {
+    const fixture = await createConnectedHookFixture("monitor-exclusive", "monitor-exclusive-session");
+    const options = (eventName: RunCodexHookOptions["eventName"]) => fixture.options(eventName);
+    await handleCodexHook(options("SessionStart"), fixture.input("SessionStart", {
+      source: "startup",
+      turn_id: "monitor-turn",
+    }));
+    const bob = fixture.service.joinRoom({
+      roomToken: fixture.room.roomToken,
+      displayName: "Bob",
+      agent: "Codex",
+      clientVersion: AGENT_HUB_VERSION,
+      protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+    });
+    fixture.service.updateRoomSettings({
+      memberToken: fixture.room.memberToken,
+      blockingProtectionEnabled: false,
+      riskRules: [{ kind: "extension", selector: ".ts", level: "blocking" }],
+    });
+    expect(fixture.service.claimLease({
+      memberToken: bob.memberToken,
+      title: "Bob standard TypeScript scope",
+      kind: "standard",
+      paths: ["src/value.ts"],
+      mode: "write",
+    }).acquired).toBe(true);
+
+    const redWarning = await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      turn_id: "monitor-turn",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+    }));
+    expect(redWarning).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    expect(JSON.stringify(redWarning)).toContain("提醒");
+    await writeFile(path.join(fixture.repository, "src", "value.ts"), "export const value = 2;\n", "utf8");
+    const redWarningPost = await handleCodexHook(options("PostToolUse"), fixture.input("PostToolUse", {
+      turn_id: "monitor-turn",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+    }));
+    expect(redWarningPost).not.toMatchObject({ continue: false });
+
+    expect(fixture.service.claimLease({
+      memberToken: bob.memberToken,
+      title: "Bob manual exclusive scene",
+      kind: "exclusive",
+      ttlMinutes: 30,
+      paths: ["Assets/Scenes/Main.unity"],
+      mode: "write",
+    }).acquired).toBe(true);
+    const exclusivePre = await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      turn_id: "monitor-turn",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: Assets/Scenes/Main.unity\n*** End Patch" },
+    }));
+    expect(exclusivePre).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    await writeFile(path.join(fixture.repository, "Assets", "Scenes", "Main.unity"), "%YAML 1.2\n", "utf8");
+    const exclusivePost = await handleCodexHook(options("PostToolUse"), fixture.input("PostToolUse", {
+      turn_id: "monitor-turn",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: Assets/Scenes/Main.unity\n*** End Patch" },
+    }));
+    expect(exclusivePost).toMatchObject({ continue: false });
+
+    expect(fixture.service.claimLease({
+      memberToken: fixture.room.memberToken,
+      title: "Alice own manual exclusive",
+      kind: "exclusive",
+      ttlMinutes: 30,
+      paths: ["src/foo.ts"],
+      mode: "write",
+    }).acquired).toBe(true);
+    const ownExclusive = await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      turn_id: "monitor-turn",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/foo.ts\n*** End Patch" },
+    }));
+    expect(ownExclusive?.hookSpecificOutput).not.toMatchObject({ permissionDecision: "deny" });
+  }, 30_000);
+
+  it("keeps normal Stop and SessionEnd shared-context finalization in monitor-only mode", async () => {
+    const fixture = await createConnectedHookFixture("monitor-finalization", "monitor-finalization-session");
+    const options = (eventName: RunCodexHookOptions["eventName"]) => fixture.options(eventName);
+    await handleCodexHook(options("SessionStart"), fixture.input("SessionStart", {
+      source: "startup",
+      turn_id: "monitor-finalization-turn",
+    }));
+    const stateStore = new CodexHookStateStore(fixture.userDataPath);
+    const hookSessionId = (await stateStore.load(fixture.sessionId))!.hubSessionId;
+    fixture.service.updateRoomSettings({
+      memberToken: fixture.room.memberToken,
+      blockingProtectionEnabled: false,
+    });
+
+    const command = "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch";
+    const beforeWrite = await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      turn_id: "monitor-finalization-turn",
+      tool_name: "apply_patch",
+      tool_input: { command },
+    }));
+    expect(beforeWrite?.hookSpecificOutput).not.toMatchObject({ permissionDecision: "deny" });
+    await writeFile(path.join(fixture.repository, "src", "value.ts"), "export const value = 2;\n", "utf8");
+    const afterWrite = await handleCodexHook(options("PostToolUse"), fixture.input("PostToolUse", {
+      turn_id: "monitor-finalization-turn",
+      tool_name: "apply_patch",
+      tool_input: { command },
+    }));
+    expect(afterWrite).not.toMatchObject({ continue: false });
+
+    await expect(handleCodexHook(
+      options("Stop"),
+      fixture.input("Stop", { turn_id: "monitor-finalization-turn" }),
+    )).resolves.toEqual({ continue: true });
+    await handleCodexHook(
+      options("SessionEnd"),
+      fixture.input("SessionEnd", { reason: "other" }),
+    );
+    const connectionStore = new ConnectionStore(
+      path.join(fixture.userDataPath, "connections.json"),
+      protector,
+    );
+    const finalizer = startSessionEndFinalizationWorker({
+      userDataPath: fixture.userDataPath,
+      store: connectionStore,
+      intervalMs: 60_000,
+    });
+    await finalizer.scanNow();
+    await finalizer.stop();
+
+    expect(fixture.service.listRoomSessions(fixture.room.memberToken).sessions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: hookSessionId, status: "closed" })]),
+    );
+    const sharedRevision = new FeatureMemoryStore(fixture.service.database).query({
+      roomId: fixture.room.room.id,
+      memberId: fixture.room.member.id,
+      memberName: fixture.room.member.displayName,
+      defaultBranch: fixture.room.room.defaultBranch,
+    }, {
+      memberToken: fixture.room.memberToken,
+      level: "detail",
+      paths: ["src/value.ts"],
+      statuses: ["draft", "candidate", "current", "conflict", "superseded", "deprecated"],
+      limit: 20,
+    }).details.find((revision) =>
+      revision.sourceSessionId === hookSessionId
+      && revision.targets.some((target) => target.path === "src/value.ts"));
+    expect(sharedRevision).toBeDefined();
+  }, 30_000);
+
+  it("rechecks the authoritative mode before downgrading a server denial", async () => {
+    const fixture = await createConnectedHookFixture("monitor-mode-race", "monitor-mode-race-session");
+    await handleCodexHook(fixture.options("SessionStart"), fixture.input("SessionStart", {
+      source: "startup",
+      turn_id: "monitor-mode-race-turn",
+    }));
+    fixture.service.updateRoomSettings({
+      memberToken: fixture.room.memberToken,
+      blockingProtectionEnabled: false,
+    });
+
+    const deniedPrepare = {
+      check: {
+        allowed: false,
+        blockers: [{
+          code: "lease_conflict",
+          path: "src/value.ts",
+          message: "Protection mode denied a standard overlap.",
+          conflict: {
+            decision: "deny",
+            severity: "critical",
+            existingLeaseKind: "standard",
+            memberId: "member-bob",
+            memberName: "Bob",
+          },
+        }],
+        warnings: [],
+        coveredPaths: [],
+        uncoveredPaths: ["src/value.ts"],
+      },
+      claim: {
+        acquired: false,
+        decision: "deny",
+        conflicts: [{
+          decision: "deny",
+          severity: "critical",
+          existingLeaseKind: "standard",
+          memberId: "member-bob",
+          memberName: "Bob",
+          requestedPath: "src/value.ts",
+          conflictingPath: "src/value.ts",
+        }],
+      },
+    };
+    const raceFetch = (
+      initialMode: boolean,
+      refreshedMode: boolean | "offline",
+      prepareError = false,
+    ) => {
+      let settingsReads = 0;
+      const fetchImpl = vi.fn<typeof fetch>(async (request, init) => {
+        const pathname = new URL(request instanceof Request ? request.url : String(request)).pathname;
+        if (pathname === "/api/room/settings") {
+          settingsReads += 1;
+          if (settingsReads === 1) {
+            return jsonResponse({ settings: { blockingProtectionEnabled: initialMode } });
+          }
+          if (refreshedMode === "offline") throw new TypeError("settings recheck offline");
+          return jsonResponse({ settings: { blockingProtectionEnabled: refreshedMode } });
+        }
+        if (pathname === "/api/edits/prepare") {
+          if (prepareError) {
+            return new Response(JSON.stringify({
+              error: "authorization_changed",
+              message: "Authorization changed during the write check.",
+            }), { status: 401, headers: { "content-type": "application/json" } });
+          }
+          return jsonResponse(deniedPrepare);
+        }
+        return fetch(request, init);
+      });
+      return { fetchImpl, settingsReads: () => settingsReads };
+    };
+    const writeInput = (eventName: "PreToolUse" | "PostToolUse") => fixture.input(eventName, {
+      turn_id: "monitor-mode-race-turn",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+    });
+
+    const switchedPreFetch = raceFetch(false, true);
+    const switchedPre = await handleCodexHook(
+      fixture.options("PreToolUse", switchedPreFetch.fetchImpl),
+      writeInput("PreToolUse"),
+    );
+    expect(switchedPre).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    expect(switchedPreFetch.settingsReads()).toBe(2);
+
+    const unchangedPreFetch = raceFetch(false, false);
+    const unchangedPre = await handleCodexHook(
+      fixture.options("PreToolUse", unchangedPreFetch.fetchImpl),
+      writeInput("PreToolUse"),
+    );
+    expect(unchangedPre).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    expect(unchangedPreFetch.settingsReads()).toBe(2);
+
+    const offlinePreFetch = raceFetch(false, "offline");
+    const offlinePre = await handleCodexHook(
+      fixture.options("PreToolUse", offlinePreFetch.fetchImpl),
+      writeInput("PreToolUse"),
+    );
+    expect(offlinePre).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    expect(offlinePreFetch.settingsReads()).toBe(2);
+
+    const disabledPreFetch = raceFetch(true, false);
+    const disabledPre = await handleCodexHook(
+      fixture.options("PreToolUse", disabledPreFetch.fetchImpl),
+      writeInput("PreToolUse"),
+    );
+    expect(disabledPre).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    expect(disabledPreFetch.settingsReads()).toBe(2);
+
+    const disabledAfterErrorFetch = raceFetch(true, false, true);
+    const disabledAfterError = await handleCodexHook(
+      fixture.options("PreToolUse", disabledAfterErrorFetch.fetchImpl),
+      writeInput("PreToolUse"),
+    );
+    expect(disabledAfterError).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    expect(disabledAfterErrorFetch.settingsReads()).toBe(2);
+
+    await writeFile(path.join(fixture.repository, "src", "value.ts"), "export const value = 2;\n", "utf8");
+    const switchedPostFetch = raceFetch(false, true);
+    const switchedPost = await handleCodexHook(
+      fixture.options("PostToolUse", switchedPostFetch.fetchImpl),
+      writeInput("PostToolUse"),
+    );
+    expect(switchedPost).toMatchObject({ continue: false });
+    expect(switchedPostFetch.settingsReads()).toBe(2);
+
+    await writeFile(path.join(fixture.repository, "src", "value.ts"), "export const value = 3;\n", "utf8");
+    const disabledPostFetch = raceFetch(true, false);
+    const disabledPost = await handleCodexHook(
+      fixture.options("PostToolUse", disabledPostFetch.fetchImpl),
+      writeInput("PostToolUse"),
+    );
+    expect(disabledPost).not.toMatchObject({ continue: false });
+    expect(disabledPostFetch.settingsReads()).toBe(2);
+
+    await writeFile(path.join(fixture.repository, "src", "value.ts"), "export const value = 4;\n", "utf8");
+    const offlinePostFetch = raceFetch(false, "offline");
+    const offlinePost = await handleCodexHook(
+      fixture.options("PostToolUse", offlinePostFetch.fetchImpl),
+      writeInput("PostToolUse"),
+    );
+    expect(offlinePost).not.toMatchObject({ continue: false });
+    expect(offlinePostFetch.settingsReads()).toBe(2);
+  }, 30_000);
+
+  it("fails open across monitor-mode local fences, server errors, overflow, and damaged state", async () => {
+    const fixture = await createConnectedHookFixture("monitor-fail-open", "monitor-fail-open-session");
+    const options = (eventName: RunCodexHookOptions["eventName"], fetchImpl?: typeof fetch) =>
+      fixture.options(eventName, fetchImpl);
+    await handleCodexHook(options("SessionStart"), fixture.input("SessionStart", {
+      source: "startup",
+      turn_id: "monitor-fail-open-turn",
+    }));
+    fixture.service.updateRoomSettings({
+      memberToken: fixture.room.memberToken,
+      blockingProtectionEnabled: false,
+    });
+    const stateStore = new CodexHookStateStore(fixture.userDataPath);
+
+    const pathless = await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      turn_id: "monitor-fail-open-turn",
+      tool_name: "Bash",
+      tool_input: { command: "pnpm run generate" },
+    }));
+    expect(pathless).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+
+    const tooManyPatch = [
+      "*** Begin Patch",
+      ...Array.from({ length: 101 }, (_, index) => `*** Add File: src/generated-${index}.ts`),
+      "*** End Patch",
+    ].join("\n");
+    const overflowPre = await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      turn_id: "monitor-fail-open-turn",
+      tool_name: "apply_patch",
+      tool_input: { command: tooManyPatch },
+    }));
+    expect(overflowPre).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    expect(JSON.stringify(overflowPre)).toContain("101");
+
+    await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      turn_id: "monitor-fail-open-turn",
+      tool_name: "Bash",
+      tool_input: { command: "pnpm run generate" },
+    }));
+    await Promise.all(Array.from({ length: 101 }, (_, index) =>
+      writeFile(path.join(fixture.repository, "src", `overflow-${index}.ts`), `export const n = ${index};\n`, "utf8")));
+    const overflowPost = await handleCodexHook(options("PostToolUse"), fixture.input("PostToolUse", {
+      turn_id: "monitor-fail-open-turn",
+      tool_name: "Bash",
+      tool_input: { command: "pnpm run generate" },
+    }));
+    expect(overflowPost).not.toMatchObject({ continue: false });
+    expect(JSON.stringify(overflowPost)).toContain("超过 100 个路径");
+
+    const branchFetch = vi.fn<typeof fetch>((request, init) => {
+      const pathname = new URL(request instanceof Request ? request.url : String(request)).pathname;
+      if (pathname === "/api/edits/prepare") {
+        return Promise.resolve(new Response(JSON.stringify({
+          error: "branch_changed",
+          message: "Branch changed during monitor check.",
+        }), { status: 409, headers: { "content-type": "application/json" } }));
+      }
+      return fetch(request, init);
+    });
+    const branchWarning = await handleCodexHook(options("PreToolUse", branchFetch), fixture.input("PreToolUse", {
+      turn_id: "monitor-fail-open-turn",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/foo.ts\n*** End Patch" },
+    }));
+    expect(branchWarning).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+
+    const staleFetch = vi.fn<typeof fetch>((request, init) => {
+      const pathname = new URL(request instanceof Request ? request.url : String(request)).pathname;
+      if (pathname === "/api/edits/prepare") {
+        return Promise.resolve(new Response(JSON.stringify({
+          error: "stale_activity_epoch",
+          message: "Stale monitor epoch.",
+          details: { currentActivityEpoch: 4 },
+        }), { status: 409, headers: { "content-type": "application/json" } }));
+      }
+      return fetch(request, init);
+    });
+    const staleWarning = await handleCodexHook(options("PreToolUse", staleFetch), fixture.input("PreToolUse", {
+      turn_id: "monitor-fail-open-turn",
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/protected.ts\n*** End Patch" },
+    }));
+    expect(staleWarning).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+
+    const stateBeforeFence = (await stateStore.load(fixture.sessionId))!;
+    await new TurnCompletionQueueStore(fixture.userDataPath).enqueue({
+      operationId: "monitor-stop-fence",
+      turnId: stateBeforeFence.currentTurnId ?? "monitor-fail-open-turn",
+      activityEpoch: stateBeforeFence.activityEpoch ?? 0,
+      state: stateBeforeFence,
+    });
+    const stopFenceWarning = await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      turn_id: stateBeforeFence.currentTurnId,
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+    }));
+    expect(stopFenceWarning).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+
+    for (const status of [401, 409]) {
+      const settingsFailure = vi.fn<typeof fetch>(async (request, init) => {
+        const pathname = new URL(request instanceof Request ? request.url : String(request)).pathname;
+        if (pathname === "/api/room/settings") {
+          return new Response(JSON.stringify({ error: "settings_unavailable", message: `settings ${status}` }), {
+            status,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return fetch(request, init);
+      });
+      const allowed = await handleCodexHook(options("PreToolUse", settingsFailure), fixture.input("PreToolUse", {
+        turn_id: "monitor-fail-open-turn",
+        tool_name: "apply_patch",
+        tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+      }));
+      expect(allowed).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    }
+
+    const [stateFile] = await readdir(stateStore.directory);
+    await writeFile(path.join(stateStore.directory, stateFile!), "{not-json", "utf8");
+    const damagedPre = await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+    }));
+    expect(damagedPre).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    const damagedPost = await handleCodexHook(options("PostToolUse"), fixture.input("PostToolUse", {
+      tool_name: "apply_patch",
+      tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
+    }));
+    expect(damagedPost).not.toMatchObject({ continue: false });
+  }, 40_000);
 });
 
 async function createConnectedHookFixture(prefix: string, sessionId: string) {
@@ -2951,6 +3444,9 @@ async function createConnectedHookFixture(prefix: string, sessionId: string) {
     defaultBranch: "main",
     hostName: "Alice",
     hostAgent: "Codex",
+    clientVersion: AGENT_HUB_VERSION,
+    protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+    schemaVersion: AGENT_HUB_SCHEMA_VERSION,
   });
   const server = createAgentHubApp({ database, service }).listen(0, "127.0.0.1");
   servers.push(server);

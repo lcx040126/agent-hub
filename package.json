@@ -1,12 +1,12 @@
 {
   "name": "agent-hub",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "private": true,
   "type": "module",
   "main": "dist/desktop/main.js",
   "description": "A shared coordination room for coding agents and their teams.",
   "agentHub": {
-    "protocolVersion": 1,
+    "protocolVersion": 2,
     "schemaVersion": 5,
     "minimumSourceProtocolVersion": 1,
     "minimumSourceSchemaVersion": 2

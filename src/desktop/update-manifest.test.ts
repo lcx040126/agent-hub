@@ -1,6 +1,7 @@
 import { generateKeyPairSync, sign } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import packageMetadata from "../../package.json" with { type: "json" };
 import {
   UPDATE_SIGNING_PUBLIC_KEY_PEM,
   verifyDesktopUpdateManifest,
@@ -25,6 +26,40 @@ describe("signed desktop update manifest", () => {
       currentSchemaVersion: 2,
     })).toMatchObject({
       manifest: { version: "0.3.0", asset: { fileName: "AgentHub-Setup-0.3.0-x64.exe" } },
+    });
+  });
+
+  it("keeps the v0.2.6 manifest compatible with an in-place v0.2.5 upgrade", () => {
+    expect(packageMetadata).toMatchObject({
+      version: "0.2.6",
+      agentHub: {
+        protocolVersion: 2,
+        schemaVersion: 5,
+        minimumSourceProtocolVersion: 1,
+      },
+    });
+    const value = manifest();
+    value.version = packageMetadata.version;
+    value.protocolVersion = packageMetadata.agentHub.protocolVersion;
+    value.minimumSourceProtocolVersion = packageMetadata.agentHub.minimumSourceProtocolVersion;
+    value.schemaVersion = packageMetadata.agentHub.schemaVersion;
+    value.minimumSourceSchemaVersion = packageMetadata.agentHub.minimumSourceSchemaVersion;
+    value.asset.fileName = `AgentHub-Setup-${packageMetadata.version}-x64.exe`;
+    value.asset.url = `https://github.com/lcx040126/agent-hub/releases/download/v${packageMetadata.version}/${value.asset.fileName}`;
+    const signed = signedManifest(value);
+
+    expect(verifyDesktopUpdateManifest(signed.bytes, signed.signature, {
+      publicKeyPem,
+      currentVersion: "0.2.5",
+      currentProtocolVersion: 1,
+      currentSchemaVersion: 5,
+    })).toMatchObject({
+      manifest: {
+        version: "0.2.6",
+        protocolVersion: 2,
+        schemaVersion: 5,
+        minimumSourceProtocolVersion: 1,
+      },
     });
   });
 

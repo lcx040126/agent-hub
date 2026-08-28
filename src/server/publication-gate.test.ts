@@ -57,9 +57,17 @@ describe("publication gate", () => {
             title: "Scene is occupied",
             summary: "Raid.unity has an active exclusive lease.",
           },
+          {
+            id: "conflict-high-warning",
+            severity: "blocking",
+            decision: "warn",
+            title: "Scene overlap is high risk",
+            summary: "Monitor the overlap without blocking publication.",
+          },
         ],
       },
       {
+        settings: { blockingProtectionEnabled: true },
         verifications: [
           {
             id: "verification-pass",
@@ -88,6 +96,204 @@ describe("publication gate", () => {
     ]);
     expect(evaluation.blockers.some((blocker) => blocker.kind === "critical_risk")).toBe(false);
     expect(evaluation.blockers.some((blocker) => blocker.id === "verification-fail")).toBe(false);
+    expect(evaluation.blockers.some((blocker) => blocker.id === "conflict-high-warning")).toBe(false);
+    expect(evaluation.blockingProtectionEnabled).toBe(true);
+  });
+
+  it("reports findings without blocking only when protection is explicitly disabled", () => {
+    const dashboard = {
+      records: [{
+        id: "risk-critical",
+        kind: "risk",
+        title: "Save migration",
+        summary: "Old saves can be lost.",
+        status: "critical",
+      }],
+      conflicts: [{
+        id: "denied-conflict",
+        severity: "warning",
+        decision: "deny",
+        title: "Explicit denial",
+        summary: "The decision, not the color, blocks.",
+      }],
+    };
+
+    expect(evaluatePublicationGate(dashboard, {
+      settings: { blockingProtectionEnabled: false },
+      verifications: [],
+    })).toMatchObject({
+      allowed: true,
+      blockingProtectionEnabled: false,
+      blockers: [{ kind: "blocking_conflict", id: "denied-conflict" }, { kind: "critical_risk" }],
+    });
+    expect(evaluatePublicationGate(dashboard, { verifications: [] })).toMatchObject({
+      allowed: false,
+      blockingProtectionEnabled: null,
+      blockers: expect.arrayContaining([
+        expect.objectContaining({ id: "denied-conflict" }),
+        expect.objectContaining({ id: "risk-critical" }),
+      ]),
+    });
+  });
+
+  it("exits successfully after reporting findings in monitor-only mode", async () => {
+    const messages: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      const body = url.endsWith("/api/snapshot")
+        ? { settings: { blockingProtectionEnabled: false }, verifications: [] }
+        : {
+            records: [],
+            conflicts: [{
+              id: "conflict-1",
+              severity: "blocking",
+              decision: "deny",
+              title: "Exclusive scope",
+              summary: "The holder has not approved release.",
+            }],
+          };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const result = await runPublicationGate({
+      branch: "develop",
+      serviceUrl: "http://127.0.0.1:4173",
+      memberToken: "secret",
+      fetchImpl,
+      log: (message) => messages.push(message),
+    });
+
+    expect(result).toMatchObject({
+      allowed: true,
+      exitCode: 0,
+      skipped: false,
+      blockingProtectionEnabled: false,
+      blockers: [{ id: "conflict-1" }],
+    });
+    expect(messages.join("\n")).toContain("纯监测模式");
+    expect(messages.join("\n")).toContain("Exclusive scope");
+  });
+
+  it("uses an explicit dashboard monitor-mode setting when the snapshot endpoint is unavailable", async () => {
+    const messages: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      if (String(input).endsWith("/api/snapshot")) {
+        return new Response(JSON.stringify({ message: "Endpoint not found." }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        settings: { blockingProtectionEnabled: false },
+        records: [{
+          id: "risk-critical",
+          kind: "risk",
+          title: "Migration risk",
+          summary: "Needs review.",
+          status: "critical",
+        }],
+        conflicts: [],
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const result = await runPublicationGate({
+      branch: "main",
+      serviceUrl: "http://127.0.0.1:4173",
+      memberToken: "secret",
+      fetchImpl,
+      log: (message) => messages.push(message),
+      error: (message) => messages.push(message),
+    });
+
+    expect(result).toMatchObject({
+      allowed: true,
+      exitCode: 0,
+      blockingProtectionEnabled: false,
+      blockers: [{ id: "risk-critical" }],
+    });
+    expect(messages.join("\n")).toContain("纯监测模式");
+    expect(messages.join("\n")).toContain("Migration risk");
+  });
+
+  it("keeps the default-deny policy when protection is enabled but the snapshot is unavailable", async () => {
+    const errors: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      if (String(input).endsWith("/api/snapshot")) {
+        return new Response(JSON.stringify({ message: "Endpoint not found." }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        settings: { blockingProtectionEnabled: true },
+        records: [{
+          id: "risk-critical",
+          kind: "risk",
+          title: "Migration risk",
+          summary: "Needs review.",
+          status: "critical",
+        }],
+        conflicts: [],
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const result = await runPublicationGate({
+      branch: "main",
+      serviceUrl: "http://127.0.0.1:4173",
+      memberToken: "secret",
+      fetchImpl,
+      log: () => undefined,
+      error: (message) => errors.push(message),
+    });
+
+    expect(result).toMatchObject({
+      allowed: false,
+      exitCode: 2,
+      blockingProtectionEnabled: true,
+      blockers: [{ id: "risk-critical" }],
+    });
+    expect(errors.join("\n")).toContain("房间快照不可用");
+    expect(errors.join("\n")).toContain("默认拒绝策略");
+    expect(errors.join("\n")).toContain("Migration risk");
+  });
+
+  it("keeps the default-deny policy when neither response exposes the setting", async () => {
+    const errors: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      const body = String(input).endsWith("/api/snapshot")
+        ? { verifications: [] }
+        : { records: [], conflicts: [] };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const result = await runPublicationGate({
+      branch: "main",
+      serviceUrl: "http://127.0.0.1:4173",
+      memberToken: "secret",
+      fetchImpl,
+      log: () => undefined,
+      error: (message) => errors.push(message),
+    });
+
+    expect(result).toMatchObject({
+      allowed: false,
+      exitCode: 2,
+      blockingProtectionEnabled: null,
+    });
+    expect(errors.join("\n")).toContain("无法确认房间阻塞保护设置");
+    expect(errors.join("\n")).toContain("默认拒绝策略");
   });
 
   it("skips non-shared branches without contacting the room service", async () => {

@@ -80,6 +80,13 @@ export interface HookExternalChangeDiagnostic {
   detectedAt: string;
 }
 
+export interface HookAdvisoryDiagnostic {
+  source: "quarantine" | "passive_wait" | "write_block_sync" | "blocked_lease";
+  reason: string;
+  paths: string[];
+  detectedAt: string;
+}
+
 export interface HookPendingCompletionState {
   operationId: string;
   turnId: string;
@@ -116,11 +123,94 @@ export interface CodexHookSessionState {
   writeBlockSyncPending?: HookWriteBlockSyncState;
   pendingWrite?: HookPendingWriteState;
   externalChangeDiagnostics?: HookExternalChangeDiagnostic[];
+  /** 已降级为提醒的旧保护围栏，仅保留排障证据，不再参与写入决策。 */
+  advisoryDiagnostics?: HookAdvisoryDiagnostic[];
   loadedFeatureVersions?: Record<string, string>;
   lastHeartbeatAt?: string;
   quarantine?: HookQuarantineState;
+  /** 最近一次权威读取到的房间模式，只用于状态迁移和界面诊断，不能离线用于拒绝写入。 */
+  blockingProtectionEnabled?: boolean;
   openedAt: string;
   updatedAt: string;
+}
+
+export interface ApplyHookProtectionModeResult {
+  changed: boolean;
+  warnings: string[];
+}
+
+/**
+ * 切入监测模式时必须一次性拆除全部本地写入围栏。
+ * 租约身份、路径归因和完成状态仍保留，确保后续扫描与共享上下文可以正常收口。
+ */
+export function applyHookProtectionMode(
+  state: CodexHookSessionState,
+  blockingProtectionEnabled: boolean,
+  detectedAt = new Date().toISOString(),
+): ApplyHookProtectionModeResult {
+  const previousMode = state.blockingProtectionEnabled;
+  const warnings: string[] = [];
+  const diagnostics: HookAdvisoryDiagnostic[] = [];
+
+  if (!blockingProtectionEnabled) {
+    if (state.quarantine) {
+      warnings.push(`已将会话隔离降级为监测提醒：${state.quarantine.reason}`);
+      diagnostics.push({
+        source: "quarantine",
+        reason: state.quarantine.reason,
+        paths: state.quarantine.paths,
+        detectedAt: state.quarantine.detectedAt,
+      });
+      state.quarantine = undefined;
+    }
+    if (state.passiveWriteBlock) {
+      warnings.push(`已取消等待 ${state.passiveWriteBlock.memberName} 的本地写入围栏。`);
+      diagnostics.push({
+        source: "passive_wait",
+        reason: `Previously waited for ${state.passiveWriteBlock.memberName}.`,
+        paths: state.passiveWriteBlock.requestedPaths,
+        detectedAt,
+      });
+      state.passiveWriteBlock = undefined;
+    }
+    if (state.writeBlockSyncPending) {
+      warnings.push("已将未确认的 write-blocked 同步降级为监测提醒。");
+      diagnostics.push({
+        source: "write_block_sync",
+        reason: "A write-blocked synchronization was still pending when monitor mode became authoritative.",
+        paths: state.writeBlockSyncPending.paths,
+        detectedAt: state.writeBlockSyncPending.recordedAt,
+      });
+      state.writeBlockSyncPending = undefined;
+    }
+    const blockedLeases = state.leases.filter((lease) => lease.coordinationState === "blocked");
+    if (blockedLeases.length > 0) {
+      warnings.push(`已解除 ${blockedLeases.length} 个本地自动租约阻塞标记。`);
+      diagnostics.push(...blockedLeases.map((lease) => ({
+        source: "blocked_lease" as const,
+        reason: `Lease ${lease.id} was locally marked blocked before monitor mode became authoritative.`,
+        paths: lease.paths,
+        detectedAt,
+      })));
+      state.leases = state.leases.map((lease) => {
+        if (lease.coordinationState !== "blocked") return lease;
+        const { coordinationState: _coordinationState, ...workingLease } = lease;
+        return workingLease;
+      });
+    }
+    if (diagnostics.length > 0) {
+      state.advisoryDiagnostics = [
+        ...(state.advisoryDiagnostics ?? []),
+        ...diagnostics,
+      ].slice(-20);
+    }
+  }
+
+  state.blockingProtectionEnabled = blockingProtectionEnabled;
+  return {
+    changed: previousMode !== blockingProtectionEnabled || diagnostics.length > 0,
+    warnings,
+  };
 }
 
 export class CodexHookStateStore {
@@ -394,6 +484,9 @@ export function parseState(raw: string): CodexHookSessionState {
     externalChangeDiagnostics: value.externalChangeDiagnostics === undefined
       ? undefined
       : parseExternalDiagnostics(value.externalChangeDiagnostics),
+    advisoryDiagnostics: value.advisoryDiagnostics === undefined
+      ? undefined
+      : parseAdvisoryDiagnostics(value.advisoryDiagnostics),
     loadedFeatureVersions: value.loadedFeatureVersions === undefined
       ? undefined
       : stringMap(value.loadedFeatureVersions),
@@ -401,6 +494,9 @@ export function parseState(raw: string): CodexHookSessionState {
       ? undefined
       : isoText(value.lastHeartbeatAt, "lastHeartbeatAt"),
     quarantine: value.quarantine === undefined ? undefined : parseQuarantine(value.quarantine),
+    blockingProtectionEnabled: value.blockingProtectionEnabled === undefined
+      ? undefined
+      : booleanValue(value.blockingProtectionEnabled, "blocking protection mode"),
     openedAt: isoText(value.openedAt, "openedAt"),
     updatedAt: isoText(value.updatedAt, "updatedAt"),
   };
@@ -468,6 +564,23 @@ function parseExternalDiagnostics(value: unknown): HookExternalChangeDiagnostic[
     return {
       paths: stringArray(entry.paths),
       detectedAt: isoText(entry.detectedAt, "external change detectedAt"),
+    };
+  });
+}
+
+function parseAdvisoryDiagnostics(value: unknown): HookAdvisoryDiagnostic[] {
+  if (!Array.isArray(value)) throw new Error("The Agent Hub hook state contains invalid advisory diagnostics.");
+  return value.slice(-20).map((entry) => {
+    if (!isRecord(entry)) throw new Error("The Agent Hub hook state contains an invalid advisory diagnostic.");
+    const source = requiredText(entry.source, "advisory diagnostic source");
+    if (!["quarantine", "passive_wait", "write_block_sync", "blocked_lease"].includes(source)) {
+      throw new Error("The Agent Hub hook state contains an invalid advisory diagnostic source.");
+    }
+    return {
+      source: source as HookAdvisoryDiagnostic["source"],
+      reason: requiredText(entry.reason, "advisory diagnostic reason"),
+      paths: stringArray(entry.paths),
+      detectedAt: isoText(entry.detectedAt, "advisory diagnostic detectedAt"),
     };
   });
 }

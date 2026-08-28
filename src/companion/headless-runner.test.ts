@@ -1,5 +1,6 @@
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
+import { AGENT_HUB_VERSION } from "../shared/version.js";
 import { runHeadlessRunner } from "./headless-runner.js";
 
 describe("Agent Hub headless health probe", () => {
@@ -15,7 +16,7 @@ describe("Agent Hub headless health probe", () => {
     await expect(runHeadlessRunner(["AgentHub.exe", "--health-probe"], stdout)).resolves.toBe(0);
     expect(JSON.parse(output)).toEqual({
       status: "ok",
-      version: "0.2.5",
+      version: AGENT_HUB_VERSION,
       mcpBridge: "ok",
       codexHook: "ok",
     });

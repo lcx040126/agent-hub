@@ -49,7 +49,7 @@ try {
   validateNewDatabase(newDatabasePath);
   results.push({ name: "new-schema-5", status: "ok", reopened: true });
 
-  process.stdout.write(`${JSON.stringify({ status: "ok", version: "0.2.5", results })}\n`);
+  process.stdout.write(`${JSON.stringify({ status: "ok", version: "0.2.6", results })}\n`);
 } finally {
   rmSync(probeRoot, { recursive: true, force: true });
 }
@@ -226,7 +226,7 @@ async function startAndStopPackagedService(dataDirectory) {
         if (
           response.ok
           && health.status === "ok"
-          && health.version === "0.2.5"
+          && health.version === "0.2.6"
           && health.schemaVersion === 5
           && health.database?.status === "ok"
         ) return;

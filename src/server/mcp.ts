@@ -4,13 +4,14 @@ import express, { type Request, type Response, type Router } from "express";
 import * as z from "zod/v4";
 import { AGENT_HUB_VERSION } from "../shared/version.js";
 
+// severity 只描述风险颜色；MCP 必须以服务端 decision 决定是否停止写入。
 const SERVER_INSTRUCTIONS = [
   "Agent Hub is an automatic collaboration guard. Follow this workflow for every coding task:",
   "1. If Codex SessionStart context supplies an Agent Hub sessionId, reuse that exact Hook session for every MCP tool and do not call session_open. Otherwise call session_open once, retain its returned session.id, then call context_query for the paths and systems involved.",
-  "2. Call lease_acquire with that sessionId before writing. If the lease is denied or blocking conflicts are returned, do not edit those paths.",
+  "2. Call lease_acquire with that sessionId before writing. Only decision=deny stops writing. A conflict with blocking severity but decision=warn is a writable high-risk warning.",
   "3. Call edit_check with the same sessionId before touching newly discovered paths, and call lease_renew with it while long-running work is active.",
   "4. Use event_append with the same sessionId to record decisions, verification evidence, risks, and handoffs as they occur.",
-  "5. Use feature_context_query during planning and before related edits. When edit_check requires historical confirmation, ask the current member and call feature_change_confirm only after an explicit answer.",
+  "5. Use feature_context_query during planning and before related edits. When protection is enabled and edit_check requires historical confirmation, ask the current member and call feature_change_confirm only after an explicit answer. In monitor-only mode historical confirmation is advisory: report the warning, but do not stop writing for that confirmation. Lease conflicts remain governed by step 2's decision=deny rule.",
   "6. Submit a structured feature revision before closing completed coding work, then call session_close even when work is incomplete. Never claim compatibility without relevant verification.",
   "Handle technical coordination automatically. Ask a human only when requirements or business rules genuinely conflict.",
 ].join("\n");
@@ -440,7 +441,7 @@ function createServer(service: AgentHubServiceLike, context: AgentHubToolContext
     {
       title: "Acquire a work-scope lease",
       description:
-        "Claim repository paths for the session_open session before writing. Pass its session.id and do not edit when a blocking conflict prevents acquisition.",
+        "Claim repository paths for the session_open session before writing. Pass its session.id; only decision=deny prevents writing, while blocking severity with decision=warn remains writable.",
       inputSchema: leaseAcquireInputSchema,
       annotations: {
         readOnlyHint: false,
@@ -474,7 +475,7 @@ function createServer(service: AgentHubServiceLike, context: AgentHubToolContext
     {
       title: "Check paths before editing",
       description:
-        "Verify that proposed edits are covered by the specified session's lease and do not conflict with another active lease.",
+        "Verify that proposed edits are covered by the specified session's lease and inspect active conflicts. Stop when allowed=false; lease conflicts enter blockers only for decision=deny, and monitor-only historical confirmation remains advisory.",
       inputSchema: editCheckInputSchema,
       annotations: {
         readOnlyHint: true,

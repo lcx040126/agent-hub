@@ -101,6 +101,8 @@ describe("Codex hook write detection", () => {
       {
         room: {
           name: "Budget room",
+        },
+        settings: {
           blockingProtectionEnabled: true,
           riskPolicyVersion: 4,
           automaticLeaseTtlMinutes: 10,
@@ -147,5 +149,30 @@ describe("Codex hook write detection", () => {
       const index = Number(line.match(/^未解决风险：Risk (\d+):/)?.[1]);
       expect(line).toBe(`未解决风险：Risk ${index}: ${records[index]?.summary.trim()}`);
     }
+  });
+
+  it("names the online other-member exclusive exception in monitor-only context", () => {
+    const context = formatRoomContext(
+      { room: { name: "Monitor room" }, settings: { blockingProtectionEnabled: false } },
+      {
+        id: "connection",
+        serverUrl: "http://127.0.0.1:4317",
+        repositoryPath: "C:/project",
+        roomName: "Monitor room",
+        createdAt: "2026-08-29T00:00:00.000Z",
+        updatedAt: "2026-08-29T00:00:00.000Z",
+      },
+      {
+        repositoryRoot: "C:/project",
+        branch: "main",
+        headCommit: "1234567890abcdef",
+        changedPaths: [],
+        changedPathFingerprints: {},
+      },
+      "hub-session",
+    );
+
+    expect(context).toContain("仅服务端在线明确确认的其他成员手动独占仍可阻止写入");
+    expect(context).not.toContain("但不阻止写入");
   });
 });

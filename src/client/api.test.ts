@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   activateSavedConnection,
+  ApiError,
   createLease,
   createRoom,
   deleteSavedConnection,
@@ -11,6 +12,7 @@ import {
   resumeSavedConnection,
   saveSession,
   secureDesktopSession,
+  updateRoomSettings,
   type Session,
 } from "./api";
 
@@ -76,6 +78,81 @@ afterEach(() => {
 });
 
 describe("desktop room transport", () => {
+  it("does not infer a denial when a legacy lease response omits decision", async () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: {
+          requestRoomServer: vi.fn(async () => ({
+            status: 200,
+            body: {
+              acquired: false,
+              conflicts: [{
+                id: "legacy-critical",
+                severity: "blocking",
+                reason: "Legacy response without an execution decision.",
+              }],
+            },
+          })),
+        },
+      },
+    });
+
+    const result = await createLease(desktopSession("connection-a"), {
+      title: "Legacy monitor response",
+      paths: ["ProjectSettings/ProjectSettings.asset"],
+      ttlMinutes: 10,
+    });
+
+    expect(result).toMatchObject({
+      acquired: false,
+      decision: "warn",
+      conflicts: [expect.objectContaining({ severity: "blocking", decision: "warn" })],
+    });
+  });
+
+  it("preserves structured server error details for monitor-mode upgrade guidance", async () => {
+    const details = {
+      requiredProtocolVersion: 2,
+      members: [{
+        id: "member-old",
+        displayName: "旧客户端成员",
+        clientVersion: "0.2.5",
+        protocolVersion: 1,
+      }],
+    };
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: {
+          requestRoomServer: vi.fn(async () => ({
+            status: 409,
+            body: {
+              error: "monitor_mode_upgrade_required",
+              message: "Every room member must upgrade.",
+              details,
+            },
+          })),
+        },
+      },
+    });
+
+    const operation = updateRoomSettings(desktopSession("connection-a"), {
+      blockingProtectionEnabled: false,
+    });
+    await expect(operation).rejects.toMatchObject({
+      name: "ApiError",
+      status: 409,
+      code: "monitor_mode_upgrade_required",
+      details,
+    });
+    await operation.catch((error: unknown) => {
+      expect(error).toBeInstanceOf(ApiError);
+    });
+  });
+
   it("uses the local server internally but gives the host a LAN invite address", async () => {
     const requestRoomServer = vi.fn(async () => ({
       status: 201,
@@ -578,7 +655,23 @@ describe("dashboard lease compatibility", () => {
                   expiresAt: "2026-08-27T08:10:00.000Z",
                 },
               ],
-              conflicts: [],
+              conflicts: [
+                {
+                  id: "high-warning",
+                  title: "Critical scope risk",
+                  summary: "The red warning remains writable.",
+                  severity: "blocking",
+                  decision: "warn",
+                  paths: ["ProjectSettings/ProjectSettings.asset"],
+                },
+                {
+                  id: "legacy-high-warning",
+                  title: "Legacy high-risk overlap",
+                  summary: "Missing decisions must not become denials.",
+                  severity: "critical",
+                  paths: ["ProjectSettings/TagManager.asset"],
+                },
+              ],
               records: [],
               activity: [],
               sessions: [{
@@ -617,5 +710,14 @@ describe("dashboard lease compatibility", () => {
       overlapPaths: [],
     });
     expect(result.generatedAt).toBe("2026-08-27T08:00:00.000Z");
+    expect(result.conflicts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "high-warning",
+        title: "检测到高风险范围重叠",
+        severity: "blocking",
+        decision: "warn",
+      }),
+      expect.objectContaining({ id: "legacy-high-warning", severity: "blocking", decision: "warn" }),
+    ]));
   });
 });

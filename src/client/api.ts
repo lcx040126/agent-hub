@@ -386,11 +386,15 @@ const LEGACY_SESSION_KEYS = ["agent-hub.session.v2", "agent-hub.session.v1"];
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly code?: string;
+  readonly details?: unknown;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code?: string, details?: unknown) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
+    this.details = details;
   }
 }
 
@@ -533,15 +537,18 @@ function normalizeConflict(value: unknown, index = 0): Conflict {
     : ["notice", "low"].includes(rawSeverity)
       ? "notice"
       : "warning";
-  const rawDecision = asString(conflict.decision, severity === "blocking" ? "deny" : "warn");
+  // severity 只负责黄/红展示；服务端没有明确返回 deny 时，客户端不能自行升级为阻断。
+  const rawDecision = asString(conflict.decision, "warn");
   const memberName = asString(conflict.memberName);
   const rawTitle = asString(conflict.title);
   const rawSummary = asString(conflict.summary, asString(conflict.reason, asString(conflict.description)));
   const title = rawTitle === "Exclusive scope overlap"
     ? "独占范围已被占用"
-    : rawTitle === "Registered scope overlap"
-      ? "检测到工作范围重叠"
-      : rawTitle;
+    : rawTitle === "Critical scope risk"
+      ? "检测到高风险范围重叠"
+      : rawTitle === "Registered scope overlap"
+        ? "检测到工作范围重叠"
+        : rawTitle;
   const summary = rawSummary === "The overlap includes a Unity, configuration, or Luban scope that requires exclusive access."
     ? "重叠范围包含 Unity 资源、配置或 Luban 数据，必须独占修改。"
     : rawSummary === "Ordinary source write scopes overlap; provide an explicit override reason to continue."
@@ -554,9 +561,7 @@ function normalizeConflict(value: unknown, index = 0): Conflict {
     severity,
     decision: ["allow", "warn", "deny"].includes(rawDecision)
       ? (rawDecision as Conflict["decision"])
-      : severity === "blocking"
-        ? "deny"
-        : "warn",
+      : "warn",
     paths: [...new Set(paths)],
     memberNames: asStringArray(conflict.memberNames).concat(memberName ? [memberName] : []),
     leaseId: asString(conflict.leaseId) || undefined,
@@ -850,10 +855,13 @@ function translatedError(payload: Record<string, unknown>, status: number): ApiE
     member_not_found: "没有找到指定成员。",
     invalid_verification_kind: "请选择有效的验证类型。",
     invalid_verification_result: "请选择有效的验证结果。",
+    monitor_mode_upgrade_required: "开启纯监测模式前，房间中的所有成员都必须升级到当前协议并重新连接。",
   };
   return new ApiError(
     translated[code] ?? asString(payload.message, code || "请求未完成，请稍后重试。"),
     status,
+    code || undefined,
+    payload.details,
   );
 }
 
@@ -1270,16 +1278,18 @@ export async function createLease(access: RequestAccess, input: CreateLeaseInput
   );
   const conflicts = firstArray(payload.conflicts).map(normalizeConflict);
   const acquired = typeof payload.acquired === "boolean" ? payload.acquired : Boolean(payload.lease);
-  const rawDecision = asString(payload.decision, acquired ? (conflicts.length ? "warn" : "allow") : "deny");
+  // 旧服务或异常响应缺少 decision 时只能降级为提醒，客户端不能根据 acquired 自行制造阻止。
+  const fallbackDecision: LeaseDecision["decision"] = acquired
+    ? conflicts.length ? "warn" : "allow"
+    : "warn";
+  const rawDecision = asString(payload.decision, fallbackDecision);
   return {
     acquired,
     lease: payload.lease ? normalizeLease(payload.lease) : undefined,
     conflicts,
     decision: ["allow", "warn", "deny", "wait"].includes(rawDecision)
       ? (rawDecision as LeaseDecision["decision"])
-      : acquired
-        ? "allow"
-        : "deny",
+      : fallbackDecision,
     releaseRequests: firstArray(payload.releaseRequests).map(normalizeReleaseRequest),
     waitingFor: payload.waitingFor ? {
       leaseId: asString(asObject(payload.waitingFor).leaseId),

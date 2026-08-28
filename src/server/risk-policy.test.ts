@@ -60,10 +60,10 @@ describe("room risk policy", () => {
     expect(evaluateRiskPolicy("Assets/Vanguard/Inventory/Critical.cs", policy).matchedRule.kind).toBe("file");
   });
 
-  it("downgrades automatic and ordinary overlap when blocking protection is off", () => {
+  it("keeps the configured risk level visible when blocking protection is off", () => {
     const result = evaluateRiskPolicy("ProjectSettings/ProjectSettings.asset", createDefaultRiskPolicy(), false);
-    expect(result).toMatchObject({ configuredLevel: "blocking", level: "warning" });
-    expect(result.reason).toContain("disabled");
+    expect(result).toMatchObject({ configuredLevel: "blocking", level: "blocking" });
+    expect(result.reason).toContain("monitor-only");
   });
 
   it("rejects duplicate and unsafe custom rules", () => {

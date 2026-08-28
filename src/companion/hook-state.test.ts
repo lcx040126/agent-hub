@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  applyHookProtectionMode,
   CodexHookStateLockTimeoutError,
   CodexHookStateStore,
   type CodexHookSessionState,
@@ -106,6 +107,58 @@ describe("CodexHookStateStore", () => {
 
     await store.remove(state.codexSessionId);
     await expect(store.load(state.codexSessionId)).resolves.toBeUndefined();
+  });
+
+  it("clears local write fences in monitor mode while preserving attribution and diagnostics", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-monitor-state-"));
+    temporaryDirectories.push(directory);
+    const store = new CodexHookStateStore(directory);
+    const state = stateForConnection(directory, "codex-monitor", "connection-monitor", "hub-monitor");
+    const detectedAt = "2026-08-28T01:02:03.000Z";
+    state.attributedChangedPaths = ["src/owned.ts"];
+    state.leaseAttributionComplete = false;
+    state.quarantine = { reason: "branch changed", paths: ["src/branch.ts"], detectedAt };
+    state.passiveWriteBlock = {
+      leaseId: "older-lease",
+      memberName: "Alice",
+      paths: ["src/wait.ts"],
+      requestedPaths: ["src/wait.ts"],
+      expiresAt: "2026-08-28T01:12:03.000Z",
+    };
+    state.writeBlockSyncPending = {
+      dirty: true,
+      paths: ["src/sync.ts"],
+      recordedAt: detectedAt,
+    };
+    state.leases = [{
+      id: "blocked-auto",
+      paths: ["src/lease.ts"],
+      expiresAt: "2026-08-28T01:12:03.000Z",
+      coordinationState: "blocked",
+    }];
+
+    const transition = applyHookProtectionMode(state, false, detectedAt);
+    expect(transition.changed).toBe(true);
+    expect(transition.warnings).toHaveLength(4);
+    await store.save(state);
+
+    await expect(store.load(state.codexSessionId)).resolves.toMatchObject({
+      blockingProtectionEnabled: false,
+      attributedChangedPaths: ["src/owned.ts"],
+      leaseAttributionComplete: false,
+      leases: [{ id: "blocked-auto", paths: ["src/lease.ts"] }],
+      advisoryDiagnostics: [
+        { source: "quarantine", reason: "branch changed", paths: ["src/branch.ts"] },
+        { source: "passive_wait", paths: ["src/wait.ts"] },
+        { source: "write_block_sync", paths: ["src/sync.ts"] },
+        { source: "blocked_lease", paths: ["src/lease.ts"] },
+      ],
+    });
+    const loaded = (await store.load(state.codexSessionId))!;
+    expect(loaded.quarantine).toBeUndefined();
+    expect(loaded.passiveWriteBlock).toBeUndefined();
+    expect(loaded.writeBlockSyncPending).toBeUndefined();
+    expect(loaded.leases[0]?.coordinationState).toBeUndefined();
   });
 
   it("removes only Hook sessions belonging to the selected room connection", async () => {

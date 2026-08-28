@@ -29,11 +29,14 @@ describe("lease overlap policy", () => {
     expect(conflicts).toMatchObject([{ severity: "warning", decision: "warn" }]);
   });
 
-  it("blocks critical concrete files but downgrades them when the owner switch is off", () => {
+  it("keeps critical risk red but allows it when the owner switch is off", () => {
     const scene = existing({ paths: ["Assets/Scenes/Main.unity"] });
     const request = { memberId: "bob", sessionId: "session-b", kind: "automatic" as const, paths: ["Assets/Scenes/Main.unity"] };
     expect(evaluateRealtimeOverlaps(request, [scene], createDefaultRiskPolicy(), true)[0]).toMatchObject({ severity: "blocking" });
-    expect(evaluateRealtimeOverlaps(request, [scene], createDefaultRiskPolicy(), false)[0]).toMatchObject({ severity: "warning" });
+    expect(evaluateRealtimeOverlaps(request, [scene], createDefaultRiskPolicy(), false)[0]).toMatchObject({
+      severity: "blocking",
+      decision: "warn",
+    });
   });
 
   it("keeps Luban warning-only by default", () => {
@@ -63,7 +66,7 @@ describe("lease overlap policy", () => {
       createDefaultRiskPolicy(),
       true,
     );
-    expect(conflicts[0]).toMatchObject({ severity: "warning", decision: "warn" });
+    expect(conflicts[0]).toMatchObject({ severity: "blocking", decision: "warn" });
   });
 
   it("shares a sessionless manual standard lease across the same member's Agent sessions", () => {

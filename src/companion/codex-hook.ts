@@ -4,6 +4,11 @@ import path from "node:path";
 import type { SecretProtector } from "../desktop/connection-store.js";
 import type { SavedRoomConnection } from "../desktop/contracts.js";
 import {
+  AGENT_HUB_PROTOCOL_VERSION,
+  AGENT_HUB_SCHEMA_VERSION,
+  AGENT_HUB_VERSION,
+} from "../shared/version.js";
+import {
   estimateContextTokens,
   packContextByBudget,
   type ContextBudgetCandidate,
@@ -30,12 +35,23 @@ import {
   type FeatureGitEvidence,
 } from "./feature-evidence.js";
 import {
+  applyHookProtectionMode,
   CodexHookStateLockTimeoutError,
   CodexHookStateStore,
   type CodexHookSessionState,
   type HookLeaseState,
   type HookProposedEditState,
 } from "./hook-state.js";
+import {
+  enforceWriteHookPolicy,
+  failOpenWriteHookOutput,
+  hasVerifiedManualExclusiveBlocker,
+  isVerifiedManualExclusiveClaim,
+  markVerifiedManualExclusiveBlock,
+  requiresAuthoritativeModeRecheck,
+  type AuthoritativeHookProtectionPolicy,
+  type HookProtectionPolicy,
+} from "./codex-hook-policy.js";
 import {
   attributedChangedPaths,
   extractAttributedWriteIntent,
@@ -103,6 +119,7 @@ interface HookRuntime {
 
 interface RoomSnapshotLike {
   room?: Record<string, unknown>;
+  settings?: Record<string, unknown>;
   members?: unknown[];
   activeLeases?: unknown[];
   decisions?: unknown[];
@@ -179,41 +196,77 @@ export async function handleCodexHook(
     }
     return { continue: true };
   }
-  const runtimePresence = await getRuntimeIntegrationStatus(
-    options.userDataPath,
-    options.runtimePresencePath,
-  );
-  if (!runtimePresence.active) {
-    return undefined;
-  }
-  const record = await resolveTrackedConnectionRecord(options, input);
-  if (!record) return undefined;
-  const connectionId = record.connection.id;
-  const localStatus = await getLocalIntegrationStatus(
-    options.userDataPath,
-    record.connection,
-    options.runtimePresencePath,
-  );
-  if (!localStatus.active) {
-    return undefined;
-  }
-  if (!localStatus.remoteAllowed) {
-    return failureOutput(
-      options.eventName,
-      new HookCleanupPendingError(localStatus.diagnostic),
-    );
-  }
-  const dispatch = async () => {
-    const result = await dispatchCodexHook(options, input, record);
-    await assertHookIntegrationActive(options, connectionId);
-    return result;
-  };
+  const writeEvent = isWriteHookEvent(options.eventName) ? options.eventName : undefined;
+  let writePolicy: HookProtectionPolicy | undefined;
+  let trackedRecord: ResolvedRoomConnectionRecord | undefined;
   try {
-    return await new IntegrationOperationTracker(options.userDataPath).run(connectionId, dispatch);
+    const runtimePresence = await getRuntimeIntegrationStatus(
+      options.userDataPath,
+      options.runtimePresencePath,
+    );
+    if (!runtimePresence.active) return undefined;
+    const record = await resolveTrackedConnectionRecord(options, input);
+    if (!record) return undefined;
+    trackedRecord = record;
+    const connectionId = record.connection.id;
+    const localStatus = await getLocalIntegrationStatus(
+      options.userDataPath,
+      record.connection,
+      options.runtimePresencePath,
+    );
+    if (!localStatus.active) return undefined;
+    if (!localStatus.remoteAllowed) {
+      return failureOutput(
+        options.eventName,
+        new HookCleanupPendingError(localStatus.diagnostic),
+      );
+    }
+    if (writeEvent) {
+      // 每次写入事件都读取权威设置。读取失败本身绝不能成为新的写入门禁。
+      writePolicy = await readAuthoritativeHookProtectionPolicy(options, record);
+      if (!writePolicy.authoritative) {
+        return failOpenWriteHookOutput(writeEvent, writePolicy.warning);
+      }
+    }
+    let effectiveWritePolicy = writePolicy;
+    const dispatch = async () => {
+      const result = await dispatchCodexHook(options, input, record, writePolicy);
+      await assertHookIntegrationActive(options, connectionId);
+      if (
+        writeEvent
+        && writePolicy?.authoritative
+        && requiresAuthoritativeModeRecheck(writeEvent, result)
+      ) {
+        // prepare/check 可能在首次读设置后才切回保护模式；未标记拒绝必须二次读取后再决定是否降级。
+        effectiveWritePolicy = await readAuthoritativeHookProtectionPolicy(options, record);
+      }
+      return result;
+    };
+    const result = await new IntegrationOperationTracker(options.userDataPath).run(connectionId, dispatch);
+    if (!writeEvent) return result;
+    if (!effectiveWritePolicy) return result;
+    if (!effectiveWritePolicy.authoritative) {
+      return failOpenWriteHookOutput(writeEvent, effectiveWritePolicy.warning);
+    }
+    return enforceWriteHookPolicy(writeEvent, result, effectiveWritePolicy);
   } catch (error) {
-    if (!(error instanceof HookIntegrationInactiveError)) throw error;
-    await new CodexHookStateStore(options.userDataPath).remove(input.session_id);
-    return undefined;
+    if (error instanceof HookIntegrationInactiveError) {
+      await new CodexHookStateStore(options.userDataPath).remove(input.session_id);
+      return undefined;
+    }
+    if (!writeEvent) throw error;
+    const latestWritePolicy = trackedRecord
+      ? await readAuthoritativeHookProtectionPolicy(options, trackedRecord)
+      : undefined;
+    if (latestWritePolicy?.authoritative && latestWritePolicy.blockingProtectionEnabled) {
+      return failureOutput(writeEvent, error, true);
+    }
+    return failOpenWriteHookOutput(
+      writeEvent,
+      latestWritePolicy && !latestWritePolicy.authoritative
+        ? `无法完成本次协调检查：${humanError(error)}。${latestWritePolicy.warning}`
+        : `无法完成本次协调检查：${humanError(error)}。`,
+    );
   }
 }
 
@@ -232,6 +285,7 @@ async function dispatchCodexHook(
   options: RunCodexHookOptions,
   input: CodexHookInput,
   record: ResolvedRoomConnectionRecord,
+  writePolicy?: HookProtectionPolicy,
 ): Promise<Record<string, unknown> | undefined> {
   switch (options.eventName) {
     case "SessionStart":
@@ -239,9 +293,9 @@ async function dispatchCodexHook(
     case "UserPromptSubmit":
       return handleUserPromptSubmit(options, input, record);
     case "PreToolUse":
-      return handlePreToolUse(options, input, record);
+      return handlePreToolUse(options, input, record, requireAuthoritativeWritePolicy(writePolicy));
     case "PostToolUse":
-      return handlePostToolUse(options, input, record);
+      return handlePostToolUse(options, input, record, requireAuthoritativeWritePolicy(writePolicy));
     case "Stop":
       return { continue: true };
     case "SessionEnd":
@@ -276,6 +330,9 @@ async function handleUserPromptSubmit(
         activityEpoch?: number;
         currentTurnId?: string | null;
       } }>("/api/sessions", {
+        clientVersion: AGENT_HUB_VERSION,
+        protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+        schemaVersion: AGENT_HUB_SCHEMA_VERSION,
         codexSessionId: input.session_id,
         turnId,
         activityEpoch: nextEpoch,
@@ -308,6 +365,42 @@ async function resolveTrackedConnectionRecord(
     input.cwd || options.cwd || process.cwd(),
     options.protector,
   );
+}
+
+async function readAuthoritativeHookProtectionPolicy(
+  options: RunCodexHookOptions,
+  record: ResolvedRoomConnectionRecord,
+): Promise<HookProtectionPolicy> {
+  try {
+    const resolved = await hydrateConnectionRecord(record);
+    const client = new AgentHubClient({
+      serverUrl: resolved.connection.serverUrl,
+      memberToken: resolved.memberToken,
+      fetchImpl: createHookGatedFetch(options, resolved.connection.id),
+    });
+    const response = await client.get<{ settings?: Record<string, unknown> }>("/api/room/settings");
+    const enabled = response.settings?.blockingProtectionEnabled;
+    if (typeof enabled !== "boolean") {
+      throw new Error("The room settings response omitted blockingProtectionEnabled.");
+    }
+    return { authoritative: true, blockingProtectionEnabled: enabled };
+  } catch (error) {
+    return {
+      authoritative: false,
+      warning: `无法读取房间的权威保护模式（${humanError(error)}）；按故障放行策略处理。`,
+    };
+  }
+}
+
+function requireAuthoritativeWritePolicy(
+  policy: HookProtectionPolicy | undefined,
+): AuthoritativeHookProtectionPolicy {
+  if (!policy?.authoritative) throw new Error("The write Hook is missing an authoritative room policy.");
+  return policy;
+}
+
+function isWriteHookEvent(event: CodexHookEventName): event is "PreToolUse" | "PostToolUse" {
+  return event === "PreToolUse" || event === "PostToolUse";
 }
 
 async function handleSessionStart(
@@ -344,6 +437,11 @@ async function handleSessionStart(
   });
   if (!runtime) return undefined;
   const snapshot = await runtime.client.get<RoomSnapshotLike>("/api/snapshot");
+  const snapshotProtectionMode = snapshot.settings?.blockingProtectionEnabled;
+  if (typeof snapshotProtectionMode === "boolean") {
+    const transition = applyHookProtectionMode(runtime.state, snapshotProtectionMode);
+    if (transition.changed) await runtime.stateStore.save(runtime.state);
+  }
   try {
     const featureIndex = await runtime.client.post<FeatureQueryResponse>("/api/features/query", {
       sessionId: runtime.state.hubSessionId,
@@ -374,13 +472,14 @@ async function handlePreToolUse(
   options: RunCodexHookOptions,
   input: CodexHookInput,
   record: ResolvedRoomConnectionRecord,
+  policy: AuthoritativeHookProtectionPolicy,
 ): Promise<Record<string, unknown> | undefined> {
   const intent = extractAttributedWriteIntent(input.tool_name, input.tool_input);
   if (!intent.writes) return undefined;
   const stateStore = new CodexHookStateStore(options.userDataPath);
   // PreToolUse 会跨多次网络调用读写 epoch、completion 与 pendingWrite；整段串行化才能阻止 Stop 覆盖新回合。
   return stateStore.runExclusive(input.session_id, () =>
-    handlePreToolUseExclusive(options, input, record, intent));
+    handlePreToolUseExclusive(options, input, record, intent, policy));
 }
 
 async function handlePreToolUseExclusive(
@@ -388,9 +487,17 @@ async function handlePreToolUseExclusive(
   input: CodexHookInput,
   record: ResolvedRoomConnectionRecord,
   intent: AttributedWriteIntent,
+  policy: AuthoritativeHookProtectionPolicy,
 ): Promise<Record<string, unknown> | undefined> {
   const runtime = await findHookRuntime(options, input, record);
   if (!runtime) return undefined;
+  const modeTransition = applyHookProtectionMode(
+    runtime.state,
+    policy.blockingProtectionEnabled,
+  );
+  if (modeTransition.changed) await runtime.stateStore.save(runtime.state);
+  const monitorMode = !policy.blockingProtectionEnabled;
+  const monitorWarnings = [...modeTransition.warnings];
   if (runtime.state.quarantine) {
     return denyOutput(
       `Agent Hub 已隔离当前会话，因为先前检测到越界写入：${runtime.state.quarantine.reason}`
@@ -407,15 +514,19 @@ async function handlePreToolUseExclusive(
     });
   } catch (error) {
     if (error instanceof HookIntegrationInactiveError || error instanceof HookCleanupPendingError) throw error;
-    // resume 未得到幂等确认时，旧任务仍可能释放 lease；必须保留本地 job/state 并明确拒绝新写入。
-    return denyOutput(`Agent Hub 尚未确认上一回合已恢复，本次写入已暂停：${humanError(error)}`);
+    const reason = `Agent Hub 尚未确认上一回合已恢复：${humanError(error)}`;
+    if (!monitorMode) {
+      // 保护模式仍保持原有完成围栏；监测模式只保留诊断并继续尝试登记本次写入。
+      return denyOutput(`${reason}，本次写入已暂停。`);
+    }
+    monitorWarnings.push(reason);
   }
   const currentTurnId = completionTurnId(input, runtime.state.activityEpoch ?? 0);
   if (runtime.state.currentTurnId !== currentTurnId) {
     runtime.state.currentTurnId = currentTurnId;
     await runtime.stateStore.save(runtime.state);
   }
-  const paths = normalizeCandidates(
+  let paths = normalizeCandidates(
     runtime.git.repositoryRoot,
     mapRepositoryCwd(
       runtime.connection.repositoryPath,
@@ -424,7 +535,7 @@ async function handlePreToolUseExclusive(
     ),
     intent.pathCandidates,
   );
-  const proposedEdits = normalizeProposedEdits(
+  let proposedEdits = normalizeProposedEdits(
     runtime.git.repositoryRoot,
     mapRepositoryCwd(runtime.connection.repositoryPath, runtime.git.repositoryRoot, input.cwd),
     intent,
@@ -448,26 +559,31 @@ async function handlePreToolUseExclusive(
   }
 
   if (paths.length > MAX_SESSION_FEATURE_PATHS || proposedEdits.length > MAX_SESSION_FEATURE_PATHS) {
-    return denyOutput(
-      `Agent Hub 单次最多协调 ${MAX_SESSION_FEATURE_PATHS} 个明确写入路径；本次命令解析到 ${Math.max(paths.length, proposedEdits.length)} 个。`
-      + " 请让 Agent 把修改拆成多个较小的工具调用，确保每个路径都能在写入前完成租约和历史功能检查。",
-    );
+    const reason = `Agent Hub 单次最多协调 ${MAX_SESSION_FEATURE_PATHS} 个明确写入路径；本次命令解析到 ${Math.max(paths.length, proposedEdits.length)} 个。`;
+    if (!monitorMode) {
+      return denyOutput(
+        `${reason} 请让 Agent 把修改拆成多个较小的工具调用，确保每个路径都能在写入前完成租约和历史功能检查。`,
+      );
+    }
+    monitorWarnings.push(`${reason} 监测模式将登记前 ${MAX_SESSION_FEATURE_PATHS} 个路径并继续写入。`);
+    paths = paths.slice(0, MAX_SESSION_FEATURE_PATHS);
+    proposedEdits = proposedEdits.slice(0, MAX_SESSION_FEATURE_PATHS);
   }
 
-  if (runtime.state.writeBlockSyncPending) {
+  if (!monitorMode && runtime.state.writeBlockSyncPending) {
     const writeBlockReason = await resynchronizeWriteBlockFence(runtime, paths);
     if (writeBlockReason) return denyOutput(writeBlockReason);
   }
 
   if (paths.length === 0) {
-    if (runtime.state.leaseAttributionComplete === false) {
+    if (!monitorMode && runtime.state.leaseAttributionComplete === false) {
       return denyOutput(
         "Agent Hub 复用了远端会话，但本机缺少该会话的完整租约状态；"
         + "不能执行无法预先确定输出路径的生成、格式化或构建写入。请改用明确路径的写入工具。",
       );
     }
     const passiveWriteBlock = runtime.state.passiveWriteBlock;
-    if (passiveWriteBlock) {
+    if (!monitorMode && passiveWriteBlock) {
       return denyOutput(
         `Agent Hub 正在等待 ${passiveWriteBlock.memberName} 释放较早会话的写入范围；`
         + "不能执行无法预先确定输出路径的生成、格式化或构建写入。"
@@ -475,7 +591,7 @@ async function handlePreToolUseExclusive(
       );
     }
     const blockedLease = runtime.state.leases.find((lease) => lease.coordinationState === "blocked");
-    if (blockedLease) {
+    if (!monitorMode && blockedLease) {
       return denyOutput(
         "Agent Hub 已阻塞当前会话的自动租约；在未提交改动清理并由明确路径写入向房间复核前，"
         + "不能执行无法预先确定输出路径的生成、格式化或构建写入。",
@@ -483,11 +599,15 @@ async function handlePreToolUseExclusive(
     }
     if (intent.attributedSideEffects && intent.proposalHash) {
       const stopFence = await adoptConcurrentStopFence(options.userDataPath, runtime);
-      if (stopFence) return stopFence;
+      if (stopFence && !monitorMode) return stopFence;
+      if (stopFence) monitorWarnings.push("检测到并发 Stop 围栏；监测模式继续写入并保留完成状态证据。");
       setPendingWrite(runtime, input, intent, proposedEdits);
       await runtime.stateStore.save(runtime.state);
       return allowOutput(
-        "Agent Hub 已识别这是一项生成、格式化或构建写入；输出路径将在工具结束后按本次增量归因并立即检查。",
+        monitorContext(
+          "Agent Hub 已识别这是一项生成、格式化或构建写入；输出路径将在工具结束后按本次增量归因并立即检查。",
+          monitorWarnings,
+        ),
       );
     }
     const hasRepositoryLease = runtime.state.leases.some((lease) =>
@@ -497,8 +617,20 @@ async function handlePreToolUseExclusive(
     );
     if (hasRepositoryLease) {
       const stopFence = await adoptConcurrentStopFence(options.userDataPath, runtime);
-      if (stopFence) return stopFence;
-      return allowOutput("Agent Hub 已确认当前会话持有整个仓库的写入范围。");
+      if (stopFence && !monitorMode) return stopFence;
+      if (stopFence) monitorWarnings.push("检测到并发 Stop 围栏；监测模式继续写入并保留完成状态证据。");
+      return allowOutput(monitorContext("Agent Hub 已确认当前会话持有整个仓库的写入范围。", monitorWarnings));
+    }
+    if (monitorMode) {
+      if (runtime.state.leaseAttributionComplete === false) {
+        monitorWarnings.push("本地缺少远端会话的完整租约归因，工具结束后将按 Git 增量尽量补登记。");
+      }
+      setPendingWrite(runtime, input, intent, proposedEdits);
+      await runtime.stateStore.save(runtime.state);
+      return allowOutput(monitorContext(
+        "Agent Hub 无法预先确定输出路径；监测模式允许写入，并将在工具结束后扫描实际变化。",
+        monitorWarnings,
+      ));
     }
     return denyOutput(
       "Agent Hub 无法从这条命令确定将写入哪些文件。请让 Agent 改用 apply_patch，或先通过 lease_acquire 明确领取最小路径后再执行。",
@@ -506,9 +638,12 @@ async function handlePreToolUseExclusive(
   }
 
   const stopFenceBeforePrepare = await adoptConcurrentStopFence(options.userDataPath, runtime);
-  if (stopFenceBeforePrepare) return stopFenceBeforePrepare;
-  const blockedLeaseReason = await resynchronizeWriteBlockFence(runtime, paths);
-  if (blockedLeaseReason) return denyOutput(blockedLeaseReason);
+  if (stopFenceBeforePrepare && !monitorMode) return stopFenceBeforePrepare;
+  if (stopFenceBeforePrepare) monitorWarnings.push("检测到并发 Stop 围栏；监测模式继续执行权威风险检查。");
+  if (!monitorMode) {
+    const blockedLeaseReason = await resynchronizeWriteBlockFence(runtime, paths);
+    if (blockedLeaseReason) return denyOutput(blockedLeaseReason);
+  }
 
   let prepared: PrepareEditsResponse | undefined;
   let recoveredActivityEpoch = false;
@@ -538,6 +673,9 @@ async function handlePreToolUseExclusive(
         || completionTurnId(input, runtime.state.activityEpoch);
       try {
         await runtime.client.post("/api/sessions", {
+          clientVersion: AGENT_HUB_VERSION,
+          protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+          schemaVersion: AGENT_HUB_SCHEMA_VERSION,
           codexSessionId: input.session_id,
           turnId: runtime.state.currentTurnId,
           activityEpoch: runtime.state.activityEpoch,
@@ -562,6 +700,12 @@ async function handlePreToolUseExclusive(
         recoveredActivityEpoch = true;
       } catch (retryError) {
         if (retryError instanceof AgentHubHttpError && retryError.code === "stale_activity_epoch") {
+          if (monitorMode) {
+            monitorWarnings.push("服务端仍报告旧 activity epoch；监测模式允许写入并保留待补登记状态。");
+            setPendingWrite(runtime, input, intent, proposedEdits);
+            await runtime.stateStore.save(runtime.state);
+            return allowOutput(monitorContext(undefined, monitorWarnings));
+          }
           return denyOutput("Agent Hub 检测到会话活动已被更新；本次写入已暂停，请重新提交当前任务。");
         }
         preparationError = retryError;
@@ -572,6 +716,13 @@ async function handlePreToolUseExclusive(
       && preparationError instanceof AgentHubHttpError
       && (preparationError.code === "branch_changed" || preparationError.code === "session_frozen")
     ) {
+      if (monitorMode) {
+        monitorWarnings.push(`${preparationError.message} 监测模式不会因分支或冻结状态阻止写入。`);
+        appendMonitorDiagnostic(runtime.state, "quarantine", preparationError.message, paths);
+        setPendingWrite(runtime, input, intent, proposedEdits);
+        await runtime.stateStore.save(runtime.state);
+        return allowOutput(monitorContext(undefined, monitorWarnings));
+      }
       runtime.state.quarantine = {
         reason: preparationError.message,
         paths: [],
@@ -581,6 +732,12 @@ async function handlePreToolUseExclusive(
       return denyOutput(`${preparationError.message} 请确认新分支基线后重新开始 Codex 会话。`);
     }
     if (!recoveredActivityEpoch && activityRecoveryAttempted) {
+      if (monitorMode) {
+        monitorWarnings.push("过期 activity epoch 的权威恢复未完成；本次写入将继续并等待后续补登记。");
+        setPendingWrite(runtime, input, intent, proposedEdits);
+        await runtime.stateStore.save(runtime.state);
+        return allowOutput(monitorContext(undefined, monitorWarnings));
+      }
       return denyOutput(
         "Agent Hub 检测到当前写入使用了过期的会话活动轮次，但本次权威恢复未能完整完成；"
         + "写入保持暂停，请恢复房间连接后重新提交当前操作。",
@@ -596,12 +753,24 @@ async function handlePreToolUseExclusive(
       )
       && isSoftIntegrationFailure(preparationError)
     ) {
+      if (monitorMode) {
+        monitorWarnings.push("房间暂时无法确认旧等待或阻塞租约；监测模式按故障放行。");
+        setPendingWrite(runtime, input, intent, proposedEdits);
+        await runtime.stateStore.save(runtime.state);
+        return allowOutput(monitorContext(undefined, monitorWarnings));
+      }
       return denyOutput(
         "Agent Hub 已记录当前会话存在等待、阻塞或尚未恢复的租约状态，但暂时无法向房间服务确认写入范围；"
         + "本次写入保持暂停，请恢复连接后用明确路径重试。",
       );
     }
-    if (!recoveredActivityEpoch) throw preparationError;
+    if (!recoveredActivityEpoch) {
+      if (!monitorMode) throw preparationError;
+      monitorWarnings.push(`写入前风险登记失败：${humanError(preparationError)}。`);
+      setPendingWrite(runtime, input, intent, proposedEdits);
+      await runtime.stateStore.save(runtime.state);
+      return allowOutput(monitorContext(undefined, monitorWarnings));
+    }
   }
   if (!prepared) throw new Error("Agent Hub prepare did not return a result.");
   updateRenewedLeases(runtime.state, prepared.renewedLeases ?? []);
@@ -614,7 +783,8 @@ async function handlePreToolUseExclusive(
     });
   }
   const stopFenceAfterPrepare = await adoptConcurrentStopFence(options.userDataPath, runtime);
-  if (stopFenceAfterPrepare) return stopFenceAfterPrepare;
+  if (stopFenceAfterPrepare && !monitorMode) return stopFenceAfterPrepare;
+  if (stopFenceAfterPrepare) monitorWarnings.push("风险检查后收到并发 Stop 围栏；监测模式继续写入。");
   if (prepared.check.allowed) {
     clearResolvedPassiveWriteBlock(runtime.state, paths);
     setPendingWrite(runtime, input, intent, proposedEdits);
@@ -622,7 +792,26 @@ async function handlePreToolUseExclusive(
     const claimed = prepared.claim?.acquired
       ? `Agent Hub 已自动领取写入范围：${paths.join("、")}。`
       : "";
-    return allowOutput(`${claimed}${formatWarnings(prepared.check.warnings)}`);
+    return allowOutput(monitorContext(
+      `${claimed}${formatWarnings(prepared.check.warnings) ?? ""}` || undefined,
+      monitorWarnings,
+    ));
+  }
+  if (
+    isVerifiedManualExclusiveClaim(prepared.claim)
+    || hasVerifiedManualExclusiveBlocker(prepared.check)
+  ) {
+    return markVerifiedManualExclusiveBlock(
+      denyOutput(prepared.claim
+        ? formatConflicts(prepared.claim.conflicts ?? [], "deny")
+        : formatEditBlockers(prepared.check.blockers, runtime.state.hubSessionId)),
+    );
+  }
+  if (monitorMode) {
+    const detectedRisk = prepared.claim && !prepared.claim.acquired
+      ? formatConflicts(prepared.claim.conflicts ?? [], prepared.claim.decision)
+      : formatEditBlockers(prepared.check.blockers, runtime.state.hubSessionId);
+    return denyOutput(monitorContext(detectedRisk, monitorWarnings) ?? detectedRisk);
   }
   // 只有同一成员的并行会话等待才需要收束当前会话自己的自动租约。
   // 其他成员或手动独占范围只拒绝这一次目标写入，不能把当前任务的无关范围一并冻结。
@@ -757,13 +946,14 @@ async function handlePostToolUse(
   options: RunCodexHookOptions,
   input: CodexHookInput,
   record: ResolvedRoomConnectionRecord,
+  policy: AuthoritativeHookProtectionPolicy,
 ): Promise<Record<string, unknown> | undefined> {
   const intent = extractAttributedWriteIntent(input.tool_name, input.tool_input);
   if (!intent.writes) return undefined;
   const stateStore = new CodexHookStateStore(options.userDataPath);
   // PostToolUse 会更新与 PreToolUse 相同的 pending、围栏和租约；整段串行化避免旧快照覆盖较新的写入阻塞状态。
   return stateStore.runExclusive(input.session_id, () =>
-    handlePostToolUseExclusive(options, input, record, intent));
+    handlePostToolUseExclusive(options, input, record, intent, policy));
 }
 
 async function handlePostToolUseExclusive(
@@ -771,9 +961,17 @@ async function handlePostToolUseExclusive(
   input: CodexHookInput,
   record: ResolvedRoomConnectionRecord,
   intent: AttributedWriteIntent,
+  policy: AuthoritativeHookProtectionPolicy,
 ): Promise<Record<string, unknown> | undefined> {
   const runtime = await findHookRuntime(options, input, record);
   if (!runtime) return undefined;
+  const modeTransition = applyHookProtectionMode(
+    runtime.state,
+    policy.blockingProtectionEnabled,
+  );
+  if (modeTransition.changed) await runtime.stateStore.save(runtime.state);
+  const monitorMode = !policy.blockingProtectionEnabled;
+  const monitorWarnings = [...modeTransition.warnings];
   const pending = runtime.state.pendingWrite;
   const baseline = pending
     ? {
@@ -839,12 +1037,17 @@ async function handlePostToolUseExclusive(
   }
   runtime.state.pendingWrite = undefined;
   await runtime.stateStore.save(runtime.state);
-  const writeBlockReason = await resynchronizeWriteBlockFence(
-    runtime,
-    newlyObserved.length > 0 ? newlyObserved : repositoryTargets,
-  );
-  if (writeBlockReason) return postToolUseStopOutput(writeBlockReason);
-  if (newlyObserved.length === 0) return undefined;
+  if (!monitorMode) {
+    const writeBlockReason = await resynchronizeWriteBlockFence(
+      runtime,
+      newlyObserved.length > 0 ? newlyObserved : repositoryTargets,
+    );
+    if (writeBlockReason) return postToolUseStopOutput(writeBlockReason);
+  }
+  if (newlyObserved.length === 0) {
+    const context = monitorContext(undefined, monitorWarnings);
+    return context ? contextOutput(context) : undefined;
+  }
 
   const proposedEdits = (pending?.proposedEdits ?? []).filter((edit) =>
     newlyObserved.some((candidate) => pathScopeCovers(edit.path, candidate) || pathScopeCovers(candidate, edit.path)),
@@ -860,17 +1063,10 @@ async function handlePostToolUseExclusive(
       status: "open",
       evidence: [`Codex session ${input.session_id}`, `Tool ${input.tool_name ?? "unknown"}`],
     }).catch(() => undefined);
-    return {
-      continue: false,
-      stopReason: reason,
-      systemMessage: reason,
-      decision: "block",
-      reason,
-      hookSpecificOutput: {
-        hookEventName: "PostToolUse",
-        additionalContext: reason,
-      },
-    };
+    if (monitorMode) {
+      return contextOutput(monitorContext(reason, monitorWarnings) ?? reason);
+    }
+    return postToolUseStopOutput(reason);
   }
   const prepared = await runtime.client.post<PrepareEditsResponse>("/api/edits/prepare", {
     sessionId: runtime.state.hubSessionId,
@@ -897,8 +1093,11 @@ async function handlePostToolUseExclusive(
   if (check.allowed) {
     const warnings = formatWarnings(check.warnings);
     return contextOutput(
-      `Agent Hub 已登记本次 Agent 实际变更：${newlyObserved.join("、")}。`
-      + (warnings ? `\n${warnings}` : ""),
+      monitorContext(
+        `Agent Hub 已登记本次 Agent 实际变更：${newlyObserved.join("、")}。`
+        + (warnings ? `\n${warnings}` : ""),
+        monitorWarnings,
+      ) ?? `Agent Hub 已登记本次 Agent 实际变更：${newlyObserved.join("、")}。`,
     );
   }
 
@@ -911,18 +1110,15 @@ async function handlePostToolUseExclusive(
     status: "open",
     evidence: [`Codex session ${input.session_id}`, `Tool ${input.tool_name ?? "unknown"}`],
   });
-  return {
-    continue: false,
-    stopReason: reason,
-    systemMessage: reason,
-    decision: "block",
-    reason,
-    hookSpecificOutput: {
-      hookEventName: "PostToolUse",
-      additionalContext:
-        `${reason}\n写入已经发生，Agent 必须停止继续修改并保留现有差异；人工、IDE 或 Unity 的无关变化没有被上传为风险。`,
-    },
-  };
+  const verifiedManualExclusive = isVerifiedManualExclusiveClaim(prepared.claim)
+    || hasVerifiedManualExclusiveBlocker(prepared.check);
+  if (monitorMode && !verifiedManualExclusive) {
+    return postToolUseStopOutput(monitorContext(reason, monitorWarnings) ?? reason);
+  }
+  const blocked = postToolUseStopOutput(reason);
+  return verifiedManualExclusive
+    ? markVerifiedManualExclusiveBlock(blocked)
+    : blocked;
 }
 
 async function ensurePendingFinalizationsStarted(
@@ -1349,6 +1545,9 @@ async function openHookRuntime(
     } }>("/api/sessions", {
       clientName: "Agent Hub Codex hook",
       agentName: "Codex",
+      clientVersion: AGENT_HUB_VERSION,
+      protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+      schemaVersion: AGENT_HUB_SCHEMA_VERSION,
       repository: git.repositoryRoot,
       branch: git.branch,
       worktree: git.repositoryRoot,
@@ -1802,16 +2001,17 @@ export function formatRoomContext(
   hubSessionId: string,
 ): string {
   const room = isRecord(snapshot.room) ? snapshot.room : {};
+  const settings = isRecord(snapshot.settings) ? snapshot.settings : {};
   const roomName = textField(room, "name") ?? textField(room, "roomName") ?? connection.roomName ?? "当前房间";
-  const blockingEnabled = room.blockingProtectionEnabled !== false;
-  const policyVersion = typeof room.riskPolicyVersion === "number" ? room.riskPolicyVersion : 1;
-  const automaticTtl = typeof room.automaticLeaseTtlMinutes === "number"
-    ? room.automaticLeaseTtlMinutes
+  const blockingEnabled = settings.blockingProtectionEnabled !== false;
+  const policyVersion = typeof settings.riskPolicyVersion === "number" ? settings.riskPolicyVersion : 1;
+  const automaticTtl = typeof settings.automaticLeaseTtlMinutes === "number"
+    ? settings.automaticLeaseTtlMinutes
     : LEASE_TTL_MINUTES;
   const header = [
     `Agent Hub 已连接：${roomName}。当前分支 ${git.branch}，提交 ${git.headCommit.slice(0, 12)}。`,
     `当前 Hook 与 MCP 必须共同使用 Agent Hub sessionId=${hubSessionId}；不要再调用 session_open 创建第二个会话。`,
-    `当前实时保护：${blockingEnabled ? "按策略执行黄色警告/红色阻塞" : "普通重叠全部降为黄色警告"}；策略版本 ${policyVersion}；自动租期 ${automaticTtl} 分钟。`,
+    `当前实时模式：${blockingEnabled ? "保护模式，按服务端 decision 执行警告或阻止" : "纯监测模式，普通风险显示黄色、重点风险显示红色；仅服务端在线明确确认的其他成员手动独占仍可阻止写入"}；策略版本 ${policyVersion}；自动租期 ${automaticTtl} 分钟。`,
     "以下是房间的实时协作状态。Git、项目源码和人工批准的规则仍是最终事实来源。",
   ];
   const candidates: Array<ContextBudgetCandidate<string>> = [];
@@ -1850,9 +2050,13 @@ export function formatRoomContext(
     return contextIndexLine(systemId ? `${name} [${systemId}]` : name, detail || undefined);
   });
 
-  const footer = "Agent Hub 会在写入前自动领取最小路径并检查冲突，在写入后只登记可归因给当前 Agent 的实际变更。出现拒绝时不要绕过；先读取命中原因，只有业务规则确实冲突时再询问人。";
+  const footer = blockingEnabled
+    ? "Agent Hub 会在写入前自动领取最小路径并检查冲突，在写入后只登记可归因给当前 Agent 的实际变更。出现拒绝时不要绕过；先读取命中原因，只有业务规则确实冲突时再询问人。"
+    : "Agent Hub 当前只监测、提示并登记可归因给当前 Agent 的实际变更；只有服务端在线明确确认的其他成员手动独占范围仍会阻止写入。";
   const truncatedNotice = "还有更多完整协作条目未在启动层加载；请通过 MCP 按路径、系统或目标继续查询。";
-  const memoryUnavailableNotice = "长期功能记忆索引本次未能加载；实时租约与冲突保护仍然有效，请通过 MCP 按需重试记忆查询。";
+  const memoryUnavailableNotice = blockingEnabled
+    ? "长期功能记忆索引本次未能加载；实时租约与冲突保护仍然有效，请通过 MCP 按需重试记忆查询。"
+    : "长期功能记忆索引本次未能加载；实时租约监测仍会继续，但本次上下文可能缺少历史功能提示。";
   const baseTokens = estimateContextTokens([...header, truncatedNotice, footer].join("\n"));
   const packed = packContextByBudget(candidates, {
     budgetTokens: 2_500,
@@ -1955,6 +2159,29 @@ function formatWarnings(warnings: Array<Record<string, unknown>>): string | unde
   return `Agent Hub 提醒：${warnings.slice(0, 5).map((item) => textField(item, "message") ?? "范围有重叠").join("；")}`;
 }
 
+function monitorContext(base: string | undefined, warnings: string[]): string | undefined {
+  const normalizedBase = base
+    ?.replace(/^Agent Hub 拒绝本次写入。/, "Agent Hub 风险提醒：")
+    .trim();
+  const lines = [
+    normalizedBase || undefined,
+    ...warnings.map((warning) => `Agent Hub 监测提醒：${warning.trim()}`),
+  ].filter((line): line is string => Boolean(line));
+  return lines.length > 0 ? lines.join("\n") : undefined;
+}
+
+function appendMonitorDiagnostic(
+  state: CodexHookSessionState,
+  source: "quarantine" | "passive_wait" | "write_block_sync" | "blocked_lease",
+  reason: string,
+  paths: string[],
+): void {
+  state.advisoryDiagnostics = [
+    ...(state.advisoryDiagnostics ?? []),
+    { source, reason, paths: unique(paths), detectedAt: new Date().toISOString() },
+  ].slice(-20);
+}
+
 function allowOutput(additionalContext?: string): Record<string, unknown> | undefined {
   if (!additionalContext) return undefined;
   return {
@@ -1985,7 +2212,11 @@ function contextOutput(additionalContext: string): Record<string, unknown> {
   };
 }
 
-function failureOutput(event: CodexHookEventName, error: unknown): Record<string, unknown> | undefined {
+function failureOutput(
+  event: CodexHookEventName,
+  error: unknown,
+  enforceProtection = false,
+): Record<string, unknown> | undefined {
   if (event === "Stop") return { continue: true };
   const message = humanError(error);
   if (isSoftIntegrationFailure(error)) {
@@ -2005,6 +2236,12 @@ function failureOutput(event: CodexHookEventName, error: unknown): Record<string
     return undefined;
   }
   if (event === "PreToolUse") {
+    if (!enforceProtection) {
+      return failOpenWriteHookOutput(
+        event,
+        `协作检查发生错误且未能确认权威保护模式（${message}）。`,
+      );
+    }
     return denyOutput(`Agent Hub 协作检查失败，已按保护策略暂停写入：${message}`);
   }
   if (event === "SessionStart") {
@@ -2017,6 +2254,12 @@ function failureOutput(event: CodexHookEventName, error: unknown): Record<string
     };
   }
   if (event === "PostToolUse") {
+    if (!enforceProtection) {
+      return failOpenWriteHookOutput(
+        event,
+        `写入登记发生错误且未能确认权威保护模式（${message}）。`,
+      );
+    }
     return {
       continue: false,
       stopReason: `Agent Hub 无法登记刚才的写入：${message}`,

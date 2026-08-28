@@ -97,17 +97,18 @@ export function evaluateRiskPolicy(
   const matchedRule = matchRule(path, category, rules)
     ?? { kind: "category", selector: category, level: DEFAULT_CATEGORY_LEVELS[category] };
   const configuredLevel = matchedRule.level;
-  const level = blockingProtectionEnabled ? configuredLevel : "warning";
   const source = ruleDescription(matchedRule, category);
   return {
     path,
     category,
-    level,
+    // 风险颜色描述范围本身，不能因为房间只监测就把重点范围降成普通范围。
+    // 是否阻止写入由租约策略的 decision 独立决定。
+    level: configuredLevel,
     configuredLevel,
     matchedRule,
     reason: blockingProtectionEnabled || configuredLevel === "warning"
       ? source
-      : `${source} Critical-range blocking is disabled for this room, so the overlap is warning-only.`,
+      : `${source} This room is in monitor-only mode, so the critical overlap remains visible but does not block writing.`,
   };
 }
 

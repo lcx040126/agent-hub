@@ -103,17 +103,18 @@ function evaluateOverlap(
 ): EvaluatedLeaseConflict {
   const sameMember = lease.memberId === request.memberId;
   if (lease.kind === "exclusive") {
-    const blocking = request.kind === "exclusive" || !sameMember;
+    const denied = request.kind === "exclusive" || !sameMember;
     return result(
       lease,
       requestedPath,
       existingPath,
-      blocking,
-      blocking
+      "blocking",
+      denied ? "deny" : "warn",
+      denied
         ? request.kind === "exclusive"
           ? "Overlapping manual exclusive leases cannot be active at the same time."
           : `${lease.memberName} has an active manual exclusive lease. Approval is required before another member's Agent can write.`
-        : "Another Agent session owned by the same member is using this manual exclusive range; writing is allowed with a warning.",
+        : "Another Agent session owned by the same member is using this manual exclusive range; the critical risk remains visible but writing is allowed.",
     );
   }
   if (request.kind === "exclusive") {
@@ -121,16 +122,23 @@ function evaluateOverlap(
       lease,
       requestedPath,
       existingPath,
-      true,
+      "blocking",
+      "deny",
       "A manual exclusive lease cannot start while any active work lease overlaps the requested range.",
     );
   }
-  if (sameMember && lease.kind === "standard" && lease.sessionId === null) {
+  if (
+    blockingProtectionEnabled
+    && sameMember
+    && lease.kind === "standard"
+    && lease.sessionId === null
+  ) {
     return result(
       lease,
       requestedPath,
       existingPath,
-      false,
+      "warning",
+      "warn",
       "This member's shared manual work range is available to all of their Agent sessions; the additional session is recorded as a warning.",
     );
   }
@@ -138,14 +146,18 @@ function evaluateOverlap(
   const requestedRisk = evaluateRiskPolicy(requestedPath, policy, blockingProtectionEnabled);
   const existingRisk = evaluateRiskPolicy(existingPath, policy, blockingProtectionEnabled);
   const blocking = requestedRisk.level === "blocking" || existingRisk.level === "blocking";
+  const decision = blocking && blockingProtectionEnabled ? "deny" : "warn";
   return {
     ...result(
       lease,
       requestedPath,
       existingPath,
-      blocking,
+      blocking ? "blocking" : "warning",
+      decision,
       blocking
-        ? `The active room policy marks this concrete overlap as blocking. ${requestedRisk.reason}`
+        ? blockingProtectionEnabled
+          ? `The active room policy marks this concrete overlap as blocking. ${requestedRisk.reason}`
+          : `The active room policy marks this concrete overlap as a critical risk, but monitor-only mode allows writing. ${requestedRisk.reason}`
         : `The concrete ranges overlap and the active room policy records a warning. ${requestedRisk.reason}`,
     ),
     requestedRisk,
@@ -157,7 +169,8 @@ function result(
   lease: CoordinationLeaseScope,
   requestedPath: string,
   existingPath: string,
-  blocking: boolean,
+  severity: "warning" | "blocking",
+  decision: "warn" | "deny",
   reason: string,
 ): EvaluatedLeaseConflict {
   return {
@@ -166,8 +179,8 @@ function result(
     memberName: lease.memberName,
     requestedPath,
     existingPath,
-    severity: blocking ? "blocking" : "warning",
-    decision: blocking ? "deny" : "warn",
+    severity,
+    decision,
     reason,
     expiresAt: lease.expiresAt,
     existingLeaseKind: lease.kind,

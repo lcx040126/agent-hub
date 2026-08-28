@@ -124,10 +124,16 @@ describe("Agent Hub Streamable HTTP MCP", () => {
 
     expect(client.getServerVersion()).toMatchObject({
       name: "agent-hub",
-      version: "0.2.5",
+      version: "0.2.6",
     });
     expect(client.getInstructions()).toContain("reuse that exact Hook session");
     expect(client.getInstructions()).toContain("do not call session_open");
+    expect(client.getInstructions()).toContain("Only decision=deny stops writing");
+    expect(client.getInstructions()).toContain("blocking severity but decision=warn is a writable high-risk warning");
+    expect(client.getInstructions()).toContain("edit_check requires historical confirmation");
+    expect(client.getInstructions()).toContain("monitor-only mode historical confirmation is advisory");
+    expect(client.getInstructions()).toContain("Lease conflicts remain governed by step 2's decision=deny rule");
+    expect(client.getInstructions()).not.toContain("edit_check returns decision=deny for historical confirmation");
 
     const listed = await client.listTools();
     expect(listed.tools.map((tool) => tool.name)).toEqual([
@@ -146,6 +152,8 @@ describe("Agent Hub Streamable HTTP MCP", () => {
     ]);
 
     const tools = Object.fromEntries(listed.tools.map((tool) => [tool.name, tool]));
+    expect(tools.edit_check.description).toContain("Stop when allowed=false");
+    expect(tools.edit_check.description).toContain("lease conflicts enter blockers only for decision=deny");
     expect(tools.context_query.annotations).toMatchObject({
       readOnlyHint: true,
       destructiveHint: false,

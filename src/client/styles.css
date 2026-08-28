@@ -1004,6 +1004,10 @@ code {
 .toggle-row span { display: grid; gap: 4px; }
 .toggle-row small { color: var(--muted); }
 .toggle-row input { width: 18px; height: 18px; }
+.monitor-upgrade-guidance { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 10px; margin-bottom: 4px; padding: 11px 12px; color: #6c4a22; background: var(--amber-soft); border: 1px solid #ead5b4; border-radius: 7px; }
+.monitor-upgrade-guidance > svg { width: 18px; height: 18px; margin-top: 1px; color: var(--amber); }
+.monitor-upgrade-guidance > span { display: grid; gap: 3px; }
+.monitor-upgrade-guidance small { color: #725f47; line-height: 1.5; }
 .management-actions, .member-management-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
 
 .release-request-banner {
