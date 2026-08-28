@@ -247,14 +247,22 @@ describe("desktop integration lifecycle", () => {
       return activated;
     });
     const startController = vi.fn(async () => { calls.push("integration:start"); });
+    const onActivated = vi.fn(() => { calls.push("schedulers:ensure"); });
 
     await expect(activateDesktopRoomConnection({
       connectionId: connection.id,
       controller: { activateExclusiveConnection, start: startController },
       localServer: { start: startServer },
+      onActivated,
     })).resolves.toEqual(activated);
 
-    expect(calls).toEqual(["server:start", "connection:activate", "integration:start"]);
+    expect(calls).toEqual([
+      "server:start",
+      "connection:activate",
+      "integration:start",
+      "schedulers:ensure",
+    ]);
+    expect(onActivated).toHaveBeenCalledTimes(1);
   });
 
   it("persists a new room paused before activating it exclusively", async () => {
@@ -291,6 +299,7 @@ describe("desktop integration lifecycle", () => {
         start: vi.fn(async () => { calls.push("integration:start"); }),
       },
       localServer: { start: vi.fn(async () => { calls.push("server:start"); }) },
+      onActivated: vi.fn(() => { calls.push("schedulers:ensure"); }),
     })).resolves.toEqual(activated);
 
     expect(calls).toEqual([
@@ -299,6 +308,7 @@ describe("desktop integration lifecycle", () => {
       "server:start",
       "connection:activate",
       "integration:start",
+      "schedulers:ensure",
     ]);
   });
 

@@ -19,25 +19,32 @@ describe("Codex session heartbeat scheduler", () => {
     const userDataPath = await temporaryUserData();
     const state = hookState();
     await new CodexHookStateStore(userDataPath).save(state);
+    let requestUrl: string | undefined;
+    let requestBody: unknown;
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      expect(String(_url)).toContain(`/api/sessions/${state.hubSessionId}/heartbeat`);
-      expect(JSON.parse(String(init?.body))).toMatchObject({
-        clientVersion: "0.2.4",
-        protocolVersion: 1,
-        schemaVersion: 4,
-        activityEpoch: 0,
-      });
+      requestUrl = String(_url);
+      requestBody = JSON.parse(String(init?.body));
       return jsonResponse(200, { session: { id: state.hubSessionId }, renewedLeases: [] });
     }) as typeof fetch;
+    const onError = vi.fn();
     const scheduler = startCodexSessionHeartbeatScheduler({
       userDataPath,
       store: connectionLookup(),
       fetchImpl,
       intervalMs: 60_000,
+      onError,
     });
     await scheduler.scanNow();
     await scheduler.stop();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(requestUrl).toContain(`/api/sessions/${state.hubSessionId}/heartbeat`);
+    expect(requestBody).toMatchObject({
+      clientVersion: "0.2.5",
+      protocolVersion: 1,
+      schemaVersion: 5,
+      activityEpoch: 0,
+    });
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it("persists renewed lease expiries without turning the heartbeat into Hook activity", async () => {
@@ -77,6 +84,129 @@ describe("Codex session heartbeat scheduler", () => {
       state: afterHeartbeat,
     }, new Date("2026-08-27T00:01:00.000Z"));
     expect(completion.expiresAt).toBe(renewedExpiry);
+  });
+
+  it("does not heartbeat while a write-blocked transition is pending", async () => {
+    const userDataPath = await temporaryUserData();
+    const state = hookState();
+    state.writeBlockSyncPending = {
+      dirty: true,
+      paths: ["src/task.ts"],
+      recordedAt: new Date().toISOString(),
+    };
+    await new CodexHookStateStore(userDataPath).save(state);
+    const store = connectionLookup();
+    const fetchImpl = vi.fn<typeof fetch>();
+    const scheduler = startCodexSessionHeartbeatScheduler({
+      userDataPath,
+      store,
+      fetchImpl,
+      intervalMs: 60_000,
+    });
+
+    await scheduler.scanNow();
+    await scheduler.stop();
+
+    expect(store.get).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the write-blocked gate after a stale scan snapshot and before sending", async () => {
+    const userDataPath = await temporaryUserData();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    const state = hookState();
+    state.leases = [{
+      id: "lease-before-pending",
+      paths: ["src/task.ts"],
+      expiresAt: "2026-08-28T00:10:00.000Z",
+      coordinationState: "working",
+    }];
+    await stateStore.save(state);
+    let markTrackerEntered!: () => void;
+    const trackerEntered = new Promise<void>((resolve) => { markTrackerEntered = resolve; });
+    let releaseTracker!: () => void;
+    const trackerReleased = new Promise<void>((resolve) => { releaseTracker = resolve; });
+    const operationTracker = {
+      async run<T>(_connectionId: string, operation: () => Promise<T>): Promise<T> {
+        markTrackerEntered();
+        await trackerReleased;
+        return operation();
+      },
+    };
+    const store = connectionLookup();
+    const fetchImpl = vi.fn<typeof fetch>();
+    const scheduler = startCodexSessionHeartbeatScheduler({
+      userDataPath,
+      store,
+      fetchImpl,
+      operationTracker,
+      intervalMs: 60_000,
+    });
+    const scan = scheduler.scanNow();
+    await trackerEntered;
+
+    const pending = (await stateStore.load(state.codexSessionId))!;
+    pending.writeBlockSyncPending = {
+      dirty: true,
+      paths: ["src/task.ts"],
+      recordedAt: new Date().toISOString(),
+    };
+    pending.leases = pending.leases.map((lease) => ({
+      ...lease,
+      coordinationState: "blocked",
+    }));
+    await stateStore.save(pending);
+    releaseTracker();
+
+    await scan;
+    await scheduler.stop();
+
+    expect(store.get).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(stateStore.load(state.codexSessionId)).resolves.toMatchObject({
+      writeBlockSyncPending: { dirty: true, paths: ["src/task.ts"] },
+      leases: [{ id: "lease-before-pending", coordinationState: "blocked" }],
+    });
+  });
+
+  it("keeps heartbeating a working lease while a passive path fence remains", async () => {
+    const userDataPath = await temporaryUserData();
+    const state = hookState();
+    state.leases = [{
+      id: "working-lease",
+      paths: ["src/reclaimed.ts"],
+      expiresAt: "2026-08-28T00:10:00.000Z",
+      coordinationState: "working",
+    }];
+    state.passiveWriteBlock = {
+      leaseId: "older-holder",
+      memberName: "Alice",
+      paths: ["src/still-held.ts"],
+      requestedPaths: ["src/reclaimed.ts", "src/still-held.ts"],
+      expiresAt: "2026-08-28T00:05:00.000Z",
+    };
+    await new CodexHookStateStore(userDataPath).save(state);
+    const renewedExpiry = "2026-08-28T00:20:00.000Z";
+    const fetchImpl = vi.fn(async () => jsonResponse(200, {
+      session: { id: state.hubSessionId },
+      renewedLeases: [{ id: "working-lease", expiresAt: renewedExpiry }],
+    })) as typeof fetch;
+    const scheduler = startCodexSessionHeartbeatScheduler({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl,
+      intervalMs: 60_000,
+    });
+
+    await scheduler.scanNow();
+    await scheduler.stop();
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    await expect(new CodexHookStateStore(userDataPath).load(state.codexSessionId))
+      .resolves.toMatchObject({
+        passiveWriteBlock: { leaseId: "older-holder" },
+        leases: [{ id: "working-lease", expiresAt: renewedExpiry }],
+      });
   });
 
   it("heartbeats two healthy sessions while isolating one malformed completion entry", async () => {

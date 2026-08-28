@@ -27,10 +27,10 @@ describe("Agent Hub REST API", () => {
     expect(health.body).toMatchObject({
       status: "ok",
       service: "agent-hub",
-      version: "0.2.4",
+      version: "0.2.5",
       protocolVersion: 1,
-      schemaVersion: 4,
-      database: { status: "ok", schemaVersion: 4 },
+      schemaVersion: 5,
+      database: { status: "ok", schemaVersion: 5 },
     });
   });
 
@@ -113,6 +113,146 @@ describe("Agent Hub REST API", () => {
     expect(dashboard.body.records.filter(
       (record: { title: string }) => record.title === "会话结束证据未完整生成",
     )).toHaveLength(1);
+  });
+
+  it("opens a new active generation while the previous Codex session is finalizing", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const first = await auth(request(app).post("/api/sessions").send({
+      codexSessionId: "codex-reopened-task",
+      turnId: "turn-before-end",
+      activityEpoch: 0,
+      repository: "C:/project",
+      branch: "main",
+    }), owner.body.token);
+    const firstSessionId = first.body.session.id as string;
+    const finalizationId = "finalization_reopened_task_001";
+
+    const finalizing = await auth(request(app)
+      .post(`/api/sessions/${firstSessionId}/finalize/start`)
+      .send({ finalizationId }), owner.body.token);
+    expect(finalizing.body.session.status).toBe("finalizing");
+
+    const reopened = await auth(request(app).post("/api/sessions").send({
+      codexSessionId: "codex-reopened-task",
+      turnId: "turn-after-reopen",
+      activityEpoch: 0,
+      repository: "C:/project",
+      branch: "main",
+    }), owner.body.token);
+    expect(reopened.status).toBe(201);
+    expect(reopened.body.session).toMatchObject({
+      status: "active",
+      reused: false,
+      codexSessionId: "codex-reopened-task",
+      currentTurnId: "turn-after-reopen",
+    });
+    expect(reopened.body.session.id).not.toBe(firstSessionId);
+
+    const sessions = await auth(request(app).get("/api/sessions"), owner.body.token);
+    expect(sessions.body.sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: firstSessionId, status: "finalizing" }),
+      expect.objectContaining({ id: reopened.body.session.id, status: "active" }),
+    ]));
+    expect((await auth(request(app)
+      .post(`/api/sessions/${firstSessionId}/heartbeat`).send({}), owner.body.token)).status).toBe(409);
+    expect((await auth(request(app)
+      .post(`/api/sessions/${reopened.body.session.id}/heartbeat`).send({}), owner.body.token)).status).toBe(200);
+  });
+
+  it("keeps finalization capabilities isolated when two sessions reuse one id", async () => {
+    const { app, database } = testApp();
+    const owner = await createRoom(app);
+    const openSession = (codexSessionId: string) => auth(request(app).post("/api/sessions").send({
+      codexSessionId,
+      repository: "C:/project",
+      branch: "main",
+    }), owner.body.token);
+    const first = await openSession("codex-finalization-owner");
+    const second = await openSession("codex-finalization-contender");
+    const finalizationId = "shared-finalization-capability";
+
+    expect((await auth(request(app)
+      .post(`/api/sessions/${first.body.session.id}/finalize/start`)
+      .send({ finalizationId }), owner.body.token)).status).toBe(200);
+    const firstScan = await auth(request(app)
+      .post(`/api/sessions/${first.body.session.id}/scan`)
+      .send({ finalizationId, changedPaths: ["src/first.ts"] }), owner.body.token);
+    expect(firstScan.status).toBe(201);
+
+    const conflictingStart = await auth(request(app)
+      .post(`/api/sessions/${second.body.session.id}/finalize/start`)
+      .send({ finalizationId }), owner.body.token);
+    expect(conflictingStart.status).toBe(409);
+    expect(conflictingStart.body.error).toBe("finalization_conflict");
+
+    // 防御旧版或手工修改过的数据库：即使出现重复能力，也不能跨会话返回扫描证据。
+    database.connection.prepare(`
+      UPDATE work_sessions
+      SET finalization_id = ?, finalizing_at = last_seen_at
+      WHERE id = ?
+    `).run(finalizationId, second.body.session.id);
+    const conflictingScan = await auth(request(app)
+      .post(`/api/sessions/${second.body.session.id}/scan`)
+      .send({ finalizationId, changedPaths: ["src/second.ts"] }), owner.body.token);
+    expect(conflictingScan.status).toBe(409);
+    expect(conflictingScan.body.error).toBe("finalization_conflict");
+    expect(conflictingScan.body.scan).toBeUndefined();
+    expect(firstScan.body.scan.sessionId).toBe(first.body.session.id);
+  });
+
+  it("lets a reopened Codex task continue its automatic path while different tasks still wait", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    await auth(request(app).post("/api/room/settings").send({
+      riskRules: [{ kind: "extension", selector: ".ts", level: "blocking" }],
+    }), owner.body.token);
+    const openSession = (codexSessionId: string, turnId: string) => auth(
+      request(app).post("/api/sessions").send({
+        codexSessionId,
+        turnId,
+        activityEpoch: 0,
+        repository: "C:/project",
+        branch: "main",
+      }),
+      owner.body.token,
+    );
+    const first = await openSession("codex-same-logical-task", "turn-before-end");
+    const firstLease = await auth(request(app).post("/api/leases").send({
+      sessionId: first.body.session.id,
+      title: "Critical path before reopen",
+      autoClaim: true,
+      paths: ["src/critical.ts"],
+    }), owner.body.token);
+    expect(firstLease.body.acquired).toBe(true);
+
+    await auth(request(app)
+      .post(`/api/sessions/${first.body.session.id}/finalize/start`)
+      .send({ finalizationId: "finalization_same_logical_task" }), owner.body.token);
+    const reopened = await openSession("codex-same-logical-task", "turn-after-reopen");
+    expect(reopened.body.session.id).not.toBe(first.body.session.id);
+    const continued = await auth(request(app).post("/api/leases").send({
+      sessionId: reopened.body.session.id,
+      title: "Continue critical path after reopen",
+      autoClaim: true,
+      paths: ["src/critical.ts"],
+    }), owner.body.token);
+    expect(continued.body).toMatchObject({ acquired: true, decision: "allow", conflicts: [] });
+
+    const independent = await openSession("codex-independent-task", "turn-independent");
+    const waiting = await auth(request(app).post("/api/leases").send({
+      sessionId: independent.body.session.id,
+      title: "Independent critical path",
+      autoClaim: true,
+      paths: ["src/critical.ts"],
+    }), owner.body.token);
+    expect(waiting.body).toMatchObject({
+      acquired: false,
+      decision: "wait",
+      conflicts: [],
+      releaseRequests: [],
+      waitingFor: { paths: ["src/critical.ts"] },
+    });
   });
 
   it("exposes commit-gated automatic release with retry and activity-epoch fencing", async () => {
@@ -474,6 +614,488 @@ describe("Agent Hub REST API", () => {
     expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).toContain(first.body.lease.id);
   });
 
+  it("keeps same-member automatic sessions in one deterministic write lane", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const openSession = (codexSessionId: string) => auth(request(app).post("/api/sessions").send({
+      codexSessionId,
+      turnId: `${codexSessionId}-turn-0`,
+      activityEpoch: 0,
+    }), owner.body.token);
+    const firstSession = await openSession("codex-lane-first");
+    const secondSession = await openSession("codex-lane-second");
+    const thirdSession = await openSession("codex-lane-third");
+
+    const first = await auth(request(app).post("/api/leases").send({
+      sessionId: firstSession.body.session.id,
+      title: "First lane",
+      autoClaim: true,
+      paths: ["src/x"],
+    }), owner.body.token);
+    const second = await auth(request(app).post("/api/leases").send({
+      sessionId: secondSession.body.session.id,
+      title: "Second independent lane",
+      autoClaim: true,
+      paths: ["src/y"],
+    }), owner.body.token);
+    expect(first.body.acquired).toBe(true);
+    expect(second.body.acquired).toBe(true);
+
+    const waiting = await auth(request(app).post("/api/leases").send({
+      sessionId: thirdSession.body.session.id,
+      title: "Broad overlapping lane",
+      autoClaim: true,
+      paths: ["src"],
+    }), owner.body.token);
+    expect(waiting.body).toMatchObject({
+      acquired: false,
+      decision: "wait",
+      conflicts: [],
+      releaseRequests: [],
+      waitingFor: { leaseId: first.body.lease.id, sessionId: firstSession.body.session.id },
+    });
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).toEqual(
+      expect.arrayContaining([first.body.lease.id, second.body.lease.id]),
+    );
+    expect(dashboard.body.leases).toHaveLength(2);
+  });
+
+  it("does not rewrite pre-existing same-member overlaps without local Git evidence", async () => {
+    const { app, database } = testApp();
+    const owner = await createRoom(app);
+    const openSession = (codexSessionId: string) => auth(request(app).post("/api/sessions").send({
+      codexSessionId,
+      turnId: `${codexSessionId}-turn-0`,
+      activityEpoch: 0,
+    }), owner.body.token);
+    const firstSession = await openSession("codex-existing-overlap-first");
+    const secondSession = await openSession("codex-existing-overlap-second");
+    const unrelatedSession = await openSession("codex-existing-overlap-unrelated");
+    const waitingSession = await openSession("codex-existing-overlap-waiting");
+
+    const first = await auth(request(app).post("/api/leases").send({
+      sessionId: firstSession.body.session.id,
+      title: "Existing broad scope",
+      autoClaim: true,
+      paths: ["src/shared"],
+    }), owner.body.token);
+    const second = await auth(request(app).post("/api/leases").send({
+      sessionId: secondSession.body.session.id,
+      title: "Legacy overlapping scope",
+      autoClaim: true,
+      paths: ["src/independent.ts"],
+    }), owner.body.token);
+    expect(first.body.acquired).toBe(true);
+    expect(second.body.acquired).toBe(true);
+
+    // Simulate an overlap persisted by an older version. The server has no Git
+    // evidence proving either existing task is clean, so a later claim must not
+    // arbitrate between them by creation time.
+    database.connection.prepare(`
+      UPDATE lease_paths SET path = 'src/shared/legacy.ts', path_key = 'src/shared/legacy.ts'
+      WHERE lease_id = ?
+    `).run(second.body.lease.id);
+
+    const unrelated = await auth(request(app).post("/api/leases").send({
+      sessionId: unrelatedSession.body.session.id,
+      title: "Unrelated new scope",
+      autoClaim: true,
+      paths: ["docs/release.md"],
+    }), owner.body.token);
+    expect(unrelated.body.acquired).toBe(true);
+
+    const waiting = await auth(request(app).post("/api/leases").send({
+      sessionId: waitingSession.body.session.id,
+      title: "Later overlapping scope",
+      autoClaim: true,
+      paths: ["src/shared/new.ts"],
+    }), owner.body.token);
+    expect(waiting.body).toMatchObject({
+      acquired: false,
+      decision: "wait",
+      waitingFor: { leaseId: first.body.lease.id },
+    });
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).toEqual(
+      expect.arrayContaining([first.body.lease.id, second.body.lease.id, unrelated.body.lease.id]),
+    );
+    expect(dashboard.body.leases).toHaveLength(3);
+  });
+
+  it("keeps dirty passively blocked leases fenced across a new turn", async () => {
+    let currentTime = Date.parse("2026-08-25T10:00:00.000Z");
+    const { app } = testApp(() => new Date(currentTime));
+    const owner = await createRoom(app);
+    const firstSession = await auth(request(app).post("/api/sessions").send({
+      codexSessionId: "codex-block-holder",
+      turnId: "holder-turn-0",
+      activityEpoch: 0,
+    }), owner.body.token);
+    const blockedSession = await auth(request(app).post("/api/sessions").send({
+      codexSessionId: "codex-blocked-session",
+      turnId: "blocked-turn-0",
+      activityEpoch: 0,
+    }), owner.body.token);
+    const holder = await auth(request(app).post("/api/leases").send({
+      sessionId: firstSession.body.session.id,
+      title: "Holder",
+      autoClaim: true,
+      paths: ["src/holder.ts"],
+    }), owner.body.token);
+    const owned = await auth(request(app).post("/api/leases").send({
+      sessionId: blockedSession.body.session.id,
+      title: "Dirty task scope",
+      autoClaim: true,
+      paths: ["src/dirty.ts"],
+    }), owner.body.token);
+    expect(holder.body.acquired).toBe(true);
+    expect(owned.body.acquired).toBe(true);
+    const originalExpiry = owned.body.lease.expiresAt;
+
+    const blocked = await auth(request(app)
+      .post(`/api/sessions/${blockedSession.body.session.id}/write-blocked`)
+      .send({ dirty: true, paths: ["src/holder.ts"], reason: "Waiting for the active holder." }), owner.body.token);
+    expect(blocked.body).toEqual({ releasedLeaseIds: [], blockedLeaseIds: [owned.body.lease.id] });
+    const repeated = await auth(request(app)
+      .post(`/api/sessions/${blockedSession.body.session.id}/write-blocked`)
+      .send({ dirty: true, paths: ["src/holder.ts"], reason: "Waiting for the active holder." }), owner.body.token);
+    expect(repeated.body).toEqual(blocked.body);
+
+    currentTime += 60_000;
+    const advanced = await auth(request(app).post("/api/sessions").send({
+      codexSessionId: "codex-blocked-session",
+      turnId: "blocked-turn-1",
+      activityEpoch: 1,
+    }), owner.body.token);
+    expect(advanced.body.session).toMatchObject({ currentTurnId: "blocked-turn-1", activityEpoch: 1 });
+    const heartbeat = await auth(request(app)
+      .post(`/api/sessions/${blockedSession.body.session.id}/heartbeat`)
+      .send({}), owner.body.token);
+    expect(heartbeat.body.renewedLeases.map((lease: { id: string }) => lease.id)).not.toContain(owned.body.lease.id);
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases.find((lease: { id: string }) => lease.id === owned.body.lease.id)).toMatchObject({
+      phase: "blocked",
+      expiresAt: originalExpiry,
+    });
+    const denied = await auth(request(app).post("/api/leases").send({
+      sessionId: blockedSession.body.session.id,
+      title: "Bypass attempt",
+      autoClaim: true,
+      paths: ["src/new.ts"],
+    }), owner.body.token);
+    expect(denied.status).toBe(409);
+    expect(denied.body.error).toBe("session_write_blocked");
+
+    currentTime = Date.parse(originalExpiry) + 1;
+    const expiredSync = await auth(request(app)
+      .post(`/api/sessions/${blockedSession.body.session.id}/write-blocked`)
+      .send({ dirty: true, paths: ["src/new.ts"], reason: "Recheck after the blocked lease TTL." }), owner.body.token);
+    expect(expiredSync.body).toEqual({ releasedLeaseIds: [], blockedLeaseIds: [] });
+  });
+
+  it("keeps dashboard scan polling compact regardless of stored scan evidence", async () => {
+    const { app, database } = testApp();
+    const owner = await createRoom(app);
+    const opened = await auth(request(app).post("/api/sessions").send({ task: "Large scan history" }), owner.body.token);
+    const insert = database.connection.prepare(`
+      INSERT INTO local_scans (
+        id, session_id, room_id, member_id, repository, branch, worktree, base_commit,
+        changed_paths_json, rule_files_json, systems_json, metadata_json, scanned_at
+      ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, '[]', '[]', '[]', ?, ?)
+    `);
+    for (let index = 0; index < 65; index += 1) {
+      insert.run(
+        `large-scan-${String(index).padStart(2, "0")}`,
+        opened.body.session.id,
+        owner.body.room.id,
+        owner.body.member.id,
+        JSON.stringify({ evidence: "x".repeat(20_000) }),
+        new Date(Date.parse("2026-08-25T10:00:00.000Z") + index).toISOString(),
+      );
+    }
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.localScans).toEqual([{
+      id: "large-scan-64",
+      sessionId: opened.body.session.id,
+      memberId: owner.body.member.id,
+      scannedAt: "2026-08-25T10:00:00.064Z",
+    }]);
+    expect(Buffer.byteLength(JSON.stringify(dashboard.body), "utf8")).toBeLessThan(128 * 1024);
+  });
+
+  it("keeps non-scan dashboard history below the desktop proxy response limit", async () => {
+    const { app, database } = testApp();
+    const owner = await createRoom(app);
+    const riskRules = Array.from({ length: 100 }, (_, index) => ({
+      kind: "directory",
+      selector: `src/rule-${index}-${"r".repeat(1_000)}`,
+      level: "warning",
+    }));
+    const settings = await auth(request(app).post("/api/room/settings").send({ riskRules }), owner.body.token);
+    expect(settings.status).toBe(200);
+    const opened = await auth(request(app).post("/api/sessions").send({
+      task: "Large dashboard history",
+      metadata: { evidence: "s".repeat(31_000) },
+    }), owner.body.token);
+    expect(opened.status).toBe(201);
+
+    const insert = database.connection.prepare(`
+      INSERT INTO records (
+        id, room_id, member_id, kind, title, summary, paths_json, status,
+        evidence_json, commit_hash, created_at
+      ) VALUES (?, ?, ?, 'risk', ?, ?, '["src/large.ts"]', 'open', ?, NULL, ?)
+    `);
+    const evidence = JSON.stringify(Array.from({ length: 100 }, () => "测".repeat(1_200)));
+    for (let index = 0; index < 4; index += 1) {
+      insert.run(
+        `large-record-${index}`,
+        owner.body.room.id,
+        owner.body.member.id,
+        `Large record ${index}`,
+        "s".repeat(12_000),
+        evidence,
+        new Date(Date.parse("2026-08-25T10:00:00.000Z") + index).toISOString(),
+      );
+    }
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.status).toBe(200);
+    expect(Buffer.byteLength(dashboard.text, "utf8")).toBeLessThan(768 * 1024);
+    expect(dashboard.body.partialSections).toContain("records");
+    expect(dashboard.body.sectionTotals.records).toBe(4);
+    expect(dashboard.body.records.length).toBeGreaterThan(0);
+    expect(dashboard.body.records.length).toBeLessThan(4);
+    expect(dashboard.body.settings.riskRules).toHaveLength(riskRules.length);
+    expect(dashboard.body.settings.riskRules.at(-1)).toMatchObject(riskRules.at(-1)!);
+    expect(dashboard.body.sessions[0]).not.toHaveProperty("metadata");
+    expect(dashboard.body.sessions[0]).not.toHaveProperty("repository");
+    expect(dashboard.body.activity[0]).not.toHaveProperty("metadata");
+
+    const saved = await auth(request(app).post("/api/room/settings").send({
+      automaticLeaseTtlMinutes: 30,
+      riskRules: dashboard.body.settings.riskRules,
+    }), owner.body.token);
+    expect(saved.status).toBe(200);
+    const persisted = await auth(request(app).get("/api/room/settings"), owner.body.token);
+    expect(persisted.body.settings.automaticLeaseTtlMinutes).toBe(30);
+    expect(persisted.body.settings.riskRules).toHaveLength(riskRules.length);
+    expect(persisted.body.settings.riskRules.at(-1)).toMatchObject(riskRules.at(-1)!);
+  });
+
+  it("reports real dashboard totals and marks SQL display windows as partial", async () => {
+    const { app, database } = testApp();
+    const owner = await createRoom(app);
+    const insertRecord = database.connection.prepare(`
+      INSERT INTO records (
+        id, room_id, member_id, kind, title, summary, paths_json, status,
+        evidence_json, commit_hash, created_at
+      ) VALUES (?, ?, ?, 'risk', ?, 'summary', '[]', 'open', '[]', NULL, ?)
+    `);
+    const insertSession = database.connection.prepare(`
+      INSERT INTO work_sessions (
+        id, room_id, member_id, status, branch_epoch, metadata_json,
+        opened_at, last_seen_at, activity_epoch
+      ) VALUES (?, ?, ?, 'active', 1, '{}', ?, ?, 0)
+    `);
+    const insertActivity = database.connection.prepare(`
+      INSERT INTO activities (
+        id, room_id, actor_member_id, actor_name, type, entity_type,
+        entity_id, summary, metadata_json, created_at
+      ) VALUES (?, ?, ?, 'Alice', 'test.activity', 'test', NULL, 'summary', '{}', ?)
+    `);
+    database.transaction(() => {
+      for (let index = 0; index < 501; index += 1) {
+        const timestamp = new Date(Date.parse("2026-08-25T10:00:00.000Z") + index).toISOString();
+        insertRecord.run(
+          `window-record-${String(index).padStart(3, "0")}`,
+          owner.body.room.id,
+          owner.body.member.id,
+          `Record ${index}`,
+          timestamp,
+        );
+        insertSession.run(
+          `window-session-${String(index).padStart(3, "0")}`,
+          owner.body.room.id,
+          owner.body.member.id,
+          timestamp,
+          timestamp,
+        );
+      }
+      for (let index = 0; index < 101; index += 1) {
+        insertActivity.run(
+          `window-activity-${String(index).padStart(3, "0")}`,
+          owner.body.room.id,
+          owner.body.member.id,
+          new Date(Date.parse("2026-08-25T11:00:00.000Z") + index).toISOString(),
+        );
+      }
+    });
+
+    const expected = database.connection.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM records WHERE room_id = ?) AS records,
+        (SELECT COUNT(*) FROM work_sessions WHERE room_id = ? AND status <> 'closed') AS sessions,
+        (SELECT COUNT(*) FROM activities WHERE room_id = ?) AS activity
+    `).get(owner.body.room.id, owner.body.room.id, owner.body.room.id) as {
+      records: number;
+      sessions: number;
+      activity: number;
+    };
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.sectionTotals).toMatchObject(expected);
+    expect(dashboard.body.records).toHaveLength(500);
+    expect(dashboard.body.sessions).toHaveLength(500);
+    expect(dashboard.body.activity).toHaveLength(100);
+    expect(dashboard.body.partialSections).toEqual(expect.arrayContaining([
+      "records",
+      "sessions",
+      "activity",
+    ]));
+  });
+
+  it("filters pending handover requests by holder before applying the dashboard limit", async () => {
+    const { app, database } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    const carol = await joinRoom(app, owner.body.inviteCode, "Carol");
+    const ownerLease = await auth(request(app).post("/api/leases").send({
+      title: "Owner holder",
+      kind: "standard",
+      paths: ["src/owner.ts"],
+    }), owner.body.token);
+    const bobLease = await auth(request(app).post("/api/leases").send({
+      title: "Bob holder",
+      kind: "standard",
+      paths: ["src/bob.ts"],
+    }), bob.body.token);
+    const insertRequest = database.connection.prepare(`
+      INSERT INTO release_requests (
+        id, room_id, requester_member_id, requester_session_id, requester_lease_id,
+        conflicting_lease_id, request_title, request_objective, requested_kind,
+        requested_mode, requested_branch, requested_base_commit, requested_ttl_minutes,
+        requested_paths_json, overlap_paths_json, reason, transfer_key, dedupe_key,
+        status, requested_at, last_requested_at
+      ) VALUES (?, ?, ?, NULL, NULL, ?, ?, NULL, 'automatic', 'write', NULL, NULL, 15,
+        ?, ?, 'test request', ?, ?, 'pending', ?, ?)
+    `);
+    const insertForHolder = (
+      id: string,
+      leaseId: string,
+      path: string,
+      timestamp: string,
+    ) => insertRequest.run(
+      id,
+      owner.body.room.id,
+      carol.body.member.id,
+      leaseId,
+      id,
+      JSON.stringify([path]),
+      JSON.stringify([{ requestedPath: path, existingPath: path }]),
+      `transfer-${id}`,
+      `dedupe-${id}`,
+      timestamp,
+      timestamp,
+    );
+    database.transaction(() => {
+      insertForHolder("older-owner-request", ownerLease.body.lease.id, "src/owner.ts", "2026-08-25T09:00:00.000Z");
+      for (let index = 0; index < 500; index += 1) {
+        insertForHolder(
+          `newer-bob-request-${String(index).padStart(3, "0")}`,
+          bobLease.body.lease.id,
+          "src/bob.ts",
+          new Date(Date.parse("2026-08-25T10:00:00.000Z") + index).toISOString(),
+        );
+      }
+    });
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.releaseRequests).toEqual([
+      expect.objectContaining({ id: "older-owner-request", holderMemberId: owner.body.member.id }),
+    ]);
+    expect(dashboard.body.sectionTotals.releaseRequests).toBe(1);
+  });
+
+  it("keeps the newest holder handover actionable before large lease scopes consume the dashboard budget", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    await auth(request(app).post("/api/leases").send({
+      title: "Scene holder",
+      kind: "standard",
+      paths: ["Assets/Scenes"],
+    }), owner.body.token);
+
+    for (let leaseIndex = 0; leaseIndex < 8; leaseIndex += 1) {
+      const paths = Array.from({ length: 100 }, (_, pathIndex) =>
+        `bulk-${leaseIndex}/scope-${pathIndex}-${"x".repeat(960)}.cs`);
+      const largeLease = await auth(request(app).post("/api/leases").send({
+        title: `Large valid lease ${leaseIndex}`,
+        kind: "standard",
+        paths,
+      }), owner.body.token);
+      expect(largeLease.status).toBe(201);
+    }
+
+    const requestedPaths = Array.from({ length: 100 }, (_, pathIndex) =>
+      `Assets/Scenes/request-${pathIndex}-${"y".repeat(900)}.unity`);
+    const blocked = await auth(request(app).post("/api/leases").send({
+      title: "Large scene handover",
+      autoClaim: true,
+      paths: requestedPaths,
+    }), bob.body.token);
+    expect(blocked.body).toMatchObject({ acquired: false, decision: "deny" });
+    const requestId = blocked.body.releaseRequests[0].id;
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.status).toBe(200);
+    expect(Buffer.byteLength(dashboard.text, "utf8")).toBeLessThan(768 * 1024);
+    expect(dashboard.body.partialSections).toEqual(expect.arrayContaining(["leases", "conflicts"]));
+    expect(dashboard.body.releaseRequests).toEqual([
+      expect.objectContaining({
+        id: requestId,
+        holderMemberId: owner.body.member.id,
+        requestedPaths,
+        overlapPaths: [],
+      }),
+    ]);
+
+    const fullRequests = await auth(request(app).get("/api/release-requests?status=pending"), owner.body.token);
+    const fullRequest = fullRequests.body.releaseRequests.find(
+      (releaseRequest: { id: string }) => releaseRequest.id === requestId,
+    );
+    expect(fullRequest.requestedPaths).toEqual(requestedPaths);
+    expect(fullRequest.overlapPaths).toHaveLength(requestedPaths.length);
+
+    const rejected = await auth(request(app)
+      .post(`/api/release-requests/${requestId}/resolve`)
+      .send({ decision: "reject", reason: "Owner is still working in this scene." }), owner.body.token);
+    expect(rejected.status).toBe(200);
+    expect(rejected.body.releaseRequest).toMatchObject({ id: requestId, status: "rejected" });
+  });
+
+  it("returns a compact capacity error when corrupted core dashboard data exceeds its budget", async () => {
+    const { app, database } = testApp();
+    const owner = await createRoom(app);
+    database.connection.prepare("UPDATE rooms SET repository = ? WHERE id = ?")
+      .run("测".repeat(400_000), owner.body.room.id);
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.status).toBe(507);
+    expect(dashboard.body).toEqual({
+      error: "dashboard_capacity_exceeded",
+      message: "The dashboard core state exceeds the safe desktop response budget.",
+    });
+    expect(Buffer.byteLength(JSON.stringify(dashboard.body), "utf8")).toBeLessThan(1024);
+  });
+
   it("deduplicates release requests and atomically transfers only conflicting standard paths", async () => {
     const { app } = testApp();
     const owner = await createRoom(app);
@@ -500,6 +1122,13 @@ describe("Agent Hub REST API", () => {
     expect(firstBlocked.body).toMatchObject({ acquired: false, decision: "deny" });
     expect(repeated.body.releaseRequests[0].id).toBe(firstBlocked.body.releaseRequests[0].id);
     expect(repeated.body.releaseRequests[0].occurrenceCount).toBe(2);
+
+    const holderDashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    const requesterDashboard = await auth(request(app).get("/api/dashboard"), bob.body.token);
+    expect(holderDashboard.body.releaseRequests).toEqual([
+      expect.objectContaining({ id: firstBlocked.body.releaseRequests[0].id }),
+    ]);
+    expect(requesterDashboard.body.releaseRequests).toEqual([]);
 
     const forbidden = await auth(request(app)
       .post(`/api/release-requests/${firstBlocked.body.releaseRequests[0].id}/resolve`)
@@ -708,7 +1337,8 @@ describe("Agent Hub REST API", () => {
       expect.objectContaining({ id: pendingIds[0], status: "cancelled" }),
       expect.objectContaining({ id: pendingIds[1], status: "cancelled" }),
     ]));
-    expect(dashboard.body.activity).toEqual(expect.arrayContaining([
+    const activity = await auth(request(app).get("/api/activity"), owner.body.token);
+    expect(activity.body.activity).toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: "member.removed",
         metadata: expect.objectContaining({

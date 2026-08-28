@@ -589,6 +589,12 @@ describe("dashboard lease compatibility", () => {
                 turnStoppedAt: "2026-08-27T08:00:00.000Z",
               }],
               localScans: [],
+              releaseRequests: [{
+                id: "request-1",
+                holderMemberId: "member-a",
+                requestedPaths: ["Assets/Scenes/Main.unity"],
+                status: "pending",
+              }],
               generatedAt: "2026-08-27T08:00:00.000Z",
               server: { mcpUrl: "http://127.0.0.1:4173/mcp" },
             },
@@ -605,6 +611,11 @@ describe("dashboard lease compatibility", () => {
       ["lease-unknown", "working"],
     ]);
     expect(result.sessions[0]?.turnStoppedAt).toBe("2026-08-27T08:00:00.000Z");
+    expect(result.releaseRequests[0]).toMatchObject({
+      id: "request-1",
+      requestedPaths: ["Assets/Scenes/Main.unity"],
+      overlapPaths: [],
+    });
     expect(result.generatedAt).toBe("2026-08-27T08:00:00.000Z");
   });
 });

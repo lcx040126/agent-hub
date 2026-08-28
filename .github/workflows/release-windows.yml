@@ -113,7 +113,7 @@ jobs:
         run: pnpm typecheck
 
       - name: Test
-        run: pnpm test
+        run: pnpm exec vitest run --maxWorkers=1
 
       - name: Validate Agent Hub release gate configuration
         shell: pwsh
@@ -140,6 +140,9 @@ jobs:
 
       - name: Verify packaged update recovery backup
         run: pnpm desktop:verify-recovery
+
+      - name: Verify packaged database migrations
+        run: node scripts/verify-packaged-database-migrations.mjs release/win-unpacked
 
       - name: Create signed update manifest
         shell: pwsh

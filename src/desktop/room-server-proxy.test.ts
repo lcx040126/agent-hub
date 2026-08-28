@@ -88,6 +88,12 @@ describe("createRequestPlan", () => {
   });
 
   it("allows v0.2 collaboration routes without opening arbitrary API access", () => {
+    expect(createRequestPlan(
+      { method: "GET", path: "/api/release-requests?status=pending" },
+      "https://hub.example",
+      "secret",
+      true,
+    ).url).toBe("https://hub.example/api/release-requests?status=pending");
     const allowedRequests = [
       { method: "GET", path: "/api/release-requests?status=pending" },
       { method: "GET", path: "/api/sessions" },
@@ -189,6 +195,60 @@ describe("requestRoomServer", () => {
         fetchMock as typeof fetch,
       ),
     ).rejects.toThrow(/non-JSON/i);
+  });
+
+  it("keeps the one MiB response limit for saved room requests", async () => {
+    const connections = {
+      get: vi.fn(async () => ({
+        id: "connection-1",
+        serverUrl: "https://hub.example",
+        repositoryPath: "C:\\repo",
+        createdAt: "2026-08-25T00:00:00.000Z",
+        updatedAt: "2026-08-25T00:00:00.000Z",
+      })),
+      readMemberToken: vi.fn(async () => "private-member-token"),
+    };
+    const oversizedBody = JSON.stringify({ payload: "x".repeat(1024 * 1024) });
+    const fetchMock = vi.fn(async () => new Response(oversizedBody, {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(oversizedBody, "utf8")),
+      },
+    }));
+
+    await expect(requestRoomServer(
+      { connectionId: "connection-1", method: "GET", path: "/api/dashboard" },
+      connections,
+      fetchMock as typeof fetch,
+    )).rejects.toThrow(/response is too large/i);
+  });
+
+  it("accepts a multibyte dashboard response inside the server budget", async () => {
+    const connections = {
+      get: vi.fn(async () => ({
+        id: "connection-1",
+        serverUrl: "https://hub.example",
+        repositoryPath: "C:\\repo",
+        createdAt: "2026-08-25T00:00:00.000Z",
+        updatedAt: "2026-08-25T00:00:00.000Z",
+      })),
+      readMemberToken: vi.fn(async () => "private-member-token"),
+    };
+    const budgetedBody = JSON.stringify({ payload: "测".repeat(250_000) });
+    const fetchMock = vi.fn(async () => new Response(budgetedBody, {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(budgetedBody, "utf8")),
+      },
+    }));
+
+    await expect(requestRoomServer(
+      { connectionId: "connection-1", method: "GET", path: "/api/dashboard" },
+      connections,
+      fetchMock as typeof fetch,
+    )).resolves.toMatchObject({ status: 200, body: { payload: expect.any(String) } });
   });
 
   it("accepts an empty 204 response from owner management routes", async () => {

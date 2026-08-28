@@ -1415,6 +1415,26 @@ code {
   background: var(--amber);
 }
 
+.work-item.waiting {
+  background: #fffdf8;
+  border-color: #decba9;
+}
+
+.work-item.waiting .work-state,
+.work-item.waiting .work-state span {
+  background: var(--amber);
+}
+
+.work-item.blocked {
+  background: #fff9f8;
+  border-color: #e3bbb6;
+}
+
+.work-item.blocked .work-state,
+.work-item.blocked .work-state span {
+  background: var(--danger);
+}
+
 .work-main {
   min-width: 0;
 }
@@ -1494,6 +1514,15 @@ code {
 .awaiting-commit-state strong {
   font-size: 11px;
   line-height: 1.35;
+}
+
+.work-item.blocked .awaiting-commit-state {
+  background: var(--danger-soft);
+  border-color: #e6beb8;
+}
+
+.work-item.blocked .awaiting-commit-state svg {
+  color: var(--danger);
 }
 
 .work-objective {

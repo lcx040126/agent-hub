@@ -5,7 +5,7 @@ import { createDefaultRiskPolicy } from "./risk-policy.js";
 
 const DEFAULT_RISK_RULES_JSON = JSON.stringify(createDefaultRiskPolicy().rules);
 const DEFAULT_RISK_RULES_SQL = DEFAULT_RISK_RULES_JSON.replaceAll("'", "''");
-const DATABASE_SCHEMA_VERSION = 4;
+const DATABASE_SCHEMA_VERSION = 5;
 
 export interface AgentHubDatabaseOptions {
   path?: string;
@@ -136,6 +136,7 @@ export class AgentHubDatabase {
         remaining_risks_json TEXT NOT NULL DEFAULT '[]',
         handoff TEXT
         ,automatic_phase TEXT NOT NULL DEFAULT 'working' CHECK (automatic_phase IN ('working', 'awaiting_commit'))
+        ,coordination_state TEXT NOT NULL DEFAULT 'working' CHECK (coordination_state IN ('working', 'waiting', 'blocked', 'awaiting_commit'))
       );
       CREATE INDEX IF NOT EXISTS leases_room_status_idx
         ON leases(room_id, status, expires_at);
@@ -494,6 +495,19 @@ export class AgentHubDatabase {
         "ALTER TABLE leases ADD COLUMN automatic_phase TEXT NOT NULL DEFAULT 'working' CHECK (automatic_phase IN ('working', 'awaiting_commit'))",
       );
     }
+    if (!leaseColumns.some((column) => column.name === "coordination_state")) {
+      this.connection.exec(
+        "ALTER TABLE leases ADD COLUMN coordination_state TEXT NOT NULL DEFAULT 'working' CHECK (coordination_state IN ('working', 'waiting', 'blocked', 'awaiting_commit'))",
+      );
+    }
+    // schema 5 中断或手工补列后也要可重试：旧 automatic_phase 仍是迁移时的权威来源。
+    this.connection.exec(`
+      UPDATE leases
+      SET coordination_state = automatic_phase
+      WHERE kind = 'automatic'
+        AND automatic_phase = 'awaiting_commit'
+        AND coordination_state = 'working'
+    `);
     this.connection.exec("CREATE INDEX IF NOT EXISTS leases_session_idx ON leases(session_id)");
 
     const roomColumns = this.connection.prepare("PRAGMA table_info(rooms)").all() as Array<{ name: string }>;
@@ -544,9 +558,8 @@ export class AgentHubDatabase {
       SELECT id, room_id, member_id, codex_session_id, status, finalizing_at,
         last_seen_at, opened_at
       FROM work_sessions
-      WHERE codex_session_id IS NOT NULL AND closed_at IS NULL
+      WHERE codex_session_id IS NOT NULL AND closed_at IS NULL AND finalizing_at IS NULL
       ORDER BY room_id, member_id, codex_session_id,
-        CASE WHEN finalizing_at IS NOT NULL THEN 0 ELSE 1 END,
         last_seen_at DESC, opened_at DESC, id DESC
     `).all() as Array<{
       id: string;
@@ -563,14 +576,14 @@ export class AgentHubDatabase {
       UPDATE work_sessions SET
         status = 'closed', closed_at = COALESCE(closed_at, last_seen_at),
         finalizing_at = NULL,
-        finalization_error = COALESCE(finalization_error, 'Superseded duplicate Codex session during schema 4 migration.')
+        finalization_error = COALESCE(finalization_error, 'Superseded duplicate Codex session during database migration.')
       WHERE id = ?
     `);
     const preserveDuplicateWorkingLease = this.connection.prepare(`
       UPDATE leases SET
-        automatic_phase = 'awaiting_commit', updated_at = ?
+        automatic_phase = 'awaiting_commit', coordination_state = 'awaiting_commit', updated_at = ?
       WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
-        AND automatic_phase = 'working'
+        AND (automatic_phase = 'working' OR coordination_state = 'working')
     `);
     for (const row of duplicateSessionRows) {
       const key = `${row.room_id}\u0000${row.member_id}\u0000${row.codex_session_id}`;
@@ -585,7 +598,7 @@ export class AgentHubDatabase {
     this.connection.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS sessions_codex_identity_idx
       ON work_sessions(room_id, member_id, codex_session_id)
-      WHERE codex_session_id IS NOT NULL AND closed_at IS NULL
+      WHERE codex_session_id IS NOT NULL AND closed_at IS NULL AND finalizing_at IS NULL
     `);
 
     const scanColumns = this.connection.prepare("PRAGMA table_info(local_scans)").all() as Array<{ name: string }>;

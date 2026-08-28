@@ -59,10 +59,12 @@ export async function activateDesktopRoomConnection(options: {
   connectionId: string;
   controller: Pick<IntegrationController, "activateExclusiveConnection" | "start">;
   localServer: Pick<ServiceSupervisor, "start">;
+  onActivated?: () => Promise<void> | void;
 }): Promise<ActivateRoomConnectionResult> {
   await options.localServer.start();
   const activated = await options.controller.activateExclusiveConnection(options.connectionId);
   await options.controller.start();
+  await options.onActivated?.();
   return activated;
 }
 
@@ -74,6 +76,7 @@ export async function saveAndActivateDesktopRoomConnection(options: {
   >;
   store: Pick<ConnectionStore, "save">;
   localServer: Pick<ServiceSupervisor, "start">;
+  onActivated?: () => Promise<void> | void;
 }): Promise<ActivateRoomConnectionResult> {
   const saved = await options.store.save({
     ...options.input,
@@ -84,6 +87,7 @@ export async function saveAndActivateDesktopRoomConnection(options: {
     connectionId: saved.id,
     controller: options.controller,
     localServer: options.localServer,
+    onActivated: options.onActivated,
   });
 }
 

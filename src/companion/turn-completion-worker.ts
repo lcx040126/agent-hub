@@ -7,6 +7,7 @@ import {
   type ConnectionOperationTracker,
 } from "./integration-operations.js";
 import {
+  matchesTurnCompletionJob,
   TurnCompletionQueueStore,
   type TurnCompletionJob,
 } from "./turn-completion-queue.js";
@@ -112,56 +113,68 @@ async function processQueue(
   operationTracker: Pick<ConnectionOperationTracker, "run">,
 ): Promise<void> {
   const now = options.now?.() ?? new Date();
-  const jobs = (await queue.list((error) => options.onError?.(error)))
+  const listedJobs = (await queue.list((error) => options.onError?.(error)))
     .filter((job) => Date.parse(job.nextAttemptAt) <= now.getTime());
-  for (const job of jobs) {
-    await operationTracker.run(job.connectionId, async () => {
-      await queue.runExclusive(job.operationId, async () => {
-        if (Date.parse(job.expiresAt) <= now.getTime()) {
-          await queue.remove(job.operationId);
+  for (const listedJob of listedJobs) {
+    await operationTracker.run(listedJob.connectionId, async () => {
+      // 文件锁只保护快照与结果提交，网络和 Git 检查不应阻塞并发 Stop 写入更新后的 evidence。
+      const job = await queue.runExclusive(listedJob.operationId, async () => {
+        const current = await queue.load(listedJob.operationId);
+        if (!current || Date.parse(current.nextAttemptAt) > now.getTime()) return undefined;
+        return current;
+      });
+      if (!job) return;
+
+      if (Date.parse(job.expiresAt) <= now.getTime()) {
+        if (await queue.removeIfUnchanged(job)) {
           await markStoppedState(options.userDataPath, job);
+        }
+        return;
+      }
+      try {
+        const state = await new CodexHookStateStore(options.userDataPath).load(job.codexSessionId);
+        const matchingState = state && matchesTurnCompletionJob(job, state) ? state : undefined;
+        if (matchingState && (matchingState.activityEpoch ?? 0) > job.activityEpoch) {
+          if (matchingState.pendingCompletion?.phase === "resuming") {
+            const client = await clientForJob(job, options);
+            await completeResume(options.userDataPath, matchingState, client, queue);
+          } else {
+            await queue.removeIfUnchanged(job);
+          }
           return;
         }
-        try {
-          const state = await new CodexHookStateStore(options.userDataPath).load(job.codexSessionId);
-          if (state && (state.activityEpoch ?? 0) > job.activityEpoch) {
-            if (state.pendingCompletion?.phase === "resuming") {
-              const client = await clientForJob(job, options);
-              await completeResume(options.userDataPath, state, client, queue);
-            } else {
-              await queue.remove(job.operationId);
-            }
-            return;
-          }
-          if (
-            state?.pendingCompletion
-            && state.pendingCompletion.activityEpoch === job.activityEpoch
-            && state.pendingCompletion.operationId !== job.operationId
-          ) {
-            await queue.remove(job.operationId);
-            return;
-          }
-
-          const client = await clientForJob(job, options);
-          const pending = await processTurnCompletionJob(job, {
-            userDataPath: options.userDataPath,
-            client,
-            gitExecutable: options.gitExecutable,
-            now: options.now,
-          });
-          if (pending) await queue.recordRetry(job, pending.error, now);
-          else await queue.remove(job.operationId);
-        } catch (error) {
-          if (error instanceof AgentHubHttpError && error.status === 404) {
-            await queue.remove(job.operationId);
-            await clearPendingState(options.userDataPath, job);
-            return;
-          }
-          const failure = toError(error);
-          await queue.recordRetry(job, failure, now);
-          options.onError?.(failure, job);
+        if (
+          matchingState?.pendingCompletion
+          && matchingState.pendingCompletion.activityEpoch === job.activityEpoch
+          && matchingState.pendingCompletion.operationId !== job.operationId
+        ) {
+          await queue.removeIfUnchanged(job);
+          return;
         }
-      });
+
+        const client = await clientForJob(job, options);
+        const pending = await processTurnCompletionJob(job, {
+          userDataPath: options.userDataPath,
+          client,
+          gitExecutable: options.gitExecutable,
+          now: options.now,
+        });
+        if (pending) await queue.recordRetry(job, pending.error, now);
+        else await queue.removeIfUnchanged(job);
+      } catch (error) {
+        if (
+          error instanceof AgentHubHttpError
+          && (error.code === "session_not_found" || error.code === "session_already_closed")
+        ) {
+          if (await queue.removeIfUnchanged(job)) {
+            await clearPendingState(options.userDataPath, job);
+          }
+          return;
+        }
+        const failure = toError(error);
+        await queue.recordRetry(job, failure, now);
+        options.onError?.(failure, job);
+      }
     });
   }
 }
@@ -254,7 +267,7 @@ export async function resumePendingTurnCompletion(
   options: ResumePendingCompletionOptions,
 ): Promise<void> {
   const queue = new TurnCompletionQueueStore(options.userDataPath);
-  const jobs = await queue.listForSession(options.state.codexSessionId);
+  const jobs = await queue.listForLifecycle(options.state);
   if (jobs.length === 0 && !options.state.pendingCompletion) return;
 
   let pending = options.state.pendingCompletion;
@@ -285,7 +298,7 @@ export async function resumePendingTurnCompletion(
   );
   applyResumeResponse(options.state, pending, response);
   await options.stateStore.save(options.state);
-  await queue.removeForSession(options.state.codexSessionId, options.state.activityEpoch);
+  await queue.removeForLifecycle(options.state, options.state.activityEpoch);
 }
 
 async function completeResume(
@@ -308,7 +321,9 @@ async function completeResume(
   const resumedEpoch = await stateStore.runExclusive(state.codexSessionId, async () => {
     const latest = await stateStore.load(state.codexSessionId);
     if (
-      !latest?.pendingCompletion
+      !latest
+      || !matchesTurnCompletionJob(state, latest)
+      || !latest.pendingCompletion
       || latest.pendingCompletion.operationId !== pending.operationId
       || latest.pendingCompletion.activityEpoch !== pending.activityEpoch
       || latest.pendingCompletion.phase !== "resuming"
@@ -318,7 +333,7 @@ async function completeResume(
     return latest.activityEpoch;
   });
   if (resumedEpoch !== undefined) {
-    await queue.removeForSession(state.codexSessionId, resumedEpoch);
+    await queue.removeForLifecycle(state, resumedEpoch);
   }
 }
 
@@ -370,7 +385,9 @@ async function clearPendingState(userDataPath: string, job: TurnCompletionJob): 
   await stateStore.runExclusive(job.codexSessionId, async () => {
     const state = await stateStore.load(job.codexSessionId);
     if (
-      !state?.pendingCompletion
+      !state
+      || !matchesTurnCompletionJob(job, state)
+      || !state.pendingCompletion
       || state.pendingCompletion.operationId !== job.operationId
       || state.pendingCompletion.activityEpoch !== job.activityEpoch
     ) return;
@@ -384,7 +401,9 @@ async function markStoppedState(userDataPath: string, job: TurnCompletionJob): P
   await stateStore.runExclusive(job.codexSessionId, async () => {
     const state = await stateStore.load(job.codexSessionId);
     if (
-      !state?.pendingCompletion
+      !state
+      || !matchesTurnCompletionJob(job, state)
+      || !state.pendingCompletion
       || state.pendingCompletion.operationId !== job.operationId
       || state.pendingCompletion.activityEpoch !== job.activityEpoch
     ) return;

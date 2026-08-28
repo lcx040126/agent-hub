@@ -546,3 +546,33 @@ v0.2.4 正式发布验证（2026-08-28）
 - 六项资产的独立下载 SHA-256、GitHub asset digest 和校验文件一致；Ed25519 签名通过，更新清单的 v0.2.4、协议 1、schema 2 到 4、Setup URL/大小/SHA-256 和发布正文均正确；`latest.yml` 的大小与 Setup 一致，SHA-512 为 `q7v0nihAMNQTslu6UasfGGS8k1gvtYkZkgqFhA3Ldi88BBlgxYubfMGauPbZY0CGcKZKqPpxmCSSzmy6uKBdzg==`。
 - 匿名访问 `releases/latest`、latest 更新清单、签名和正式 Setup 均返回 HTTP 200 并解析到 v0.2.4；匿名下载的清单与签名字节和已审计资产一致。
 - 真实 v0.2.2 应用内升级、无法启动的 v0.2.3 覆盖恢复、非默认目录升级、断网长时间恢复和双机协作仍按发布说明列为未完成的实机验收，不因正式发布而改记为通过。
+
+v0.2.5 已确认修复（预发布，2026-08-28）
+
+问题与边界
+- 同一个 Codex 任务重新打开时，旧 generation 可以继续处于 `finalizing`，新 generation 同时建立为 `active`；两者分配不同的 `hubSessionId` 与 `finalizationId`。旧 generation 的心跳、SessionEnd 收尾和 TurnCompletion 任务按身份隔离，不能阻塞、删除或复活新 generation。
+- 桌面应用即使在所有连接均暂停时启动，后续激活已有连接或保存并激活连接时，也会幂等启动仓库扫描、Codex 会话心跳和交接申请提醒，无需重启 Agent Hub 桌面应用；重复激活不会创建重复后台任务。
+- `SessionEnd` 与 `TurnCompletion` 队列按 operation ID 使用持久化文件锁和原子替换；enqueue、重试和条件删除按同一 operation 串行合并。`TurnCompletion` job 的 `revision` 单调递增（旧格式缺省从 0 迁移），旧 worker 只有在 revision 仍匹配时才能删除，迟到的旧 enqueue/evidence 不能覆盖较新的证据、重试计数或等待状态；损坏条目隔离为诊断，不阻断其他任务。
+- 新 Codex 任务的 `SessionStart` 可能没有真实 turn ID，只能先登记回退 turn；首次真实写入若仍使用同一 activity epoch，会被服务端 fence 当作过期请求拒绝。新增受管 `UserPromptSubmit` 在提示提交时提前登记真实 turn 并推进 epoch，`PreToolUse` 保留一次权威恢复，不再要求人工制造 `Stop -> resume`。
+- 同一成员的不同会话申请重叠自动范围时，以已经成功登记的活动租约为现有持有者，后来的会话等待，不再创建会反向阻塞持有者的对等冲突。不得在缺少会话 Git 证据时仅按全局创建时间强制取消其他任务。
+- 等待会话在本机持久化最近持有租约、会话、路径、到期提示和触发等待的完整申请范围。缓存到期时间只提示重新检查，不能作为持有者未续租或本地清除围栏的证明；只有明确路径覆盖完整原申请并经服务端允许后才清除围栏。本地状态丢失后复用远端会话时，路径未知写入保持拒绝，明确路径网络失败不放行，进入等待按 dirty 处理，避免取消本机未知的远端租约。
+- 等待转换在网络请求前写入待同步标记；响应丢失后，后续明确写入和 `PostToolUse` 必须先幂等补发，后台心跳不得续租尚未确认停止的范围。心跳在同一会话锁内重新读取门禁、请求服务端并合并续租结果，锁外旧 working 快照不能越过刚落盘的 pending/blocked。`PreToolUse` 与 `PostToolUse` 也串行更新状态，旧 Post 不能覆盖较新的等待围栏或绕过围栏 prepare。clean 补同步成功即清除本机该会话的旧自动租约缓存，即使幂等响应已为空；passive 围栏本身不停止已确认 working 的其他路径租约心跳。
+- `SessionEnd` 先用确定性 finalization ID 写入持久化收尾队列，再在同一会话锁内删除 Hook 状态；若在途心跳占锁，队列记录作为终止标记，使心跳在响应写回前删除状态而不是复活旧文件。后台 finalizer 在移除终止记录前也会同锁清理 connection、hub session 均匹配的旧状态，避免误删同一 Codex ID 后来打开的新会话。
+- 房间服务和房主身份仍正常时，仪表盘可能因累积扫描或其他合法大字段超过桌面代理 1 MiB 上限而被界面误报离线。修复为只返回当前成员最近一次扫描摘要，去掉会话和动态中界面不用的大字段；完整风险规则属于不可裁剪核心，待处理申请先按当前持有人查询再应用上限，区段总数来自数据库真实计数。其余可增长列表按 768 KiB UTF-8 预算装入；SQL 窗口或字节预算截断都返回结构化标记，界面显示刷新不完整而不是房间断开。完整证据仍留在数据库和专用查询中，不放宽代理容量保护。
+
+- 仪表盘响应按可操作性排序，先装入当前持有人的待处理申请，再装入租约、冲突、成员和历史区段；轮询响应中的申请省略可能膨胀的 `overlapPaths`。需要完整申请范围和重叠证据时，成员令牌可调用 `GET /api/release-requests?status=pending` 或 `status=all`，完整房间快照仍可通过 `GET /api/snapshot` 获取。
+
+版本与迁移
+- schema 5 的 `sessions_codex_identity_idx` 在 `(room_id, member_id, codex_session_id)` 上使用部分唯一索引，谓词为 `codex_session_id IS NOT NULL AND closed_at IS NULL AND finalizing_at IS NULL`；它允许同一 Codex ID 的旧 `finalizing` generation 与新 `active` generation 并存，同时只保留一个未关闭且未进入 finalizing 的当前 generation。
+- 数据库测试与打包迁移探针覆盖 schema 2/3/4 到 5、全新 schema 5、重复打开、已补列但未完成回填的恢复状态，以及重复会话双列一致性。schema 4 双代 fixture 同时包含 `finalizing + active` generation 对和 `active + active` 重复对，验证唯一索引谓词、归并结果和租约保留。
+- 包版本设为 `0.2.5`，协议版本保持 1，数据库 schema 升至 5，最低可读取来源 schema 保持 2；受管 Codex Hook 从五类增加为六类，新增 `UserPromptSubmit`。
+- schema 5 为自动租约增加 `coordination_state`。迁移从旧 `automatic_phase` 幂等回填；重复 Codex session 的保守归并同步更新两列，防止 loser 租约在升级后被误当作 `working` 继续续租。
+
+当前验证
+- `src/server/db.test.ts` 14 项定向数据库测试通过；61 个测试文件共 527 项串行全量测试、两套 TypeScript 配置检查、生产构建、打包迁移探针脚本语法检查和 `git diff --check` 通过。
+- 桌面调度器回归覆盖全暂停启动后激活、重复补启动不创建副本，以及后续启动器失败时保留已成功启动的实例。
+- 容量回归覆盖累积扫描、完整风险规则、持有人查询先于 500 条窗口、仪表盘申请优先装入、数据库真实总数、会话与动态 SQL 窗口、多字节 UTF-8 核心字段、结构化截断状态以及桌面代理 1 MiB 防护；Hook 集成测试覆盖真实 turn 提前登记、网络失败后的首次写入恢复、停止后继续任务、clean 等待、响应丢失后的幂等补同步、并发 `PreToolUse`/`PostToolUse` 状态保护、TurnCompletion revision 条件删除与旧证据隔离、pending-only 路径未知写入拒绝、心跳旧快照重读门禁、在途心跳后的 `SessionEnd` 防状态复活、partial reclaim 心跳、缓存到期后仍拒绝路径未知写入、完整原范围复核以及远端租约归属不完整保护。
+- 打包迁移探针已更新为 v0.2.5/schema 5、纳入 schema 4 输入，并接入 Windows 发布流程的打包后门禁；本轮没有生成 v0.2.5 packaged 目录，因此未运行真实打包服务迁移探针。Windows 安装候选、真实 Codex 首轮写入、长时间房间轮询和双机真实协作也尚未在本记录中验收。
+
+发布状态
+- 本轮明确暂不发布：不创建或推送 `v0.2.5` 标签，不创建 GitHub Release，不更新公开 `latest` 资产，不把本地候选写成正式安装包。当前 GitHub `latest` 仍为 v0.2.4。

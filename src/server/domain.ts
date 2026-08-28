@@ -29,7 +29,7 @@ export type ConflictSeverity = "warning" | "blocking";
 export type ConflictDecision = "allow" | "warn" | "deny";
 export type LeaseMode = "read" | "write";
 export type LeaseKind = "automatic" | "standard" | "exclusive";
-export type AutomaticLeasePhase = "working" | "awaiting_commit";
+export type AutomaticLeasePhase = "working" | "waiting" | "blocked" | "awaiting_commit";
 export type ReleaseRequestStatus = "pending" | "approved" | "rejected" | "cancelled";
 export type MemberCompatibility = "compatible" | "incompatible" | "unknown";
 export type RecordKind = "decision" | "validation" | "handoff" | "risk";
@@ -133,9 +133,17 @@ export type LeaseClaimResult =
     }
   | {
       acquired: false;
-      decision: "warn" | "deny";
+      decision: "warn" | "deny" | "wait";
       conflicts: LeaseConflict[];
       releaseRequests: ReleaseRequest[];
+      waitingFor?: {
+        leaseId: string;
+        sessionId: string | null;
+        title: string;
+        memberName: string;
+        expiresAt: string;
+        paths: string[];
+      };
     };
 
 export interface ReleaseRequest {
@@ -252,7 +260,7 @@ export interface RoomSnapshot {
 }
 
 export interface EditIssue {
-  code: "uncovered_path" | "lease_conflict" | "feature_confirmation_required";
+  code: "uncovered_path" | "lease_conflict" | "feature_confirmation_required" | "session_write_blocked";
   path: string;
   message: string;
   conflict?: LeaseConflict;

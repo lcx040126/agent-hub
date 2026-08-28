@@ -18,7 +18,14 @@ describe("parseHeadlessInvocation", () => {
   });
 
   it("parses each supported Codex hook event", () => {
-    for (const eventName of ["SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"] as const) {
+    for (const eventName of [
+      "SessionStart",
+      "UserPromptSubmit",
+      "PreToolUse",
+      "PostToolUse",
+      "Stop",
+      "SessionEnd",
+    ] as const) {
       expect(parseHeadlessInvocation(["AgentHub.exe", "--codex-hook", eventName])).toEqual({
         mode: "codex-hook",
         eventName,

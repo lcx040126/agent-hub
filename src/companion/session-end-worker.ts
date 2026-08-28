@@ -1,7 +1,12 @@
 import type { ConnectionStore } from "../desktop/connection-store.js";
-import { finalizeQueuedSession } from "./codex-hook.js";
+import { finalizeQueuedSession, SessionEndLocalEvidenceError } from "./codex-hook.js";
 import { AgentHubClient, AgentHubHttpError } from "./hub-client.js";
-import { SessionEndQueueStore, type SessionEndQueueJob } from "./session-end-queue.js";
+import { CodexHookStateStore } from "./hook-state.js";
+import {
+  matchesSessionEndJob,
+  SessionEndQueueStore,
+  type SessionEndQueueJob,
+} from "./session-end-queue.js";
 import { IntegrationOperationTracker, type ConnectionOperationTracker } from "./integration-operations.js";
 
 export interface SessionEndFinalizationWorker {
@@ -20,6 +25,7 @@ export interface StartSessionEndFinalizationWorkerOptions {
   integrationActive?: () => boolean;
   intervalMs?: number;
   fetchImpl?: typeof fetch;
+  gitExecutable?: string;
   now?: () => Date;
   onError?: (error: Error, job?: SessionEndQueueJob) => void;
   operationTracker?: Pick<ConnectionOperationTracker, "run">;
@@ -66,36 +72,83 @@ async function processQueue(
   operationTracker: Pick<ConnectionOperationTracker, "run">,
 ): Promise<void> {
   const now = options.now?.() ?? new Date();
-  const jobs = (await queue.list()).filter((job) => Date.parse(job.nextAttemptAt) <= now.getTime());
-  for (const job of jobs) {
+  const jobs = (await queue.list((error) => options.onError?.(error)))
+    .filter((job) => Date.parse(job.nextAttemptAt) <= now.getTime());
+  for (const queuedJob of jobs) {
+    let job = queuedJob;
     try {
+      const prepared = await prepareQueuedJob(queue, queuedJob, options.userDataPath);
+      if (!prepared) continue;
+      job = prepared;
       await operationTracker.run(job.connectionId, () => processJob(job, options));
+      await removeFinalizedHookState(job, options.userDataPath);
       await queue.remove(job.finalizationId);
     } catch (error) {
       const failure = toError(error);
       if (
         error instanceof AgentHubHttpError
-        && (error.status === 404 || error.code === "session_already_closed")
+        && (error.code === "session_not_found" || error.code === "session_already_closed")
       ) {
+        await removeFinalizedHookState(job, options.userDataPath);
         await queue.remove(job.finalizationId);
         continue;
       }
-      if (job.attempts + 1 >= MAX_LOCAL_EVIDENCE_ATTEMPTS && !isNetworkFailure(failure)) {
+      const localEvidenceFailure = error instanceof SessionEndLocalEvidenceError;
+      const failedJob = await queue.recordFailure(job, failure, now, { localEvidenceFailure });
+      if (!failedJob) continue;
+      job = failedJob;
+      if (localEvidenceFailure && job.localEvidenceAttempts >= MAX_LOCAL_EVIDENCE_ATTEMPTS) {
         try {
           await operationTracker.run(
             job.connectionId,
             () => completeWithoutEvidence(job, options, failure),
           );
+          await removeFinalizedHookState(job, options.userDataPath);
           await queue.remove(job.finalizationId);
           continue;
         } catch (completionError) {
           options.onError?.(toError(completionError), job);
         }
       }
-      await queue.recordFailure(job, failure, now);
       options.onError?.(failure, job);
     }
   }
+}
+
+async function prepareQueuedJob(
+  queue: SessionEndQueueStore,
+  snapshot: SessionEndQueueJob,
+  userDataPath: string,
+): Promise<SessionEndQueueJob | undefined> {
+  const stateStore = new CodexHookStateStore(userDataPath);
+  return stateStore.runExclusive(snapshot.codexSessionId, async () => {
+    let job: SessionEndQueueJob;
+    try {
+      job = await queue.load(snapshot.finalizationId);
+    } catch (error) {
+      if (isMissingFile(error)) return undefined;
+      throw error;
+    }
+    const state = await stateStore.load(snapshot.codexSessionId);
+    if (!state || !matchesSessionEndJob(job, state)) return job;
+    const merged = await queue.mergeState(job.finalizationId, state);
+    await stateStore.remove(snapshot.codexSessionId);
+    return merged;
+  });
+}
+
+async function removeFinalizedHookState(
+  job: SessionEndQueueJob,
+  userDataPath: string,
+): Promise<void> {
+  const stateStore = new CodexHookStateStore(userDataPath);
+  await stateStore.runExclusive(job.codexSessionId, async () => {
+    const state = await stateStore.load(job.codexSessionId);
+    if (
+      state
+      && matchesSessionEndJob(job, state)
+    ) await stateStore.remove(job.codexSessionId);
+  });
 }
 
 async function processJob(
@@ -103,7 +156,7 @@ async function processJob(
   options: StartSessionEndFinalizationWorkerOptions,
 ): Promise<void> {
   const client = await clientForJob(job, options);
-  await finalizeQueuedSession(job, { client });
+  await finalizeQueuedSession(job, { client, gitExecutable: options.gitExecutable });
 }
 
 async function completeWithoutEvidence(
@@ -138,10 +191,8 @@ async function clientForJob(
   });
 }
 
-function isNetworkFailure(error: Error): boolean {
-  return /(?:fetch failed|failed to fetch|network|socket|econn|etimedout|timed out|did not respond|connection reset|connection refused|aborted)/i.test(
-    error.message,
-  );
+function isMissingFile(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
 }
 
 function toError(error: unknown): Error {

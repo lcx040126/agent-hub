@@ -175,7 +175,7 @@ describe("mergeCodexMcpConfig", () => {
     ).toThrow();
   });
 
-  it("installs five idempotent lifecycle hooks while preserving user hooks", () => {
+  it("installs six idempotent lifecycle hooks while preserving user hooks", () => {
     const source = [
       "[[hooks.PreToolUse]]",
       'matcher = "^custom$"',
@@ -207,7 +207,14 @@ describe("mergeCodexMcpConfig", () => {
 
     expect((parsed.features as Record<string, unknown>).hooks).toBe(true);
     expect(Object.keys(hooks)).toEqual(
-      expect.arrayContaining(["SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]),
+      expect.arrayContaining([
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "SessionEnd",
+      ]),
     );
     expect(preHandlers.filter((handler) => handler.command === "custom-check.exe")).toHaveLength(1);
     expect(
@@ -283,7 +290,14 @@ describe("reconcileCodexConfig", () => {
       groups.flatMap((group) => group.hooks as Array<Record<string, unknown>>),
     );
 
-    for (const event of ["SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]) {
+    for (const event of [
+      "SessionStart",
+      "UserPromptSubmit",
+      "PreToolUse",
+      "PostToolUse",
+      "Stop",
+      "SessionEnd",
+    ]) {
       const expected = `${MANAGED_HOOK_COMMAND} --codex-hook ${event}`;
       expect(allHandlers.filter((handler) => handler.command === expected)).toHaveLength(1);
     }
@@ -675,7 +689,14 @@ describe("removeCodexMcpConfig", () => {
     expect(servers.agent_hub_abcd).toBeUndefined();
     expect(servers.agent_hub_efgh).toBeDefined();
     expect(Object.keys(hooks)).toEqual(
-      expect.arrayContaining(["SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]),
+      expect.arrayContaining([
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "SessionEnd",
+      ]),
     );
   });
 
@@ -698,7 +719,7 @@ describe("removeCodexMcpConfig", () => {
     expect(parsed.hooks).toBeDefined();
   });
 
-  it("removes only the five exact managed hook handlers with the last managed server", () => {
+  it("removes only the six exact managed hook handlers with the last managed server", () => {
     const source = mergeCodexMcpConfig([
       "[[hooks.PreToolUse]]",
       'matcher = "^(Bash|apply_patch)$"',

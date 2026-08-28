@@ -4,7 +4,7 @@ Agent Hub 是一个面向多人、多 Agent 开发的协作房间。房主创建
 
 它不会合并不同模型的内部记忆，也不会上传私人聊天或隐藏思考。它共享的是成员、会话、路径、租约、项目结构、功能行为、决定、验证、风险和 Git 证据等可审计信息。
 
-> v0.2.4 是 Windows x64 局域网版本，专门修复旧房间数据库升级到 schema 4 时的启动失败。v0.2.2 和健康的 v0.2.3 可在正式发布后使用应用内更新；v0.2.0、v0.2.1 以及无法启动的 v0.2.3 必须手动运行 v0.2.4 Setup 覆盖原安装目录。任何版本都不要先卸载或删除 `%APPDATA%\agent-hub`。房主退出、关机或离开网络时，其他成员会暂时无法同步。
+> 当前源码已进入 v0.2.5 预发布状态，协议版本保持 1，数据库升级到 schema 5；v0.2.5 尚未发布、没有可下载的正式 Setup，也不是 GitHub `latest`。当前正式公开版本仍是 v0.2.4。任何升级都不要先卸载或删除 `%APPDATA%\agent-hub`；房主退出、关机或离开网络时，其他成员会暂时无法同步。
 
 ## 工作原理
 
@@ -18,7 +18,7 @@ Agent Hub 是一个面向多人、多 Agent 开发的协作房间。房主创建
 每位成员的电脑
   ├─ Agent Hub：加入房间、显示通知和管理连接
   ├─ MCP：让 Codex 按需查询上下文和执行协调操作
-  ├─ Hooks：在会话开始、写入前后、回合停止和会话结束时自动检查
+  ├─ Hooks：在会话开始、提交提示、写入前后、回合停止和会话结束时自动检查
   └─ 本地扫描器：分析 Git、C# 和 Unity 依赖，只同步结构化元数据
 ```
 
@@ -36,7 +36,7 @@ Agent Hub 主要解决两类不同的问题：
 3. 团队中的房主和每位成员都要在自己的电脑上安装。大家使用同一个 Setup 安装包。
 4. 当前安装包没有商业代码签名证书。Windows SmartScreen 弹出提示时，应先确认下载来源和哈希；来源不明或哈希不一致时不要继续。
 
-v0.2.4 继续使用 NSIS Setup 安装版，不发布 Portable 便携版。安装目录可以在安装过程中选择，房间数据和本机连接数据保存在 Windows 用户数据目录中，不会因为覆盖安装新版而主动删除。
+当前正式公开的 v0.2.4 使用 NSIS Setup 安装版，不发布 Portable 便携版。v0.2.5 目前只有预发布源码，不应从不存在的 Release 安装。安装目录可以在安装过程中选择，房间数据和本机连接数据保存在 Windows 用户数据目录中，不会因为覆盖安装新版而主动删除。
 
 > **旧版本升级提醒：** v0.2.0/v0.2.1 的应用内更新器存在 `app.asar` 恢复备份缺陷，必须手动运行 v0.2.4 Setup 覆盖原安装目录。若 v0.2.3 已因数据库升级错误而无法启动，也必须手动覆盖，因为应用内更新入口不可用。已恢复或已正常迁移到 schema 4 的 v0.2.3 可以正常更新。所有情况都禁止先卸载或删除 `%APPDATA%\agent-hub`。
 
@@ -68,9 +68,9 @@ v0.2.4 继续使用 NSIS Setup 安装版，不发布 Portable 便携版。安装
 每位成员加入房间后都要在自己的电脑上完成一次连接：
 
 1. 在 Agent Hub 中打开“连接设置”。
-2. 点击“安装连接”。程序会备份现有 `~/.codex/config.toml`，再写入一个房间专用 MCP 配置和五类 Hook。
+2. 点击“安装连接”。程序会备份现有 `~/.codex/config.toml`，再写入一个房间专用 MCP 配置和六类 Hook。
 3. 完全退出并重新启动 Codex。
-4. Codex 首次加载非托管 Hook 时会要求用户审核。核对命令指向已安装的 Agent Hub 后，信任 `SessionStart`、`PreToolUse`、`PostToolUse`、`Stop` 和 `SessionEnd` 五项。
+4. Codex 首次加载非托管 Hook 时会要求用户审核。核对命令指向已安装的 Agent Hub 后，信任 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop` 和 `SessionEnd` 六项。
 5. 从已连接的本地项目目录创建 Codex 任务。项目外的无项目任务不会自动匹配该房间。
 
 MCP 与 Hook 分工如下：
@@ -79,6 +79,7 @@ MCP 与 Hook 分工如下：
 | --- | --- |
 | MCP | 按需查询房间上下文、功能记忆和协调状态，并登记会话内批准等操作 |
 | `SessionStart` | 打开房间会话，注入预算内的实时状态和相关功能索引 |
+| `UserPromptSubmit` | 每次新提示提交时提前登记真实 turn 和新的 activity epoch，避免首次写入仍使用会话启动时的回退 turn |
 | `PreToolUse` | 在 Agent 写入前识别目标路径和符号，检查租约、风险策略和历史功能影响 |
 | `PostToolUse` | 只登记能够归因到本次 Agent 工具调用的实际变化，更新本地诊断和房间状态 |
 | `Stop` | 回合结束后停止自动租约续期；归因改动已提交或完全撤销时释放，否则保护到租期到期 |
@@ -110,7 +111,23 @@ MCP bridge 先完成本地握手，仅在 Codex 请求工具时懒连接房间�
 
 升级后如果旧连接文件异常地为同一规范化仓库留下多个活动房间，Agent Hub 会在启动时把这些候选全部暂停，等待用户明确打开目标房间。若仍检测到歧义，Hook 会允许本次写入并提示本次没有完成跨成员协作检查；后台扫描和通知也会跳过该仓库，而不是任意选择一个房间或错误阻塞写入。
 
-v0.2.4 沿用协议版本 1、数据库 schema 4 和最低来源 schema 2，并继续使用 Codex 配置中的稳定 Hook launcher 路径。升级后只对已经明确安装过的 Agent Hub 接入校正受管 MCP 与五类 Hook，用户 Hook 和其他 MCP 保持不变。
+v0.2.5 预发布源码保持协议版本 1 和最低来源 schema 2，数据库升级到 schema 5，并继续使用 Codex 配置中的稳定 Hook launcher 路径。升级对账只校正已经明确安装过的 Agent Hub MCP 与六类受管 Hook，用户 Hook 和其他 MCP 保持不变。同一 Codex 任务重新打开时，旧 generation 可以继续处于 `finalizing`，新 generation 同时保持 `active`；两者以不同的 `hubSessionId` 和 `finalizationId` 隔离，旧收尾任务不能阻塞或删除新任务状态。
+
+桌面应用即使在所有连接均暂停时启动，后续激活已有连接或保存并激活连接时，也会幂等启动仓库扫描、Codex 会话心跳和交接申请提醒，无需重启 Agent Hub 桌面应用；重复激活不会创建重复后台任务。
+
+v0.2.5 针对三条已确认故障链做了窄范围修复：`SessionStart` 缺少真实 turn 时会先使用回退值，新的 `UserPromptSubmit` 会在写入前推进真实 turn/epoch，`PreToolUse` 仍保留一次权威恢复；同一成员已有成功登记的重叠自动租约时，现有持有者继续优先，后来的会话进入等待，避免两个会话互相反向阻塞。等待会话会在本机保存持有者信息和触发等待的完整申请范围：缓存到期时间只提示何时重新检查，不能据此认定持有者没有续租；只有明确路径完整覆盖原申请并经房间服务允许后才清除围栏。即使自身 clean、租约缓存被清理、远端租约归属尚未完整恢复或同步短暂失败，也不能用输出路径未知的生成或构建命令绕过保护；已知围栏或未知远端租约存在时，明确路径检查遇到断网也保持拒绝。`SessionEnd` 与 `TurnCompletion` 队列按 operation ID 使用持久化文件锁和原子替换；`TurnCompletion` job 的 `revision` 单调递增，重试、并发 enqueue 与条件删除会核对 revision，迟到的旧证据不能覆盖较新的路径证据或移除更新后的任务。
+
+另一个“房间断开”现象不是房主身份丢失，而是仪表盘轮询响应超过桌面代理 1 MiB 上限；仪表盘现在只返回当前成员最近一次扫描摘要，去掉会话与动态中界面不用的大字段，并按 768 KiB UTF-8 预算装入其他可增长列表。完整风险规则始终作为核心状态返回，当前成员的待处理申请会先在数据库中按持有人筛选再应用展示上限，并在响应装入时优先于租约、冲突和历史区段；各区段返回数据库真实总数。为控制轮询大小，仪表盘申请省略 `overlapPaths`，完整申请范围和重叠证据通过 `GET /api/release-requests?status=pending` 或 `status=all`（完整房间快照仍可用 `GET /api/snapshot`）读取；SQL 展示窗口或字节预算任一处截断都会显示具体数据暂未完整刷新，不再把非网络响应错误直接说成房间离线。完整历史仍保留在数据库和专用查询中。
+
+## v0.2.5 预发布状态
+
+当前源码验证（2026-08-28）：
+
+- `pnpm typecheck`、61 个测试文件共 527 项的串行全量测试、`pnpm build`、`node --check scripts/verify-packaged-database-migrations.mjs` 和 `git diff --check` 均已通过。
+- 数据库回归覆盖 schema 2/3/4 到 schema 5、全新 schema 5、部分回填恢复和重复 Codex session 双列同步；自动租约的 `coordination_state` 与旧 `automatic_phase` 一起迁移。schema 4 双代 fixture 同时验证 `finalizing + active` generation 并存与 `active + active` 重复归并；schema 5 的 `sessions_codex_identity_idx` 使用 `codex_session_id IS NOT NULL AND closed_at IS NULL AND finalizing_at IS NULL` 部分唯一索引谓词。
+- 桌面调度器回归覆盖全暂停启动后激活、重复补启动不创建副本，以及后续启动器失败时保留已成功启动的实例。
+- 尚未执行真实 Windows 安装、真实 Codex 首轮写入、长时间房间轮询、双机协作或 packaged migration probe；这些不计为通过。
+- 本轮明确暂不发布：没有 `v0.2.5` 标签、GitHub Release、正式 Setup、更新清单或公开 `latest` 资产，当前公开版本仍为 v0.2.4。
 
 ## 日常工作流程
 
@@ -212,7 +229,7 @@ v0.2.0 和 v0.2.1 的更新恢复代码使用 Electron 改写过的 `node:fs` �
 
 该缺陷存在于正在执行更新的旧客户端中，因此 v0.2.0/v0.2.1 用户必须手动运行 `AgentHub-Setup-0.2.4-x64.exe`，选择原安装目录覆盖安装。无法启动的 v0.2.3 没有可用的应用内更新入口，也必须采用相同方式覆盖；已修复或已正常迁移到 schema 4 的 v0.2.3 可以正常更新。v0.2.2 用户可在 v0.2.4 正式发布后直接使用应用内更新。任何情况都不要先卸载，不要删除 `%APPDATA%\agent-hub`，也不要手工删除房间数据库。
 
-覆盖安装和后续更新的目标是保留房间数据库、成员与项目连接、加密凭证、房间设置、协作记录、功能记忆、租约和待处理申请。v0.2.0 的历史验证结果见 [v0.2.0 发布说明](docs/releases/v0.2.0.md)，生命周期隔离见 [v0.2.1 发布说明](docs/releases/v0.2.1.md)，本机恢复修复见 [v0.2.2 发布说明](docs/releases/v0.2.2.md)，Stop 与提交后释放、持久化收尾及升级配置校正见 [v0.2.3 发布说明](docs/releases/v0.2.3.md)，旧数据库升级热修复见 [v0.2.4 发布说明](docs/releases/v0.2.4.md)。
+覆盖安装和后续更新的目标是保留房间数据库、成员与项目连接、加密凭证、房间设置、协作记录、功能记忆、租约和待处理申请。v0.2.0 的历史验证结果见 [v0.2.0 发布说明](docs/releases/v0.2.0.md)，生命周期隔离见 [v0.2.1 发布说明](docs/releases/v0.2.1.md)，本机恢复修复见 [v0.2.2 发布说明](docs/releases/v0.2.2.md)，Stop 与提交后释放、持久化收尾及升级配置校正见 [v0.2.3 发布说明](docs/releases/v0.2.3.md)，旧数据库升级热修复见 [v0.2.4 发布说明](docs/releases/v0.2.4.md)，当前未发布改动见 [v0.2.5 预发布说明](docs/releases/v0.2.5.md)。
 
 ## 对 Git 的影响
 

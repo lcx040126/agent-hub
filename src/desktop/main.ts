@@ -43,6 +43,10 @@ import {
   AGENT_HUB_VERSION,
 } from "../shared/version.js";
 import { createConsistentSqliteBackup } from "../server/sqlite-backup.js";
+import {
+  ensureActiveSchedulerSlots,
+  type ActiveSchedulerSlots,
+} from "./active-schedulers.js";
 import { DesktopAppUpdater, type ElectronUpdateEngine } from "./app-updater.js";
 import {
   codexMcpServerSpec,
@@ -82,11 +86,17 @@ const noTray = process.argv.includes("--no-tray");
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let hostServer: ServiceSupervisor | null = null;
-let scanScheduler: RepositoryScanScheduler | null = null;
-let hookHeartbeatScheduler: CodexSessionHeartbeatScheduler | null = null;
+const activeSchedulers: ActiveSchedulerSlots<
+  RepositoryScanScheduler,
+  CodexSessionHeartbeatScheduler,
+  ReleaseRequestNotificationScheduler
+> = {
+  scanner: null,
+  heartbeat: null,
+  releaseNotifier: null,
+};
 let sessionEndFinalizationWorker: SessionEndFinalizationWorker | null = null;
 let turnCompletionWorker: TurnCompletionWorker | null = null;
-let releaseRequestNotifier: ReleaseRequestNotificationScheduler | null = null;
 let desktopUpdater: DesktopAppUpdater | null = null;
 let integrationController: IntegrationController | null = null;
 let unsubscribeUpdateStatus: (() => void) | null = null;
@@ -243,32 +253,39 @@ async function bootstrap(): Promise<void> {
       desktopLogger.error("repository.scan", "Background repository scan failed.", error);
     },
   });
-  if (integrationIsActive()) {
-    scanScheduler = startScanner();
-    hookHeartbeatScheduler = startCodexSessionHeartbeatScheduler({
-      userDataPath: userDataDirectory,
-      store,
-      onError(error) {
-        desktopLogger.warn("codex.heartbeat", "Codex session heartbeat failed.", error);
-      },
+  const startHeartbeat = () => startCodexSessionHeartbeatScheduler({
+    userDataPath: userDataDirectory,
+    store,
+    onError(error) {
+      desktopLogger.warn("codex.heartbeat", "Codex session heartbeat failed.", error);
+    },
+  });
+  const startReleaseNotifier = () => startReleaseRequestNotificationScheduler({
+    store,
+    notify(request, connection) {
+      if (!Notification.isSupported()) return;
+      const notification = new Notification({
+        title: `${connection.roomName || "Agent Hub"}：保护范围交接申请`,
+        body: `${request.requesterName} 请求“${request.requestTitle}”${request.requestedPaths[0] ? `\n${request.requestedPaths[0]}` : ""}`,
+        silent: false,
+      });
+      notification.on("click", () => showMainWindow());
+      notification.show();
+    },
+    onError(error) {
+      desktopLogger.warn("release-request.notification", "Release-request notification check failed.", error);
+    },
+  });
+  const ensureActiveSchedulers = () => {
+    ensureActiveSchedulerSlots({
+      active: integrationIsActive(),
+      current: activeSchedulers,
+      startScanner,
+      startHeartbeat,
+      startReleaseNotifier,
     });
-    releaseRequestNotifier = startReleaseRequestNotificationScheduler({
-      store,
-      notify(request, connection) {
-        if (!Notification.isSupported()) return;
-        const notification = new Notification({
-          title: `${connection.roomName || "Agent Hub"}：保护范围交接申请`,
-          body: `${request.requesterName} 请求“${request.requestTitle}”${request.requestedPaths[0] ? `\n${request.requestedPaths[0]}` : ""}`,
-          silent: false,
-        });
-        notification.on("click", () => showMainWindow());
-        notification.show();
-      },
-      onError(error) {
-        desktopLogger.warn("release-request.notification", "Release-request notification check failed.", error);
-      },
-    });
-  }
+  };
+  ensureActiveSchedulers();
 
   const engine = await createElectronUpdateEngine();
   const updater = new DesktopAppUpdater({
@@ -284,11 +301,11 @@ async function bootstrap(): Promise<void> {
     recoveryExecutor,
       installHooks: {
       async prepareForInstall() {
-        const maintenanceScanner = scanScheduler;
+        const maintenanceScanner = activeSchedulers.scanner;
         // A scheduler marks itself stopped before draining its current scan.
         // Clear the live reference first so abort recovery always creates a
         // fresh instance even when a later maintenance step fails.
-        scanScheduler = null;
+        activeSchedulers.scanner = null;
         await enterDesktopMaintenance({
           controller: integrationController,
           scanner: maintenanceScanner,
@@ -322,31 +339,22 @@ async function bootstrap(): Promise<void> {
         await recoverDesktopMaintenance({
           controller: integrationController,
           localServer: hostServer,
-          restartSchedulers: [
-            () => {
-              if (!scanScheduler && integrationController?.getPresence()?.record.status === "active") {
-                scanScheduler = startScanner();
-              }
-            },
-            () => {
-              if (!hookHeartbeatScheduler && integrationController?.getPresence()?.record.status === "active") {
-                hookHeartbeatScheduler = startCodexSessionHeartbeatScheduler({
-                  userDataPath: userDataDirectory,
-                  store,
-                  onError(error) {
-                    desktopLogger.warn("codex.heartbeat", "Codex session heartbeat failed.", error);
-                  },
-                });
-              }
-            },
-          ],
+          restartSchedulers: [ensureActiveSchedulers],
         });
       },
     },
   });
   desktopUpdater = updater;
 
-  registerIpc(serverInfo, store, userDataDirectory, updater, integrationController, hostServer);
+  registerIpc(
+    serverInfo,
+    store,
+    userDataDirectory,
+    updater,
+    integrationController,
+    hostServer,
+    ensureActiveSchedulers,
+  );
   const window = createMainWindow(serverInfo.localServerUrl);
   mainWindow = window;
   unsubscribeUpdateStatus = updater.subscribe((status) => {
@@ -384,17 +392,17 @@ async function cleanupBeforeQuit(): Promise<void> {
   // shutdownDesktopIntegration closes the sentinel before waiting on these
   // producers, then drains their operation markers before remote cleanup.
   const schedulers = [
-    scanScheduler,
-    hookHeartbeatScheduler,
+    activeSchedulers.scanner,
+    activeSchedulers.heartbeat,
     sessionEndFinalizationWorker,
     turnCompletionWorker,
-    releaseRequestNotifier,
+    activeSchedulers.releaseNotifier,
   ];
-  scanScheduler = null;
-  hookHeartbeatScheduler = null;
+  activeSchedulers.scanner = null;
+  activeSchedulers.heartbeat = null;
   sessionEndFinalizationWorker = null;
   turnCompletionWorker = null;
-  releaseRequestNotifier = null;
+  activeSchedulers.releaseNotifier = null;
   unsubscribeUpdateStatus?.();
   unsubscribeUpdateStatus = null;
   desktopUpdater?.dispose();
@@ -517,6 +525,7 @@ function registerIpc(
   updater: DesktopAppUpdater,
   controller: IntegrationController,
   localServer: ServiceSupervisor,
+  ensureActiveSchedulers: () => void,
 ): void {
   const allowedRepositories = new Set<string>();
   void store.list().then((connections) => {
@@ -578,11 +587,13 @@ function registerIpc(
       throw new Error("A saved room connection is required.");
     }
     const normalizedId = connectionId.trim();
-    return activateDesktopRoomConnection({
+    const activated = await activateDesktopRoomConnection({
       connectionId: normalizedId,
       controller,
       localServer,
+      onActivated: ensureActiveSchedulers,
     });
+    return activated;
   });
 
   ipcMain.handle(DESKTOP_IPC.deleteRoomConnection, async (event, connectionId: unknown) => {
@@ -622,10 +633,11 @@ function registerIpc(
       controller,
       store,
       localServer,
+      onActivated: ensureActiveSchedulers,
     });
     const saved = activated.connection;
     allowedRepositories.add(pathKey(saved.repositoryPath));
-    await scanScheduler?.scanNow();
+    await activeSchedulers.scanner?.scanNow();
     return activated;
   });
 

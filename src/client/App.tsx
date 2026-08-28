@@ -94,10 +94,70 @@ import {
 type View = "work" | "records" | "connection" | "management";
 type Notice = { tone: "success" | "warning" | "danger"; message: string };
 type RecordModalKind = Exclude<RecordKind, "context">;
+export type DashboardSyncState = "online" | "partial" | "offline" | "refresh_failed" | "unauthorized";
 type DeleteConnectionTarget = Pick<
   SavedRoomConnection,
   "id" | "roomName" | "memberName" | "serverUrl" | "repositoryPath"
 >;
+
+export function classifyDashboardRefreshFailure(
+  error: unknown,
+): Exclude<DashboardSyncState, "online" | "partial"> {
+  if (error instanceof ApiError) {
+    if (error.status === 401) return "unauthorized";
+    if (error.status === 0) return "offline";
+  }
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  if (
+    message.includes("无法连接房主服务")
+    || message.includes("could not reach the room server")
+    || message.includes("failed to fetch")
+    || message.includes("fetch failed")
+    || message.includes("econnrefused")
+    || message.includes("etimedout")
+  ) return "offline";
+  return "refresh_failed";
+}
+
+function dashboardRefreshErrorMessage(
+  error: unknown,
+  state: Exclude<DashboardSyncState, "online" | "partial">,
+): string {
+  if (state === "unauthorized") return "成员凭证已失效，请重新加入房间。";
+  if (state === "offline") return "无法连接房主服务，请确认邀请地址正确且房主电脑在线。";
+  const detail = error instanceof Error ? error.message : "房间状态加载失败。";
+  return `房间仍保留最近一次同步内容，但团队数据刷新失败：${detail}`;
+}
+
+export function dashboardPartialRefreshMessage(sections: readonly string[]): string {
+  const labels: Record<string, string> = {
+    leases: "工作范围",
+    conflicts: "冲突",
+    releaseRequests: "交接申请",
+    members: "成员",
+    sessions: "Agent 会话",
+    activity: "动态",
+    records: "项目记录",
+    settings: "风险规则",
+  };
+  const visible = [...new Set(sections)].map((section) => labels[section] ?? section);
+  return `房间仍在线，但${visible.join("、")}达到轮询展示上限；完整内容仍保留在房间数据库和专用查询中。`;
+}
+
+export function dashboardSyncStateForPartialSections(
+  sections: readonly string[],
+): Extract<DashboardSyncState, "online" | "partial"> {
+  // 动态和项目记录本来就是有界历史视图；只有协作安全状态不完整时才标记部分展示。
+  const coordinationSections = new Set([
+    "leases",
+    "conflicts",
+    "releaseRequests",
+    "members",
+    "sessions",
+    "settings",
+  ]);
+  return sections.some((section) => coordinationSections.has(section)) ? "partial" : "online";
+}
 
 export type DashboardModal =
   | { type: "claim" }
@@ -223,17 +283,26 @@ export function isAwaitingCommitLease(
   return lease.kind === "automatic" && lease.phase === "awaiting_commit";
 }
 
+export function isBlockedLease(lease: Pick<Lease, "kind" | "phase">): boolean {
+  return lease.kind === "automatic" && lease.phase === "blocked";
+}
+
 export function splitVisibleLeases(
   leases: readonly Lease[],
   now = Date.now(),
-): { working: Lease[]; awaitingCommit: Lease[] } {
+): { working: Lease[]; waiting: Lease[]; blocked: Lease[]; awaitingCommit: Lease[] } {
   const working: Lease[] = [];
+  const waiting: Lease[] = [];
+  const blocked: Lease[] = [];
   const awaitingCommit: Lease[] = [];
   for (const lease of leases) {
     if (!isValidLease(lease, now)) continue;
-    (isAwaitingCommitLease(lease) ? awaitingCommit : working).push(lease);
+    if (lease.phase === "waiting") waiting.push(lease);
+    else if (isBlockedLease(lease)) blocked.push(lease);
+    else if (isAwaitingCommitLease(lease)) awaitingCommit.push(lease);
+    else working.push(lease);
   }
-  return { working, awaitingCommit };
+  return { working, waiting, blocked, awaitingCommit };
 }
 
 export type ProtectedSystem = {
@@ -1136,23 +1205,40 @@ function DesktopUpdateControl({ onNotice }: { onNotice: (message: string, tone?:
   );
 }
 
-function StatusSummary({ dashboard, online, now, conflicts }: { dashboard: Dashboard; online: boolean; now: number; conflicts?: Conflict[] }) {
+export function StatusSummary({ dashboard, syncState, now, conflicts }: { dashboard: Dashboard; syncState: DashboardSyncState; now: number; conflicts?: Conflict[] }) {
   const activeLeases = dashboard.leases.filter((lease) => isValidLease(lease, now));
   const blockers = (conflicts ?? dashboard.conflicts).filter((item) => item.severity === "blocking");
   const onlineMembers = dashboard.members.filter((member) => member.status === "online").length;
+  const connected = syncState === "online" || syncState === "partial";
+  const statusTitle = syncState === "offline"
+    ? "正在重新连接房间"
+    : syncState === "unauthorized"
+      ? "成员凭证已失效"
+      : syncState === "refresh_failed"
+        ? "团队数据暂未刷新"
+        : blockers.length
+          ? "需要处理协作阻塞"
+          : syncState === "partial"
+            ? "团队状态部分展示"
+            : "团队协作正常";
+  const statusDetail = syncState === "offline"
+    ? "已保留最近一次同步内容，不会丢失本地工作"
+    : syncState === "unauthorized"
+      ? "已保留最近一次同步内容，请重新加入房间"
+      : syncState === "refresh_failed"
+        ? "房间未被判定为断开，系统会继续重试团队数据刷新"
+        : blockers.length
+          ? `${blockers.length} 项阻塞尚未解决，相关工作不会进入共享结果`
+          : syncState === "partial"
+            ? "房间保持在线，超出轮询上限的协作内容仍保留在房间中"
+            : "系统正在后台同步工作范围与项目上下文";
   return (
-    <section className={`status-summary ${online ? "healthy" : "offline"}`} aria-label="协作状态">
+    <section className={`status-summary ${connected ? "healthy" : "offline"}`} aria-label="协作状态">
       <div className="status-primary">
         <span className="status-signal"><Radio aria-hidden="true" /></span>
         <div>
-          <strong>{online ? (blockers.length ? "需要处理协作阻塞" : "团队协作正常") : "正在重新连接房间"}</strong>
-          <span>
-            {online
-              ? blockers.length
-                ? `${blockers.length} 项阻塞尚未解决，相关工作不会进入共享结果`
-                : "系统正在后台同步工作范围与项目上下文"
-              : "已保留最近一次同步内容，不会丢失本地工作"}
-          </span>
+          <strong>{statusTitle}</strong>
+          <span>{statusDetail}</span>
         </div>
       </div>
       <div className="status-metrics">
@@ -1206,8 +1292,10 @@ export function WorkItem({
   onClose: (lease: Lease) => void;
 }) {
   const awaitingCommit = isAwaitingCommitLease(lease);
+  const blocked = isBlockedLease(lease);
+  const waiting = lease.phase === "waiting";
   return (
-    <article className={`work-item ${own ? "own" : ""} ${awaitingCommit ? "awaiting-commit" : ""}`}>
+    <article className={`work-item ${own ? "own" : ""} ${awaitingCommit ? "awaiting-commit" : ""} ${blocked ? "blocked" : ""} ${waiting ? "waiting" : ""}`}>
       <div className="work-state" aria-hidden="true"><span /></div>
       <div className="work-main">
         <div className="work-title-row">
@@ -1223,6 +1311,8 @@ export function WorkItem({
             <strong>会话已结束，等待提交</strong>
           </div>
         )}
+        {blocked && <div className="awaiting-commit-state" role="status"><AlertTriangle aria-hidden="true" /><strong>存在未提交改动，已停止续租，等待当前租约到期</strong></div>}
+        {waiting && <div className="awaiting-commit-state" role="status"><Clock3 aria-hidden="true" /><strong>等待较早会话释放重叠范围</strong></div>}
         {lease.objective && <p className="work-objective">{lease.objective}</p>}
         <div className="scope-list" aria-label="涉及范围">
           {lease.paths.length ? lease.paths.map((path) => (
@@ -1237,7 +1327,7 @@ export function WorkItem({
           <span>基于 {shortCommit(lease.baseCommit)}</span>
         </div>
       </div>
-      {own && !awaitingCommit && (
+      {own && !awaitingCommit && !blocked && !waiting && (
         <div className="work-actions">
           <IconButton label="延长保护时间" onClick={() => onRenew(lease)} disabled={busy}>
             <RefreshCw className={busy ? "spin" : ""} aria-hidden="true" />
@@ -1369,12 +1459,16 @@ export function WorkView({
   onRenew: (lease: Lease) => void;
   onClose: (lease: Lease) => void;
 }) {
-  const { working, awaitingCommit } = splitVisibleLeases(dashboard.leases, now);
+  const { working, waiting, blocked, awaitingCommit } = splitVisibleLeases(dashboard.leases, now);
   const isOwnLease = (lease: Lease) => lease.memberId === dashboard.currentMember.id || lease.memberName === dashboard.currentMember.name;
   const ownWorkingLeases = working.filter(isOwnLease);
   const otherWorkingLeases = working.filter((lease) => !isOwnLease(lease));
   const ownAwaitingLeases = awaitingCommit.filter(isOwnLease);
   const otherAwaitingLeases = awaitingCommit.filter((lease) => !isOwnLease(lease));
+  const ownWaitingLeases = waiting.filter(isOwnLease);
+  const otherWaitingLeases = waiting.filter((lease) => !isOwnLease(lease));
+  const ownBlockedLeases = blocked.filter(isOwnLease);
+  const otherBlockedLeases = blocked.filter((lease) => !isOwnLease(lease));
   const activeSessions = dashboard.sessions.filter((session) => isRealtimeAgentSession(session, now));
   const conflicts = [...transientConflicts, ...dashboard.conflicts];
   return (
@@ -1422,6 +1516,17 @@ export function WorkView({
             )}
             <p className="automation-caption"><Bot aria-hidden="true" />日常范围由本地组件自动维护；需要提前声明工作范围或创建独占保护时，可使用“手动领取”。</p>
           </section>
+          {(waiting.length > 0 || blocked.length > 0) && (
+            <section className="section-block awaiting-protection-section" aria-labelledby="coordination-title">
+              <div className="section-heading"><div><span className="section-kicker">租约协调</span><h2 id="coordination-title">等待与阻塞</h2></div><span className="quiet-count">{waiting.length + blocked.length} 项</span></div>
+              <div className="work-list">
+                {ownWaitingLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
+                {otherWaitingLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own={false} busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
+                {ownBlockedLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
+                {otherBlockedLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own={false} busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
+              </div>
+            </section>
+          )}
           {awaitingCommit.length > 0 && (
             <section className="section-block awaiting-protection-section" aria-labelledby="awaiting-protection-title">
               <div className="section-heading">
@@ -1550,14 +1655,14 @@ function CopyValue({ label, value, secret = false }: { label: string; value: str
 function ConnectionView({
   dashboard,
   session,
-  online,
+  syncState,
   now,
   deleting,
   onRemoveLocal,
 }: {
   dashboard: Dashboard;
   session: Session;
-  online: boolean;
+  syncState: DashboardSyncState;
   now: number;
   deleting: boolean;
   onRemoveLocal: () => void;
@@ -1573,6 +1678,18 @@ function ConnectionView({
   const [inviteAddress, setInviteAddress] = useState(session.inviteServerUrl || session.serverUrl || window.location.origin);
   const [installing, setInstalling] = useState(false);
   const [installMessage, setInstallMessage] = useState("");
+  const roomServiceConnected = syncState === "online" || syncState === "partial";
+  const roomServiceState = roomServiceConnected ? "connected" : syncState === "offline" ? "disconnected" : "pending";
+  const roomServiceDetail = syncState === "online"
+    ? "已连接，团队状态正在同步"
+    : syncState === "partial"
+      ? "已连接，部分协作内容超出轮询展示上限"
+      : syncState === "offline"
+        ? "连接中断，正在自动重试"
+        : syncState === "unauthorized"
+          ? "成员凭证已失效，请重新加入房间"
+          : "最近一次团队数据刷新失败，正在自动重试";
+  const roomServiceLabel = roomServiceConnected ? "在线" : syncState === "offline" ? "离线" : syncState === "unauthorized" ? "需处理" : "待刷新";
 
   useEffect(() => {
     if (!isDesktopApp() || dashboard.currentMember.role !== "host" || session.inviteServerUrl) return;
@@ -1606,10 +1723,10 @@ function ConnectionView({
         </div>
       </div>
       <div className="connection-health">
-        <div className={online ? "connected" : "disconnected"}>
+        <div className={roomServiceState}>
           <span><Server aria-hidden="true" /></span>
-          <div><strong>房间服务</strong><small>{online ? "已连接，团队状态正在同步" : "连接中断，正在自动重试"}</small></div>
-          <em>{online ? "在线" : "离线"}</em>
+          <div><strong>房间服务</strong><small>{roomServiceDetail}</small></div>
+          <em>{roomServiceLabel}</em>
         </div>
         <div className={agentOnline ? "connected" : "pending"}>
           <span><Bot aria-hidden="true" /></span>
@@ -1902,7 +2019,7 @@ function DashboardApp({
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [leaving, setLeaving] = useState(false);
-  const [online, setOnline] = useState(true);
+  const [syncState, setSyncState] = useState<DashboardSyncState>("online");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState<Notice | null>(initialNotice);
   const [activeModal, setActiveModal] = useState<DashboardModal | null>(null);
@@ -1930,15 +2047,16 @@ function DashboardApp({
       setDashboard(next);
       setServerClockOffsetMs(nextClockOffsetMs);
       setLeaseNow(localObservedAt + nextClockOffsetMs);
-      setOnline(true);
-      setError("");
+      const partialSections = next.partialSections ?? [];
+      const partial = partialSections.length > 0;
+      // 容量受控的部分响应仍代表连接成功；只有传输或数据契约失败才进入陈旧状态。
+      setSyncState(dashboardSyncStateForPartialSections(partialSections));
+      setError(partial ? dashboardPartialRefreshMessage(partialSections) : "");
     } catch (caught) {
-      setOnline(false);
-      if (caught instanceof ApiError && caught.status === 401) {
-        setError("成员凭证已失效，请重新加入房间。");
-      } else if (!quiet) {
-        setError(caught instanceof Error ? caught.message : "房间状态加载失败。");
-      }
+      // 数据契约或响应体错误只会让缓存数据变旧，不能伪装成房间断线。
+      const failureState = classifyDashboardRefreshFailure(caught);
+      setSyncState(failureState);
+      setError(dashboardRefreshErrorMessage(caught, failureState));
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -2008,7 +2126,9 @@ function DashboardApp({
   const handleClaim = async (input: CreateLeaseInput) => {
     const result = await createLease(session, input);
     setTransientConflicts(result.conflicts);
-    if (!result.acquired || result.decision === "deny") {
+    if (result.decision === "wait") {
+      setNotice({ tone: "warning", message: `已进入等待队列，优先租约由 ${result.waitingFor?.memberName ?? "较早会话"} 持有；当前任务不会反向阻塞它。` });
+    } else if (!result.acquired || result.decision === "deny") {
       setNotice({ tone: "danger", message: result.releaseRequests.length ? "范围已被占用，释放申请已经发送给当前持有人。" : "范围已被占用，工作没有被登记。冲突详情已显示在当前页面。" });
     } else {
       setNotice({ tone: result.decision === "warn" ? "warning" : "success", message: result.decision === "warn" ? "范围已登记，同时发现需要关注的重叠。" : "工作范围已登记并开始保护。" });
@@ -2086,7 +2206,7 @@ function DashboardApp({
           <small><GitBranch aria-hidden="true" />{dashboard.room.defaultBranch}</small>
         </div>
         <div className="top-actions">
-          <span className={`connection-pill ${online ? "online" : "offline"}`}><span />{online ? "已连接" : "连接中"}</span>
+          <span className={`connection-pill ${syncState === "online" || syncState === "partial" ? "online" : "offline"}`}><span />{syncState === "online" || syncState === "partial" ? "已连接" : syncState === "offline" ? "连接中" : syncState === "unauthorized" ? "凭证失效" : "待刷新"}</span>
           <IconButton label="刷新团队状态" onClick={() => void refresh()} disabled={refreshing || leaving}><RefreshCw className={refreshing ? "spin" : ""} aria-hidden="true" /></IconButton>
           <div className="current-user" title={dashboard.currentMember.name}><span>{dashboard.currentMember.name.slice(0, 1).toUpperCase()}</span><div><strong>{dashboard.currentMember.name}</strong><small>{dashboard.currentMember.role === "host" ? "房主" : "成员"}</small></div></div>
           <IconButton label="离开当前房间" onClick={requestLeave} disabled={leaving}>{leaving ? <LoaderCircle className="spin" aria-hidden="true" /> : <LogOut aria-hidden="true" />}</IconButton>
@@ -2096,13 +2216,13 @@ function DashboardApp({
         <AppNav view={view} onChange={setView} open={navOpen} onClose={() => setNavOpen(false)} />
         <main className="workspace">
           {ownedReleaseRequests.length > 0 && <div className="release-request-banner" role="status"><Bell aria-hidden="true" /><div><strong>{ownedReleaseRequests.length} 个范围交接申请等待你处理</strong><span>{ownedReleaseRequests[0].requesterName} 需要修改你正在保护的路径。</span></div><button type="button" className="primary-button" onClick={() => openModal({ type: "release", requestId: ownedReleaseRequests[0].id })}>查看申请</button></div>}
-          <StatusSummary dashboard={dashboard} online={online} now={leaseNow} conflicts={[...transientConflicts, ...dashboard.conflicts]} />
+          <StatusSummary dashboard={dashboard} syncState={syncState} now={leaseNow} conflicts={[...transientConflicts, ...dashboard.conflicts]} />
           <DesktopUpdateControl onNotice={(message, tone = "success") => setNotice({ message, tone })} />
           {error && <div className="inline-alert"><AlertTriangle aria-hidden="true" />{error}</div>}
           {view === "work" && <WorkView dashboard={dashboard} busyLeaseId={busyLeaseId} transientConflicts={transientConflicts} now={leaseNow} onClaim={() => openModal({ type: "claim" })} onRenew={handleRenew} onClose={(lease) => openModal({ type: "close", lease })} />}
           {view === "records" && <RecordsView dashboard={dashboard} onAdd={(recordKind) => openModal({ type: "record", recordKind })} />}
           {view === "management" && <ManagementView dashboard={dashboard} session={session} onRefresh={() => refresh(true)} onNotice={(message, tone = "success") => setNotice({ message, tone })} />}
-          {view === "connection" && <ConnectionView dashboard={dashboard} session={session} online={online} now={leaseNow} deleting={deletingCurrentConnection} onRemoveLocal={onDeleteCurrentConnection} />}
+          {view === "connection" && <ConnectionView dashboard={dashboard} session={session} syncState={syncState} now={leaseNow} deleting={deletingCurrentConnection} onRemoveLocal={onDeleteCurrentConnection} />}
         </main>
       </div>
       {activeModal?.type === "claim" && <ClaimLeaseModal settings={dashboard.settings} onClose={() => setActiveModal(null)} onSubmit={handleClaim} />}

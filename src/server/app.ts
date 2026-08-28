@@ -27,6 +27,9 @@ import {
 } from "./service.js";
 import { UpdateCoordinator } from "./update-coordinator.js";
 
+const DASHBOARD_RESPONSE_TARGET_BYTES = 768 * 1024;
+const DASHBOARD_RESPONSE_METADATA_RESERVE_BYTES = 4 * 1024;
+
 export interface CreateAgentHubAppOptions {
   database?: AgentHubDatabase;
   databasePath?: string;
@@ -160,21 +163,18 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
   app.get("/api/dashboard", (request, response) => {
     const token = bearerToken(request);
     const dashboard = service.getDashboard(token);
-    response.json({
-      room: roomResponse(dashboard.room),
-      currentMember: memberResponse(dashboard.currentMember),
-      members: dashboard.members.map(memberResponse),
-      leases: dashboard.leases.map(leaseResponse),
-      conflicts: dashboard.conflicts.map(conflictResponse),
-      records: dashboard.records.map(recordResponse),
-      activity: dashboard.activity.map(activityResponse),
-      sessions: dashboard.sessions,
-      localScans: dashboard.localScans,
-      settings: dashboard.settings,
-      releaseRequests: dashboard.releaseRequests,
-      generatedAt: dashboard.generatedAt,
-      server: { mcpUrl: resolveMcpUrl(request, options.mcpUrl) },
-    });
+    const body = JSON.stringify(dashboardResponse(
+      dashboard,
+      resolveMcpUrl(request, options.mcpUrl),
+    ));
+    if (Buffer.byteLength(body, "utf8") > DASHBOARD_RESPONSE_TARGET_BYTES) {
+      response.status(507).json({
+        error: "dashboard_capacity_exceeded",
+        message: "The dashboard core state exceeds the safe desktop response budget.",
+      });
+      return;
+    }
+    response.type("application/json").send(body);
   });
 
   app.get("/api/snapshot", (request, response) => {
@@ -270,6 +270,7 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       lease: result.acquired ? leaseResponse(result.lease) : undefined,
       conflicts: result.conflicts.map(conflictResponse),
       releaseRequests: result.releaseRequests,
+      waitingFor: "waitingFor" in result ? result.waitingFor : undefined,
     });
   });
 
@@ -347,15 +348,29 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
         lease: result.claim.acquired ? leaseResponse(result.claim.lease) : undefined,
         conflicts: result.claim.conflicts.map(conflictResponse),
         releaseRequests: result.claim.releaseRequests,
+        waitingFor: "waitingFor" in result.claim ? result.claim.waitingFor : undefined,
       } : undefined,
     });
   });
 
+  app.post("/api/sessions/:id/write-blocked", (request, response) => {
+    const body = bodyObject(request);
+    response.json(service.markWriteBlocked({
+      memberToken: bearerToken(request),
+      sessionId: parameter(request, "id"),
+      dirty: body.dirty === true,
+      reason: optionalValue(body, "reason"),
+      paths: stringArrayValue(body.paths),
+    }));
+  });
+
   app.get("/api/release-requests", (request, response) => {
     const rawStatus = typeof request.query.status === "string" ? request.query.status : undefined;
+    const token = bearerToken(request);
     response.json({
+      currentMemberId: service.authenticateMemberToken(token).member.id,
       releaseRequests: service.listReleaseRequests({
-        memberToken: bearerToken(request),
+        memberToken: token,
         status: rawStatus as ReleaseRequestStatus | "all" | undefined,
       }),
     });
@@ -741,7 +756,7 @@ function leaseResponse(lease: ReturnType<AgentHubService["renewLease"]>) {
     branch: lease.branch ?? "",
     baseCommit: lease.baseCommit ?? undefined,
     paths: lease.paths.map((path) => path.path),
-    pathDetails: lease.paths,
+    highRiskPaths: lease.paths.filter((path) => path.risk === "high").map((path) => path.path),
     mode: lease.mode,
     kind: lease.kind,
     phase: lease.phase,
@@ -803,6 +818,130 @@ function activityResponse(activity: ReturnType<AgentHubService["listActivity"]>[
     metadata: activity.metadata,
     createdAt: activity.createdAt,
   };
+}
+
+function dashboardActivityResponse(
+  activity: ReturnType<AgentHubService["getDashboard"]>["activity"][number],
+) {
+  return {
+    id: activity.id,
+    type: activity.type,
+    actorName: activity.actorName ?? "Agent Hub",
+    memberName: activity.actorName ?? undefined,
+    title: activity.summary,
+    summary: activity.summary,
+    createdAt: activity.createdAt,
+  };
+}
+
+function dashboardSessionResponse(
+  session: ReturnType<AgentHubService["getDashboard"]>["sessions"][number],
+) {
+  return {
+    id: session.id,
+    memberId: session.memberId,
+    clientName: session.clientName ?? undefined,
+    agentName: session.agentName ?? undefined,
+    task: session.task ?? undefined,
+    branch: session.branch ?? undefined,
+    baseCommit: session.baseCommit ?? undefined,
+    status: session.status,
+    lastSeenAt: session.lastSeenAt,
+    turnStoppedAt: session.turnStoppedAt ?? undefined,
+    clientVersion: session.clientVersion ?? undefined,
+    protocolVersion: session.protocolVersion ?? undefined,
+    schemaVersion: session.schemaVersion ?? undefined,
+  };
+}
+
+function dashboardReleaseRequestResponse(
+  request: ReturnType<AgentHubService["getDashboard"]>["releaseRequests"][number],
+) {
+  // 弹窗处理申请只需要实际请求范围。合法申请也可能展开为很大的重叠路径笛卡尔积，
+  // 这部分完整证据留在专用接口，避免挤掉仪表盘中的可操作申请。
+  return { ...request, overlapPaths: [] };
+}
+
+function dashboardResponse(
+  dashboard: ReturnType<AgentHubService["getDashboard"]>,
+  mcpUrl: string,
+) {
+  const members: unknown[] = [];
+  const leases: unknown[] = [];
+  const conflicts: unknown[] = [];
+  const releaseRequests: unknown[] = [];
+  const sessions: unknown[] = [];
+  const activity: unknown[] = [];
+  const records: unknown[] = [];
+  const partialSections: string[] = [];
+  const sectionTotals = dashboard.sectionTotals;
+  const payload = {
+    room: roomResponse(dashboard.room),
+    currentMember: memberResponse(dashboard.currentMember),
+    members,
+    leases,
+    conflicts,
+    records,
+    activity,
+    sessions,
+    localScans: dashboard.localScans,
+    // 风险规则会被管理页整表保存，必须作为不可裁剪的核心状态完整返回。
+    settings: dashboard.settings,
+    releaseRequests,
+    generatedAt: dashboard.generatedAt,
+    server: { mcpUrl },
+    partialSections,
+    sectionTotals,
+  };
+  let payloadBytes = jsonByteLength(payload);
+  const contentBudget = DASHBOARD_RESPONSE_TARGET_BYTES - DASHBOARD_RESPONSE_METADATA_RESERVE_BYTES;
+  const markPartial = (section: string) => {
+    if (!partialSections.includes(section)) partialSections.push(section);
+  };
+  const appendWithinBudget = (section: string, target: unknown[], values: unknown[]) => {
+    for (const value of values) {
+      const addedBytes = jsonByteLength(value) + (target.length > 0 ? 1 : 0);
+      if (payloadBytes + addedBytes > contentBudget) {
+        markPartial(section);
+        return;
+      }
+      target.push(value);
+      payloadBytes += addedBytes;
+    }
+  };
+
+  // 协作安全状态优先于历史展示；达到预算时返回结构化 partialSections，
+  // 让客户端保持在线并明确提示部分展示，而不是被桌面代理按断线拒绝整个响应。
+  const sourceLengths: Record<keyof typeof sectionTotals, number> = {
+    leases: dashboard.leases.length,
+    conflicts: dashboard.conflicts.length,
+    releaseRequests: dashboard.releaseRequests.length,
+    members: dashboard.members.length,
+    sessions: dashboard.sessions.length,
+    activity: dashboard.activity.length,
+    records: dashboard.records.length,
+    settings: dashboard.settings.riskRules.length,
+  };
+  for (const [section, total] of Object.entries(sectionTotals)) {
+    if (total > sourceLengths[section as keyof typeof sectionTotals]) markPartial(section);
+  }
+  // 即使大型租约范围耗尽后续轮询预算，持有人也必须能处理最新交接申请。
+  appendWithinBudget(
+    "releaseRequests",
+    releaseRequests,
+    dashboard.releaseRequests.map(dashboardReleaseRequestResponse),
+  );
+  appendWithinBudget("leases", leases, dashboard.leases.map(leaseResponse));
+  appendWithinBudget("conflicts", conflicts, dashboard.conflicts.map(conflictResponse));
+  appendWithinBudget("members", members, dashboard.members.map(memberResponse));
+  appendWithinBudget("sessions", sessions, dashboard.sessions.map(dashboardSessionResponse));
+  appendWithinBudget("activity", activity, dashboard.activity.map(dashboardActivityResponse));
+  appendWithinBudget("records", records, dashboard.records.map(recordResponse));
+  return payload;
+}
+
+function jsonByteLength(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
 function bodyObject(request: Request): Record<string, unknown> {

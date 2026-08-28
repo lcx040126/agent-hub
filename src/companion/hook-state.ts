@@ -32,6 +32,24 @@ export interface HookLeaseState {
   id: string;
   paths: string[];
   expiresAt: string;
+  coordinationState?: "working" | "blocked";
+}
+
+export interface HookPassiveWriteBlockState {
+  leaseId: string;
+  sessionId?: string;
+  memberName: string;
+  /** 服务端最近返回的持有者范围，仅用于诊断和提示。 */
+  paths: string[];
+  /** 触发等待的完整申请范围；只有服务端重新检查该范围后才能清除围栏。 */
+  requestedPaths: string[];
+  expiresAt: string;
+}
+
+export interface HookWriteBlockSyncState {
+  dirty: boolean;
+  paths: string[];
+  recordedAt: string;
 }
 
 export interface HookQuarantineState {
@@ -92,6 +110,10 @@ export interface CodexHookSessionState {
   leases: HookLeaseState[];
   /** false 表示本地状态曾丢失，服务端可能仍有本机尚未恢复的自动租约。 */
   leaseAttributionComplete?: boolean;
+  /** 等待同成员较早会话时，阻止无法在写前确定输出路径的命令绕过协调。 */
+  passiveWriteBlock?: HookPassiveWriteBlockState;
+  /** write-blocked 尚未获得服务端确认；心跳与后续写入必须先等待幂等补发。 */
+  writeBlockSyncPending?: HookWriteBlockSyncState;
   pendingWrite?: HookPendingWriteState;
   externalChangeDiagnostics?: HookExternalChangeDiagnostic[];
   loadedFeatureVersions?: Record<string, string>;
@@ -124,7 +146,7 @@ export class CodexHookStateStore {
   }
 
   /**
-   * 同一个 Codex session 的 Stop、PreToolUse 与心跳都必须在这里串行化。
+   * 同一个 Codex session 的 Stop、PreToolUse、PostToolUse 与心跳都必须在这里串行化。
    * 进程内 Promise 锁无法覆盖独立 Hook 进程，因此使用原子创建的文件作为所有权凭据。
    */
   async runExclusive<T>(
@@ -149,13 +171,28 @@ export class CodexHookStateStore {
     codexSessionId: string,
     renewedLeases: Array<Pick<HookLeaseState, "id" | "expiresAt">>,
   ): Promise<CodexHookSessionState | undefined> {
-    const normalizedRenewals = new Map(renewedLeases.map((lease) => [
-      requiredText(lease.id, "lease ID"),
-      isoText(lease.expiresAt, "lease expiry"),
-    ]));
+    return this.runExclusiveLeaseRenewal(codexSessionId, async () => renewedLeases);
+  }
+
+  /**
+   * 心跳必须在同一把会话锁内重读门禁、请求服务端并合并续租结果，避免旧扫描快照越过刚写入的 pending/blocked 状态。
+   * operation 返回 undefined 表示当前状态不应发送心跳；返回数组表示服务端已经确认的续租结果。
+   */
+  async runExclusiveLeaseRenewal(
+    codexSessionId: string,
+    operation: (
+      state: CodexHookSessionState,
+    ) => Promise<Array<Pick<HookLeaseState, "id" | "expiresAt">> | undefined>,
+  ): Promise<CodexHookSessionState | undefined> {
     return this.runExclusive(codexSessionId, async () => {
       const state = await this.load(codexSessionId);
       if (!state) return undefined;
+      const renewedLeases = await operation(state);
+      if (renewedLeases === undefined) return state;
+      const normalizedRenewals = new Map(renewedLeases.map((lease) => [
+        requiredText(lease.id, "lease ID"),
+        isoText(lease.expiresAt, "lease expiry"),
+      ]));
       let changed = false;
       const leases = state.leases.map((lease) => {
         const expiresAt = normalizedRenewals.get(lease.id);
@@ -347,6 +384,12 @@ export function parseState(raw: string): CodexHookSessionState {
     leaseAttributionComplete: value.leaseAttributionComplete === undefined
       ? true
       : booleanValue(value.leaseAttributionComplete, "lease attribution completeness"),
+    passiveWriteBlock: value.passiveWriteBlock === undefined
+      ? undefined
+      : parsePassiveWriteBlock(value.passiveWriteBlock),
+    writeBlockSyncPending: value.writeBlockSyncPending === undefined
+      ? undefined
+      : parseWriteBlockSync(value.writeBlockSyncPending),
     pendingWrite: value.pendingWrite === undefined ? undefined : parsePendingWrite(value.pendingWrite),
     externalChangeDiagnostics: value.externalChangeDiagnostics === undefined
       ? undefined
@@ -440,10 +483,44 @@ function parseQuarantine(value: unknown): HookQuarantineState {
 
 function parseLease(value: unknown): HookLeaseState {
   if (!isRecord(value)) throw new Error("The Agent Hub hook state contains an invalid lease.");
+  const coordinationState = value.coordinationState === undefined
+    ? undefined
+    : requiredText(value.coordinationState, "lease coordination state");
+  if (coordinationState !== undefined && coordinationState !== "working" && coordinationState !== "blocked") {
+    throw new Error("The Agent Hub hook state contains an invalid lease coordination state.");
+  }
   return {
     id: requiredText(value.id, "lease ID"),
     paths: stringArray(value.paths),
     expiresAt: isoText(value.expiresAt, "lease expiry"),
+    coordinationState,
+  };
+}
+
+function parsePassiveWriteBlock(value: unknown): HookPassiveWriteBlockState {
+  if (!isRecord(value)) throw new Error("The Agent Hub hook state contains an invalid passive write block.");
+  const paths = stringArray(value.paths);
+  return {
+    leaseId: requiredText(value.leaseId, "passive write block lease ID"),
+    sessionId: value.sessionId === undefined
+      ? undefined
+      : requiredText(value.sessionId, "passive write block session ID"),
+    memberName: requiredText(value.memberName, "passive write block member name"),
+    paths,
+    // v0.2.5 预发布期间生成过不带 requestedPaths 的状态，按持有者范围保守迁移。
+    requestedPaths: value.requestedPaths === undefined
+      ? paths
+      : stringArray(value.requestedPaths),
+    expiresAt: isoText(value.expiresAt, "passive write block expiry"),
+  };
+}
+
+function parseWriteBlockSync(value: unknown): HookWriteBlockSyncState {
+  if (!isRecord(value)) throw new Error("The Agent Hub hook state contains an invalid write-block sync.");
+  return {
+    dirty: booleanValue(value.dirty, "write-block sync dirty state"),
+    paths: stringArray(value.paths),
+    recordedAt: isoText(value.recordedAt, "write-block sync recordedAt"),
   };
 }
 

@@ -96,13 +96,14 @@ interface ManagedMcpIdentity {
 }
 
 interface HookDefinition {
-  event: "SessionStart" | "PreToolUse" | "PostToolUse" | "Stop" | "SessionEnd";
+  event: "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "Stop" | "SessionEnd";
   matcher?: string;
   timeout: number;
 }
 
 const MANAGED_HOOK_DEFINITIONS: HookDefinition[] = [
   { event: "SessionStart", matcher: "^(startup|resume|clear|compact)$", timeout: 10 },
+  { event: "UserPromptSubmit", timeout: 5 },
   { event: "PreToolUse", matcher: "^(Bash|apply_patch)$", timeout: 20 },
   { event: "PostToolUse", matcher: "^(Bash|apply_patch)$", timeout: 20 },
   { event: "Stop", timeout: 3 },

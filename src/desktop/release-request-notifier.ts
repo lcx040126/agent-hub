@@ -91,13 +91,13 @@ async function notifyPendingRequests(
       const response = await requester({
         connectionId: connection.id,
         method: "GET",
-        path: "/api/dashboard",
+        path: "/api/release-requests?status=pending",
       }, options.store);
       if (response.status < 200 || response.status >= 300) return;
-      const dashboard = record(response.body);
-      const currentMemberId = text(record(dashboard.currentMember).id);
+      const payload = record(response.body);
+      const currentMemberId = text(payload.currentMemberId);
       if (!currentMemberId) return;
-      const requests = Array.isArray(dashboard.releaseRequests) ? dashboard.releaseRequests : [];
+      const requests = Array.isArray(payload.releaseRequests) ? payload.releaseRequests : [];
       for (const value of requests) {
         const request = record(value);
         if (text(request.status) !== "pending" || text(request.holderMemberId) !== currentMemberId) continue;

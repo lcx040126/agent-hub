@@ -6,6 +6,10 @@ import {
   SavedConnectionList,
   WorkItem,
   WorkView,
+  StatusSummary,
+  classifyDashboardRefreshFailure,
+  dashboardPartialRefreshMessage,
+  dashboardSyncStateForPartialSections,
   dashboardClockOffsetMs,
   formatLeaseExpiryCountdown,
   isRealtimeAgentSession,
@@ -16,7 +20,7 @@ import {
   protectedSystemsForDashboard,
   splitVisibleLeases,
 } from "./App";
-import type { Dashboard, Lease, SavedRoomConnection } from "./api";
+import { ApiError, type Dashboard, type Lease, type SavedRoomConnection } from "./api";
 
 const originalWindow = globalThis.window;
 const LEASE_NOW = Date.parse("2026-08-27T08:00:00.000Z");
@@ -115,6 +119,43 @@ describe("dashboard modal coordination", () => {
       "member-current",
       new Set(["request-dismissed"]),
     )).toBeUndefined();
+  });
+});
+
+describe("dashboard refresh state", () => {
+  it("separates transport failures, expired credentials, and stale dashboard data", () => {
+    expect(classifyDashboardRefreshFailure(new ApiError("无法连接", 0))).toBe("offline");
+    expect(classifyDashboardRefreshFailure(new Error("无法连接房主服务，请确认房主电脑在线。"))).toBe("offline");
+    expect(classifyDashboardRefreshFailure(new ApiError("成员凭证已失效", 401))).toBe("unauthorized");
+    expect(classifyDashboardRefreshFailure(new Error("The room server response is too large."))).toBe("refresh_failed");
+    expect(classifyDashboardRefreshFailure(new Error("The room server returned invalid JSON."))).toBe("refresh_failed");
+    expect(classifyDashboardRefreshFailure(new ApiError("服务内部错误", 500))).toBe("refresh_failed");
+  });
+
+  it("labels stale data as a refresh failure without claiming the room disconnected", () => {
+    const markup = renderToStaticMarkup(
+      <StatusSummary dashboard={dashboard()} syncState="refresh_failed" now={LEASE_NOW} />,
+    );
+
+    expect(markup).toContain("团队数据暂未刷新");
+    expect(markup).toContain("房间未被判定为断开");
+    expect(markup).not.toContain("正在重新连接房间");
+  });
+
+  it("reports budgeted dashboard sections as partial data while keeping the room online", () => {
+    expect(dashboardPartialRefreshMessage(["records", "activity", "records"])).toBe(
+      "房间仍在线，但项目记录、动态达到轮询展示上限；完整内容仍保留在房间数据库和专用查询中。",
+    );
+    expect(dashboardSyncStateForPartialSections(["activity", "records"])).toBe("online");
+    expect(dashboardSyncStateForPartialSections(["activity", "leases"])).toBe("partial");
+
+    const markup = renderToStaticMarkup(
+      <StatusSummary dashboard={dashboard()} syncState="partial" now={LEASE_NOW} />,
+    );
+    expect(markup).toContain("团队状态部分展示");
+    expect(markup).toContain("房间保持在线");
+    expect(markup).not.toContain("团队数据暂未刷新");
+    expect(markup).not.toContain("正在重新连接房间");
   });
 });
 

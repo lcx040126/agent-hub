@@ -7,7 +7,7 @@ describe("release request notification scheduler", () => {
     const request = vi.fn(async () => ({
       status: 200,
       body: {
-        currentMember: { id: "holder-1" },
+        currentMemberId: "holder-1",
         releaseRequests: [
           {
             id: "request-1",
@@ -38,6 +38,11 @@ describe("release request notification scheduler", () => {
     await scheduler.scanNow();
     await scheduler.scanNow();
     await scheduler.stop();
+    expect(request).toHaveBeenCalledWith({
+      connectionId: "connection-1",
+      method: "GET",
+      path: "/api/release-requests?status=pending",
+    }, store);
     expect(notify).toHaveBeenCalledTimes(1);
     expect(notify).toHaveBeenCalledWith(expect.objectContaining({
       id: "request-1",

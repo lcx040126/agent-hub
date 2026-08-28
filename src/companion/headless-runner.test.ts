@@ -15,7 +15,7 @@ describe("Agent Hub headless health probe", () => {
     await expect(runHeadlessRunner(["AgentHub.exe", "--health-probe"], stdout)).resolves.toBe(0);
     expect(JSON.parse(output)).toEqual({
       status: "ok",
-      version: "0.2.4",
+      version: "0.2.5",
       mcpBridge: "ok",
       codexHook: "ok",
     });

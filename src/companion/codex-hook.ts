@@ -44,10 +44,15 @@ import {
 import { getLocalIntegrationStatus, getRuntimeIntegrationStatus } from "./integration-gate.js";
 import { IntegrationOperationTracker } from "./integration-operations.js";
 import {
+  matchesSessionEndJob,
   SessionEndQueueStore,
   type SessionEndQueueJob,
 } from "./session-end-queue.js";
-import { TurnCompletionQueueStore, type TurnCompletionJob } from "./turn-completion-queue.js";
+import {
+  matchesTurnCompletionJob,
+  TurnCompletionQueueStore,
+  type TurnCompletionJob,
+} from "./turn-completion-queue.js";
 import {
   processTurnCompletionJob,
   resumePendingTurnCompletion,
@@ -56,6 +61,7 @@ import { collectAttributedPathEvidence, type AttributedPathEvidence } from "./tu
 
 export type CodexHookEventName =
   | "SessionStart"
+  | "UserPromptSubmit"
   | "PreToolUse"
   | "PostToolUse"
   | "Stop"
@@ -122,9 +128,17 @@ interface EditCheckResponse {
 
 interface LeaseResponse {
   acquired: boolean;
-  decision: "allow" | "warn" | "deny";
+  decision: "allow" | "warn" | "deny" | "wait";
   lease?: { id: string; paths?: string[]; expiresAt: string };
   conflicts?: Array<Record<string, unknown>>;
+  waitingFor?: {
+    leaseId: string;
+    sessionId?: string | null;
+    title: string;
+    memberName: string;
+    expiresAt: string;
+    paths: string[];
+  };
 }
 
 const MAX_HOOK_INPUT_BYTES = 1024 * 1024;
@@ -209,6 +223,11 @@ interface PrepareEditsResponse {
   renewedLeases?: Array<{ id: string; paths?: string[]; expiresAt: string }>;
 }
 
+interface WriteBlockedResponse {
+  releasedLeaseIds: string[];
+  blockedLeaseIds: string[];
+}
+
 async function dispatchCodexHook(
   options: RunCodexHookOptions,
   input: CodexHookInput,
@@ -217,6 +236,8 @@ async function dispatchCodexHook(
   switch (options.eventName) {
     case "SessionStart":
       return handleSessionStart(options, input, record);
+    case "UserPromptSubmit":
+      return handleUserPromptSubmit(options, input, record);
     case "PreToolUse":
       return handlePreToolUse(options, input, record);
     case "PostToolUse":
@@ -226,6 +247,52 @@ async function dispatchCodexHook(
     case "SessionEnd":
       return undefined;
   }
+}
+
+async function handleUserPromptSubmit(
+  options: RunCodexHookOptions,
+  input: CodexHookInput,
+  record: ResolvedRoomConnectionRecord,
+): Promise<Record<string, unknown> | undefined> {
+  const turnId = input.turn_id?.trim();
+  if (!turnId) return undefined;
+  const stateStore = new CodexHookStateStore(options.userDataPath);
+  return stateStore.runExclusive(input.session_id, async () => {
+    const runtime = await findHookRuntime(options, input, record);
+    if (!runtime || runtime.state.currentTurnId === turnId) return undefined;
+    try {
+      // 上一轮 Stop 留下的完成证据必须经幂等 resume 协议收口，不能由提示事件直接清空。
+      await resumePendingTurnCompletion({
+        userDataPath: options.userDataPath,
+        state: runtime.state,
+        stateStore: runtime.stateStore,
+        client: runtime.client,
+        turnId,
+      });
+      if (runtime.state.currentTurnId === turnId) return undefined;
+
+      const nextEpoch = Math.max(runtime.state.activityEpoch ?? 0, 0) + 1;
+      const response = await runtime.client.post<{ session: {
+        activityEpoch?: number;
+        currentTurnId?: string | null;
+      } }>("/api/sessions", {
+        codexSessionId: input.session_id,
+        turnId,
+        activityEpoch: nextEpoch,
+        branch: runtime.git.branch,
+        baseCommit: runtime.git.headCommit,
+        repository: runtime.git.repositoryRoot,
+        worktree: runtime.git.repositoryRoot,
+        metadata: { source: "codex-hook", event: "UserPromptSubmit" },
+      });
+      runtime.state.activityEpoch = Math.max(nextEpoch, response.session.activityEpoch ?? 0);
+      runtime.state.currentTurnId = response.session.currentTurnId ?? turnId;
+      await runtime.stateStore.save(runtime.state);
+    } catch {
+      // Prompt submission is advisory; PreToolUse performs the authoritative retry.
+    }
+    return undefined;
+  });
 }
 
 async function resolveTrackedConnectionRecord(
@@ -249,15 +316,33 @@ async function handleSessionStart(
   record: ResolvedRoomConnectionRecord,
 ): Promise<Record<string, unknown> | undefined> {
   const stateStore = new CodexHookStateStore(options.userDataPath);
-  const existingState = await stateStore.load(input.session_id);
-  if (existingState && existingState.connectionId !== record.connection.id) return undefined;
-  if (!(await getLocalIntegrationStatus(
-    options.userDataPath,
-    record.connection,
-    options.runtimePresencePath,
-  )).active) return undefined;
-  const resolved = await hydrateConnectionRecord(record);
-  const runtime = await openHookRuntime(options, input, resolved, !existingState, existingState);
+  const sessionEndQueue = new SessionEndQueueStore(options.userDataPath);
+  const runtime = await stateStore.runExclusive(input.session_id, async () => {
+    let existingState = await stateStore.load(input.session_id);
+    if (existingState && existingState.connectionId !== record.connection.id) return undefined;
+    if (!(await getLocalIntegrationStatus(
+      options.userDataPath,
+      record.connection,
+      options.runtimePresencePath,
+    )).active) return undefined;
+    const resolved = await hydrateConnectionRecord(record);
+    const pendingFinalizations = (await sessionEndQueue.listForSession(input.session_id))
+      .filter((job) => job.connectionId === record.connection.id);
+    const matchingFinalization = existingState
+      ? pendingFinalizations.find((job) => matchesSessionEndJob(job, existingState!))
+      : undefined;
+    if (existingState && matchingFinalization) {
+      await sessionEndQueue.mergeState(matchingFinalization.finalizationId, existingState);
+    }
+    // 先让旧代次进入 finalizing，服务端才会为同一个 Codex task 分配新的 active Hub session。
+    await ensurePendingFinalizationsStarted(options, resolved, pendingFinalizations);
+    if (existingState && matchingFinalization) {
+      await stateStore.remove(input.session_id);
+      existingState = undefined;
+    }
+    return openHookRuntime(options, input, resolved, !existingState, existingState);
+  });
+  if (!runtime) return undefined;
   const snapshot = await runtime.client.get<RoomSnapshotLike>("/api/snapshot");
   try {
     const featureIndex = await runtime.client.post<FeatureQueryResponse>("/api/features/query", {
@@ -344,7 +429,6 @@ async function handlePreToolUseExclusive(
     mapRepositoryCwd(runtime.connection.repositoryPath, runtime.git.repositoryRoot, input.cwd),
     intent,
   );
-
   if (paths.length > 0) {
     const targetedBaseline = await inspectGitWorkingPathsFromIdentity(runtime.git, paths, {
       gitExecutable: options.gitExecutable,
@@ -370,7 +454,33 @@ async function handlePreToolUseExclusive(
     );
   }
 
+  if (runtime.state.writeBlockSyncPending) {
+    const writeBlockReason = await resynchronizeWriteBlockFence(runtime, paths);
+    if (writeBlockReason) return denyOutput(writeBlockReason);
+  }
+
   if (paths.length === 0) {
+    if (runtime.state.leaseAttributionComplete === false) {
+      return denyOutput(
+        "Agent Hub 复用了远端会话，但本机缺少该会话的完整租约状态；"
+        + "不能执行无法预先确定输出路径的生成、格式化或构建写入。请改用明确路径的写入工具。",
+      );
+    }
+    const passiveWriteBlock = runtime.state.passiveWriteBlock;
+    if (passiveWriteBlock) {
+      return denyOutput(
+        `Agent Hub 正在等待 ${passiveWriteBlock.memberName} 释放较早会话的写入范围；`
+        + "不能执行无法预先确定输出路径的生成、格式化或构建写入。"
+        + ` 缓存租约预计 ${formatHookExpiry(passiveWriteBlock.expiresAt)}，届时仍须改用明确路径的写入工具向房间重新检查。`,
+      );
+    }
+    const blockedLease = runtime.state.leases.find((lease) => lease.coordinationState === "blocked");
+    if (blockedLease) {
+      return denyOutput(
+        "Agent Hub 已阻塞当前会话的自动租约；在未提交改动清理并由明确路径写入向房间复核前，"
+        + "不能执行无法预先确定输出路径的生成、格式化或构建写入。",
+      );
+    }
     if (intent.attributedSideEffects && intent.proposalHash) {
       const stopFence = await adoptConcurrentStopFence(options.userDataPath, runtime);
       if (stopFence) return stopFence;
@@ -381,7 +491,9 @@ async function handlePreToolUseExclusive(
       );
     }
     const hasRepositoryLease = runtime.state.leases.some((lease) =>
-      lease.paths.some((leasePath) => leasePath === "."),
+      lease.coordinationState !== "blocked"
+      && Date.parse(lease.expiresAt) > Date.now()
+      && lease.paths.some((leasePath) => leasePath === "."),
     );
     if (hasRepositoryLease) {
       const stopFence = await adoptConcurrentStopFence(options.userDataPath, runtime);
@@ -395,8 +507,12 @@ async function handlePreToolUseExclusive(
 
   const stopFenceBeforePrepare = await adoptConcurrentStopFence(options.userDataPath, runtime);
   if (stopFenceBeforePrepare) return stopFenceBeforePrepare;
+  const blockedLeaseReason = await resynchronizeWriteBlockFence(runtime, paths);
+  if (blockedLeaseReason) return denyOutput(blockedLeaseReason);
 
-  let prepared: PrepareEditsResponse;
+  let prepared: PrepareEditsResponse | undefined;
+  let recoveredActivityEpoch = false;
+  let activityRecoveryAttempted = false;
   try {
     prepared = await runtime.client.post<PrepareEditsResponse>("/api/edits/prepare", {
       sessionId: runtime.state.hubSessionId,
@@ -410,24 +526,97 @@ async function handlePreToolUseExclusive(
       proposedEdits,
     });
   } catch (error) {
-    if (error instanceof AgentHubHttpError && (error.code === "branch_changed" || error.code === "session_frozen")) {
-      runtime.state.quarantine = { reason: error.message, paths: [], detectedAt: new Date().toISOString() };
-      await runtime.stateStore.save(runtime.state);
-      return denyOutput(`${error.message} 请确认新分支基线后重新开始 Codex 会话。`);
+    let preparationError = error;
+    if (error instanceof AgentHubHttpError && error.code === "stale_activity_epoch") {
+      activityRecoveryAttempted = true;
+      const details = isRecord(error.details) ? error.details : {};
+      const currentEpoch = typeof details.currentActivityEpoch === "number"
+        ? details.currentActivityEpoch
+        : runtime.state.activityEpoch ?? 0;
+      runtime.state.activityEpoch = currentEpoch + 1;
+      runtime.state.currentTurnId = input.turn_id?.trim()
+        || completionTurnId(input, runtime.state.activityEpoch);
+      try {
+        await runtime.client.post("/api/sessions", {
+          codexSessionId: input.session_id,
+          turnId: runtime.state.currentTurnId,
+          activityEpoch: runtime.state.activityEpoch,
+          branch: runtime.git.branch,
+          baseCommit: runtime.git.headCommit,
+          repository: runtime.git.repositoryRoot,
+          worktree: runtime.git.repositoryRoot,
+          metadata: { source: "codex-hook", event: "stale_activity_epoch_recovery" },
+        });
+        await runtime.stateStore.save(runtime.state);
+        prepared = await runtime.client.post<PrepareEditsResponse>("/api/edits/prepare", {
+          sessionId: runtime.state.hubSessionId,
+          title: "Codex automatic write retry",
+          intent: "Retry after stale activity epoch recovery",
+          branch: runtime.git.branch,
+          baseCommit: runtime.git.headCommit,
+          turnId: runtime.state.currentTurnId,
+          activityEpoch: runtime.state.activityEpoch,
+          paths,
+          proposedEdits,
+        });
+        recoveredActivityEpoch = true;
+      } catch (retryError) {
+        if (retryError instanceof AgentHubHttpError && retryError.code === "stale_activity_epoch") {
+          return denyOutput("Agent Hub 检测到会话活动已被更新；本次写入已暂停，请重新提交当前任务。");
+        }
+        preparationError = retryError;
+      }
     }
-    throw error;
+    if (
+      !recoveredActivityEpoch
+      && preparationError instanceof AgentHubHttpError
+      && (preparationError.code === "branch_changed" || preparationError.code === "session_frozen")
+    ) {
+      runtime.state.quarantine = {
+        reason: preparationError.message,
+        paths: [],
+        detectedAt: new Date().toISOString(),
+      };
+      await runtime.stateStore.save(runtime.state);
+      return denyOutput(`${preparationError.message} 请确认新分支基线后重新开始 Codex 会话。`);
+    }
+    if (!recoveredActivityEpoch && activityRecoveryAttempted) {
+      return denyOutput(
+        "Agent Hub 检测到当前写入使用了过期的会话活动轮次，但本次权威恢复未能完整完成；"
+        + "写入保持暂停，请恢复房间连接后重新提交当前操作。",
+      );
+    }
+    const blockedLease = runtime.state.leases.some((lease) => lease.coordinationState === "blocked");
+    if (
+      !recoveredActivityEpoch
+      && (
+        runtime.state.passiveWriteBlock
+        || blockedLease
+        || runtime.state.leaseAttributionComplete === false
+      )
+      && isSoftIntegrationFailure(preparationError)
+    ) {
+      return denyOutput(
+        "Agent Hub 已记录当前会话存在等待、阻塞或尚未恢复的租约状态，但暂时无法向房间服务确认写入范围；"
+        + "本次写入保持暂停，请恢复连接后用明确路径重试。",
+      );
+    }
+    if (!recoveredActivityEpoch) throw preparationError;
   }
+  if (!prepared) throw new Error("Agent Hub prepare did not return a result.");
   updateRenewedLeases(runtime.state, prepared.renewedLeases ?? []);
   if (prepared.claim?.acquired && prepared.claim.lease) {
+    const claimedPaths = prepared.claim.lease.paths?.length ? prepared.claim.lease.paths : paths;
     upsertLease(runtime.state, {
       id: prepared.claim.lease.id,
-      paths: prepared.claim.lease.paths?.length ? prepared.claim.lease.paths : paths,
+      paths: claimedPaths,
       expiresAt: prepared.claim.lease.expiresAt,
     });
   }
   const stopFenceAfterPrepare = await adoptConcurrentStopFence(options.userDataPath, runtime);
   if (stopFenceAfterPrepare) return stopFenceAfterPrepare;
   if (prepared.check.allowed) {
+    clearResolvedPassiveWriteBlock(runtime.state, paths);
     setPendingWrite(runtime, input, intent, proposedEdits);
     await runtime.stateStore.save(runtime.state);
     const claimed = prepared.claim?.acquired
@@ -435,19 +624,80 @@ async function handlePreToolUseExclusive(
       : "";
     return allowOutput(`${claimed}${formatWarnings(prepared.check.warnings)}`);
   }
+  // 只有同一成员的并行会话等待才需要收束当前会话自己的自动租约。
+  // 其他成员或手动独占范围只拒绝这一次目标写入，不能把当前任务的无关范围一并冻结。
+  const passiveConflict = prepared.claim?.decision === "wait";
+  if (passiveConflict) {
+    const initial = new Set(runtime.state.initialChangedPaths.map(pathKey));
+    // 本地租约归属不完整时必须按 dirty 处理，防止服务端把无法在本机重建的租约取消。
+    const dirty = runtime.state.leaseAttributionComplete === false
+      || runtime.state.pendingWrite !== undefined
+      || (runtime.state.attributedChangedPaths?.length ?? 0) > 0
+      || runtime.git.changedPaths.some((path) => !initial.has(pathKey(path)));
+    const waitingFor = prepared.claim?.waitingFor;
+    if (waitingFor) {
+      runtime.state.passiveWriteBlock = {
+        leaseId: waitingFor.leaseId,
+        sessionId: typeof waitingFor.sessionId === "string" ? waitingFor.sessionId : undefined,
+        memberName: waitingFor.memberName,
+        paths: unique(waitingFor.paths.length > 0 ? waitingFor.paths : paths),
+        requestedPaths: unique([
+          ...(runtime.state.passiveWriteBlock?.requestedPaths ?? []),
+          ...paths,
+        ]),
+        expiresAt: waitingFor.expiresAt,
+      };
+    }
+    runtime.state.writeBlockSyncPending = {
+      dirty,
+      paths: unique(paths),
+      recordedAt: new Date().toISOString(),
+    };
+    // write-ahead 保存必须先于网络调用；等待响应期间后台心跳不得续租尚未确认停止的范围。
+    if (dirty) synchronizeBlockedLeaseState(runtime.state, undefined, true);
+    await runtime.stateStore.save(runtime.state);
+    const response = await runtime.client.post<WriteBlockedResponse>(
+      `/api/sessions/${encodeURIComponent(runtime.state.hubSessionId)}/write-blocked`,
+      {
+        dirty,
+        reason: "Waiting for an older same-member automatic lease.",
+        paths,
+      },
+    ).catch(() => undefined);
+    if (response) {
+      synchronizeBlockedLeaseState(runtime.state, response, dirty);
+      runtime.state.writeBlockSyncPending = undefined;
+      await runtime.stateStore.save(runtime.state);
+    }
+  }
   if (prepared.claim && !prepared.claim.acquired) {
+    if (prepared.claim.decision === "wait") {
+      const waitingFor = prepared.claim.waitingFor;
+      const holder = waitingFor && typeof waitingFor.memberName === "string"
+        ? waitingFor.memberName
+        : "同一成员的较早会话";
+      const expiry = waitingFor && typeof waitingFor.expiresAt === "string"
+        ? `，预计 ${formatHookExpiry(waitingFor.expiresAt)}`
+        : "";
+      return denyOutput(`Agent Hub 正在等待 ${holder} 释放重叠写入范围${expiry}；当前会话不会反向阻塞优先任务。`);
+    }
     return denyOutput(formatConflicts(prepared.claim.conflicts ?? [], prepared.claim.decision));
   }
   return denyOutput(formatEditBlockers(prepared.check.blockers, runtime.state.hubSessionId));
+}
+
+function formatHookExpiry(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "租约到期";
+  const minutes = Math.max(0, Math.ceil((timestamp - Date.now()) / 60_000));
+  return minutes <= 1 ? "1 分钟内到期" : `${minutes} 分钟后到期`;
 }
 
 async function adoptConcurrentStopFence(
   userDataPath: string,
   runtime: HookRuntime,
 ): Promise<Record<string, unknown> | undefined> {
-  const jobs = await new TurnCompletionQueueStore(userDataPath).listForSession(
-    runtime.state.codexSessionId,
-  );
+  const jobs = await new TurnCompletionQueueStore(userDataPath).listForLifecycle(runtime.state);
   const currentEpoch = runtime.state.activityEpoch ?? 0;
   const candidate = jobs
     .filter((job) => job.activityEpoch >= currentEpoch)
@@ -510,6 +760,18 @@ async function handlePostToolUse(
 ): Promise<Record<string, unknown> | undefined> {
   const intent = extractAttributedWriteIntent(input.tool_name, input.tool_input);
   if (!intent.writes) return undefined;
+  const stateStore = new CodexHookStateStore(options.userDataPath);
+  // PostToolUse 会更新与 PreToolUse 相同的 pending、围栏和租约；整段串行化避免旧快照覆盖较新的写入阻塞状态。
+  return stateStore.runExclusive(input.session_id, () =>
+    handlePostToolUseExclusive(options, input, record, intent));
+}
+
+async function handlePostToolUseExclusive(
+  options: RunCodexHookOptions,
+  input: CodexHookInput,
+  record: ResolvedRoomConnectionRecord,
+  intent: AttributedWriteIntent,
+): Promise<Record<string, unknown> | undefined> {
   const runtime = await findHookRuntime(options, input, record);
   if (!runtime) return undefined;
   const pending = runtime.state.pendingWrite;
@@ -577,6 +839,11 @@ async function handlePostToolUse(
   }
   runtime.state.pendingWrite = undefined;
   await runtime.stateStore.save(runtime.state);
+  const writeBlockReason = await resynchronizeWriteBlockFence(
+    runtime,
+    newlyObserved.length > 0 ? newlyObserved : repositoryTargets,
+  );
+  if (writeBlockReason) return postToolUseStopOutput(writeBlockReason);
   if (newlyObserved.length === 0) return undefined;
 
   const proposedEdits = (pending?.proposedEdits ?? []).filter((edit) =>
@@ -658,6 +925,37 @@ async function handlePostToolUse(
   };
 }
 
+async function ensurePendingFinalizationsStarted(
+  options: RunCodexHookOptions,
+  resolved: ResolvedRoomConnection,
+  jobs: SessionEndQueueJob[],
+): Promise<void> {
+  if (jobs.length === 0) return;
+  const client = new AgentHubClient({
+    serverUrl: resolved.connection.serverUrl,
+    memberToken: resolved.memberToken,
+    fetchImpl: createHookGatedFetch(options, resolved.connection.id),
+  });
+  for (const job of jobs) {
+    try {
+      await client.post(`/api/sessions/${encodeURIComponent(job.hubSessionId)}/finalize/start`, {
+        finalizationId: job.finalizationId,
+        summary: `Codex session ${job.codexSessionId} ended; a new lifecycle generation is opening.`,
+      });
+    } catch (error) {
+      if (
+        error instanceof AgentHubHttpError
+        && (
+          error.code === "session_not_found"
+          || error.code === "session_already_closed"
+          || error.code === "finalization_conflict"
+        )
+      ) continue;
+      throw error;
+    }
+  }
+}
+
 async function handleStop(
   options: RunCodexHookOptions,
   input: CodexHookInput,
@@ -669,7 +967,11 @@ async function handleStop(
   const queue = new TurnCompletionQueueStore(options.userDataPath);
   await new IntegrationOperationTracker(options.userDataPath).run(initialState.connectionId, async () => {
     const snapshot = await stateStore.load(input.session_id);
-    if (!snapshot || snapshot.connectionId !== initialState.connectionId) return;
+    if (
+      !snapshot
+      || snapshot.connectionId !== initialState.connectionId
+      || snapshot.hubSessionId !== initialState.hubSessionId
+    ) return;
     if (snapshot.pendingCompletion?.phase === "stopped") return;
 
     const knownRecord = await resolveOptionalConnectionRecordById(
@@ -693,7 +995,11 @@ async function handleStop(
     try {
       await stateStore.runExclusive(input.session_id, async () => {
         const state = await stateStore.load(input.session_id);
-        if (!state || state.connectionId !== initialState.connectionId) {
+        if (
+          !state
+          || state.connectionId !== initialState.connectionId
+          || state.hubSessionId !== initialState.hubSessionId
+        ) {
           if (fenced.created) await queue.remove(fenced.job.operationId);
           job = undefined;
           return;
@@ -784,8 +1090,13 @@ async function handleStop(
         });
         if (pending) {
           const latest = await stateStore.load(job!.codexSessionId);
-          // 新 epoch 已经恢复后，旧 Stop 的证据诊断不再权威；直接丢弃旧 job，不能回写或继续重试。
-          if ((latest?.activityEpoch ?? 0) > job!.activityEpoch) await queue.remove(job!.operationId);
+          // 只有同一 Hub generation 已经推进到更高 epoch 时，旧 Stop 才真正失效。
+          // SessionEnd 删除旧 state 或立即复开新 generation 时，旧租约仍需要自己的 job 继续检查提交，不能只等 TTL。
+          if (
+            latest
+            && matchesTurnCompletionJob(job!, latest)
+            && (latest.activityEpoch ?? 0) > job!.activityEpoch
+          ) await queue.remove(job!.operationId);
           else await queue.recordRetry(job!, pending.error);
         } else await queue.remove(job!.operationId);
       });
@@ -803,7 +1114,7 @@ async function ensureStopCompletionJob(
 ): Promise<{ job: TurnCompletionJob; created: boolean }> {
   const activityEpoch = state.pendingCompletion?.activityEpoch ?? state.activityEpoch ?? 0;
   const turnId = state.pendingCompletion?.turnId ?? completionTurnId(input, activityEpoch);
-  const existingJobs = await queue.listForSession(state.codexSessionId);
+  const existingJobs = await queue.listForLifecycle(state);
   const existing = state.pendingCompletion?.phase === "awaiting_commit"
     ? existingJobs.find((candidate) =>
         candidate.activityEpoch === activityEpoch
@@ -843,50 +1154,46 @@ async function handleSessionEnd(
   input: CodexHookInput,
 ): Promise<void> {
   const stateStore = new CodexHookStateStore(options.userDataPath);
-  const state = await stateStore.load(input.session_id);
-  if (!state) return;
-  if (!state.finalizationId) {
-    state.finalizationId = randomUUID();
-    await stateStore.save(state);
-  }
+  const snapshot = await stateStore.load(input.session_id);
+  if (!snapshot) return;
+  // 队列文件同时充当 durable SessionEnd tombstone。确定性 ID 保证并发或重试的 SessionEnd 指向同一任务。
+  const state = snapshot.finalizationId
+    ? snapshot
+    : { ...snapshot, finalizationId: sessionFinalizationId(snapshot) };
   const job = await new SessionEndQueueStore(options.userDataPath).enqueue(state, input.reason);
-  await stateStore.remove(input.session_id);
-
   try {
-    await new IntegrationOperationTracker(options.userDataPath).run(state.connectionId, async () => {
-      const record = await resolveConnectionRecordById(
-        options.userDataPath,
-        state.connectionId,
-        options.protector,
+    await stateStore.runExclusive(input.session_id, async () => {
+      const current = await stateStore.load(input.session_id);
+      if (!current || !matchesSessionEndJob(job, current)) return;
+      await new SessionEndQueueStore(options.userDataPath).mergeState(
+        job.finalizationId,
+        current,
+        input.reason,
       );
-      if (!record) return;
-      const integration = await getLocalIntegrationStatus(
-        options.userDataPath,
-        record.connection,
-        options.runtimePresencePath,
-      );
-      if (!integration.active || !integration.remoteAllowed) return;
-      const resolved = await hydrateConnectionRecord(record);
-      const client = new AgentHubClient({
-        serverUrl: resolved.connection.serverUrl,
-        memberToken: resolved.memberToken,
-        fetchImpl: options.fetchImpl,
-        timeoutMs: 1_500,
-      });
-      await client.post(`/api/sessions/${encodeURIComponent(state.hubSessionId)}/finalize/start`, {
-        finalizationId: job.finalizationId,
-        summary: `Codex session ${input.session_id} ended; final evidence was queued locally.`,
-      });
-    });
-  } catch {
-    // The durable desktop worker owns retries. SessionEnd must return inside
-    // Codex's fixed three-second lifecycle even when the room is offline.
+      await stateStore.remove(input.session_id);
+    }, { timeoutMs: STOP_STATE_LOCK_TIMEOUT_MS });
+  } catch (error) {
+    if (!(error instanceof CodexHookStateLockTimeoutError)) throw error;
+    // 在途 heartbeat 会在写回前看到队列 tombstone 并完成删除；这里不能突破宿主的 3 秒预算继续等待。
   }
+}
+
+function sessionFinalizationId(state: CodexHookSessionState): string {
+  return `codex_${createHash("sha256")
+    .update(`${state.connectionId}\0${state.hubSessionId}\0${state.codexSessionId}`)
+    .digest("hex")}`;
 }
 
 export interface FinalizeQueuedSessionOptions {
   client: AgentHubClient;
   gitExecutable?: string;
+}
+
+export class SessionEndLocalEvidenceError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message, { cause });
+    this.name = "SessionEndLocalEvidenceError";
+  }
 }
 
 export async function finalizeQueuedSession(
@@ -898,9 +1205,15 @@ export async function finalizeQueuedSession(
     finalizationId: job.finalizationId,
     summary: `Codex session ${job.codexSessionId} ended; background finalization started.`,
   });
-  const git = await inspectGitWorkingState(job.repositoryPath, {
-    gitExecutable: options.gitExecutable,
-  });
+  let git: Awaited<ReturnType<typeof inspectGitWorkingState>>;
+  try {
+    git = await inspectGitWorkingState(job.repositoryPath, {
+      gitExecutable: options.gitExecutable,
+    });
+  } catch (error) {
+    // 只有明确发生在本地 Git 取证阶段的错误才能消耗证据降级预算。
+    throw new SessionEndLocalEvidenceError(`Local Git inspection failed: ${humanError(error)}`, error);
+  }
   const actualPaths = unique(job.attributedPaths);
   const sessionContext = {
     hubSessionId: job.hubSessionId,
@@ -916,13 +1229,16 @@ export async function finalizeQueuedSession(
     featureMemorySummary = `本次 Agent 会话涉及超过 ${MAX_SESSION_FEATURE_PATHS} 个归因路径，自动功能记忆未生成，以免用不完整证据覆盖稳定版本。`;
     evidenceError = featureMemorySummary;
   } else if (actualPaths.length > 0) {
-    [featureEvidence, featureVerifications] = await Promise.all([
-      collectFeatureGitEvidence(git.repositoryRoot, job.baseCommit, {
+    try {
+      featureEvidence = await collectFeatureGitEvidence(git.repositoryRoot, job.baseCommit, {
         gitExecutable: options.gitExecutable,
         includePaths: actualPaths,
-      }),
-      collectSessionFeatureVerifications(client, sessionContext),
-    ]);
+      });
+    } catch (error) {
+      // 先完整收口本地子进程，再请求 snapshot；远端失败不能留下仍在访问仓库的失联 Git 任务。
+      throw new SessionEndLocalEvidenceError(`Local feature evidence failed: ${humanError(error)}`, error);
+    }
+    featureVerifications = await collectSessionFeatureVerifications(client, sessionContext);
   }
 
   await client.post(`/api/sessions/${encodeURIComponent(job.hubSessionId)}/scan`, {
@@ -1377,6 +1693,88 @@ function updateRenewedLeases(
   }
 }
 
+function synchronizeBlockedLeaseState(
+  state: CodexHookSessionState,
+  response: WriteBlockedResponse | undefined,
+  dirty: boolean,
+): void {
+  const blockedLeaseIds = new Set(response?.blockedLeaseIds ?? []);
+  // 服务端响应丢失时，已有 pendingWrite/脏差异仍要求本地先失败关闭；
+  // 显式路径会继续走服务端检查，而未知输出路径不能绕过这个状态。
+  if (dirty) {
+    state.leases = response === undefined
+      ? state.leases.map((lease) => ({ ...lease, coordinationState: "blocked" as const }))
+      : state.leases
+          .filter((lease) => blockedLeaseIds.has(lease.id))
+          .map((lease) => ({ ...lease, coordinationState: "blocked" as const }));
+    return;
+  }
+  // clean 转换成功即证明服务端已取消该会话的全部活动自动租约。重试响应可能因为首次响应丢失而返回空 ID，
+  // 因此不能只按 releasedLeaseIds 删除，否则会保留可误放行 pathless 写入的本地旧租约。
+  if (response) state.leases = [];
+}
+
+async function resynchronizeWriteBlockFence(
+  runtime: HookRuntime,
+  paths: string[],
+): Promise<string | undefined> {
+  const pending = runtime.state.writeBlockSyncPending;
+  if (pending) {
+    let response: WriteBlockedResponse;
+    try {
+      response = await runtime.client.post<WriteBlockedResponse>(
+        `/api/sessions/${encodeURIComponent(runtime.state.hubSessionId)}/write-blocked`,
+        {
+          dirty: pending.dirty,
+          reason: "Retrying an unconfirmed automatic lease transition.",
+          paths: pending.paths,
+        },
+      );
+    } catch (error) {
+      if (!isSoftIntegrationFailure(error)) throw error;
+      return "Agent Hub 尚未确认当前会话等待后的租约状态；"
+        + "本次写入保持暂停，请恢复连接后用明确路径重试。";
+    }
+    synchronizeBlockedLeaseState(runtime.state, response, pending.dirty);
+    runtime.state.writeBlockSyncPending = undefined;
+    await runtime.stateStore.save(runtime.state);
+    if (response.blockedLeaseIds.length > 0) {
+      return "Agent Hub 已确认当前会话仍有阻塞的自动租约；在未提交改动清理并等待租约到期前不能继续写入。";
+    }
+  }
+  if (!runtime.state.leases.some((lease) => lease.coordinationState === "blocked")) return undefined;
+  let response: WriteBlockedResponse;
+  try {
+    response = await runtime.client.post<WriteBlockedResponse>(
+      `/api/sessions/${encodeURIComponent(runtime.state.hubSessionId)}/write-blocked`,
+      {
+        dirty: true,
+        reason: "Retrying a previously blocked or unconfirmed automatic lease transition.",
+        paths,
+      },
+    );
+  } catch (error) {
+    if (!isSoftIntegrationFailure(error)) throw error;
+    return "Agent Hub 尚未确认当前会话的自动租约已经在房间中停止续租；"
+      + "本次写入保持暂停，请恢复连接后用明确路径重试。";
+  }
+  synchronizeBlockedLeaseState(runtime.state, response, true);
+  await runtime.stateStore.save(runtime.state);
+  if (response.blockedLeaseIds.length > 0) {
+    return "Agent Hub 已确认当前会话仍有阻塞的自动租约；在未提交改动清理并等待租约到期前不能继续写入。";
+  }
+  return undefined;
+}
+
+function clearResolvedPassiveWriteBlock(state: CodexHookSessionState, checkedPaths: string[]): void {
+  const block = state.passiveWriteBlock;
+  if (!block) return;
+  const requestedPaths = block.requestedPaths.length > 0 ? block.requestedPaths : block.paths;
+  const recheckedEntireRequest = requestedPaths.every((requestedPath) =>
+    checkedPaths.some((checkedPath) => pathScopeCovers(checkedPath, requestedPath)));
+  if (recheckedEntireRequest) state.passiveWriteBlock = undefined;
+}
+
 function normalizeCandidates(repositoryRoot: string, cwd: string, candidates: string[]): string[] {
   return unique(
     candidates
@@ -1639,7 +2037,7 @@ function isSoftIntegrationFailure(error: unknown): boolean {
     return error.status === 408 || error.status === 429 || error.status >= 500;
   }
   if (!(error instanceof Error)) return false;
-  return /(?:fetch failed|failed to fetch|network|socket|econn|etimedout|timed out|did not respond|connection reset|connection refused|aborted)/i.test(
+  return /(?:fetch failed|failed to fetch|offline|network|socket|econn|etimedout|timed out|did not respond|connection reset|connection refused|aborted)/i.test(
     error.message,
   );
 }
@@ -1709,6 +2107,21 @@ function parseHookInput(raw: string): CodexHookInput {
     reason: textField(value, "reason"),
     turn_id: textField(value, "turn_id"),
     stop_hook_active: typeof value.stop_hook_active === "boolean" ? value.stop_hook_active : undefined,
+  };
+}
+
+function postToolUseStopOutput(reason: string): Record<string, unknown> {
+  return {
+    continue: false,
+    stopReason: reason,
+    systemMessage: reason,
+    decision: "block",
+    reason,
+    hookSpecificOutput: {
+      hookEventName: "PostToolUse",
+      additionalContext:
+        `${reason}\n写入已经发生，Agent 必须停止新增修改并保留当前差异，等待 Agent Hub 完成租约状态同步。`,
+    },
   };
 }
 

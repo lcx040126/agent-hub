@@ -56,7 +56,7 @@ export type Lease = {
   highRiskPaths: string[];
   mode: "write" | "read";
   kind: "automatic" | "standard" | "exclusive";
-  phase?: "working" | "awaiting_commit";
+  phase?: "working" | "waiting" | "blocked" | "awaiting_commit";
   status: string;
   createdAt?: string;
   expiresAt?: string;
@@ -169,6 +169,8 @@ export type Dashboard = {
   localScans: LocalScan[];
   settings: RoomSettings;
   releaseRequests: ReleaseRequest[];
+  partialSections?: string[];
+  sectionTotals?: Record<string, number>;
   generatedAt?: string;
   server: { mcpUrl: string };
 };
@@ -366,8 +368,16 @@ export type LeaseDecision = {
   acquired: boolean;
   lease?: Lease;
   conflicts: Conflict[];
-  decision: "allow" | "warn" | "deny";
+  decision: "allow" | "warn" | "deny" | "wait";
   releaseRequests: ReleaseRequest[];
+  waitingFor?: {
+    leaseId: string;
+    sessionId?: string;
+    title: string;
+    memberName: string;
+    expiresAt: string;
+    paths: string[];
+  };
 };
 
 const SESSION_POINTER_KEY = "agent-hub.session.public.v3";
@@ -490,12 +500,18 @@ function normalizeLease(value: unknown): Lease {
     branch: asString(lease.branch) || undefined,
     baseCommit: asString(lease.baseCommit) || undefined,
     paths: normalizedPaths.paths,
-    highRiskPaths: [...new Set([...normalizedPaths.highRiskPaths, ...detailedPaths.highRiskPaths])],
+    highRiskPaths: [...new Set([
+      ...normalizedPaths.highRiskPaths,
+      ...detailedPaths.highRiskPaths,
+      ...asStringArray(lease.highRiskPaths),
+    ])],
     mode: lease.mode === "read" ? "read" : "write",
     kind: ["automatic", "standard", "exclusive"].includes(asString(lease.kind))
       ? asString(lease.kind) as Lease["kind"]
       : "standard",
-    phase: phase === "awaiting_commit" ? "awaiting_commit" : "working",
+    phase: ["working", "waiting", "blocked", "awaiting_commit"].includes(phase)
+      ? phase as Lease["phase"]
+      : "working",
     status: asString(lease.status, "active"),
     createdAt: asString(lease.createdAt) || undefined,
     updatedAt: asString(lease.updatedAt) || undefined,
@@ -1220,6 +1236,11 @@ export async function getDashboard(access: RequestAccess, roomToken?: string): P
     localScans: firstArray(payload.localScans).map(normalizeLocalScan),
     settings: normalizeRoomSettings(payload.settings, room),
     releaseRequests: firstArray(payload.releaseRequests).map(normalizeReleaseRequest),
+    partialSections: asStringArray(payload.partialSections),
+    sectionTotals: Object.fromEntries(
+      Object.entries(asObject(payload.sectionTotals))
+        .filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1])),
+    ),
     generatedAt: asString(payload.generatedAt) || undefined,
     server: {
       mcpUrl: asString(asObject(payload.server).mcpUrl, `${accessServerUrl(access) ?? window.location.origin}/mcp`),
@@ -1254,12 +1275,20 @@ export async function createLease(access: RequestAccess, input: CreateLeaseInput
     acquired,
     lease: payload.lease ? normalizeLease(payload.lease) : undefined,
     conflicts,
-    decision: ["allow", "warn", "deny"].includes(rawDecision)
+    decision: ["allow", "warn", "deny", "wait"].includes(rawDecision)
       ? (rawDecision as LeaseDecision["decision"])
       : acquired
         ? "allow"
         : "deny",
     releaseRequests: firstArray(payload.releaseRequests).map(normalizeReleaseRequest),
+    waitingFor: payload.waitingFor ? {
+      leaseId: asString(asObject(payload.waitingFor).leaseId),
+      sessionId: asString(asObject(payload.waitingFor).sessionId) || undefined,
+      title: asString(asObject(payload.waitingFor).title),
+      memberName: asString(asObject(payload.waitingFor).memberName),
+      expiresAt: asString(asObject(payload.waitingFor).expiresAt),
+      paths: asStringArray(asObject(payload.waitingFor).paths),
+    } : undefined,
   };
 }
 

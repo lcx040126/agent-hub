@@ -35,8 +35,26 @@ describe("CodexHookStateStore", () => {
       observedChangedFingerprints: { "src/existing.ts": "observed-fingerprint" },
       attributedChangedPaths: ["src/new.ts"],
       attributedPathsTruncated: true,
-      leases: [{ id: "lease-1", paths: ["src/new.ts"], expiresAt: now }],
+      leases: [{
+        id: "lease-1",
+        paths: ["src/new.ts"],
+        expiresAt: now,
+        coordinationState: "blocked",
+      }],
       leaseAttributionComplete: false,
+      passiveWriteBlock: {
+        leaseId: "holder-lease-1",
+        sessionId: "holder-session-1",
+        memberName: "Alice",
+        paths: ["src/held.ts"],
+        requestedPaths: ["src/held.ts", "src/also-held.ts"],
+        expiresAt: now,
+      },
+      writeBlockSyncPending: {
+        dirty: true,
+        paths: ["src/held.ts", "src/also-held.ts"],
+        recordedAt: now,
+      },
       pendingWrite: {
         proposalHash: "a".repeat(64),
         toolName: "apply_patch",
@@ -61,10 +79,20 @@ describe("CodexHookStateStore", () => {
     await store.save(state);
     await expect(store.load(state.codexSessionId)).resolves.toMatchObject({
       connectionId: "connection-1",
-      leases: [{ id: "lease-1", paths: ["src/new.ts"] }],
+      leases: [{ id: "lease-1", paths: ["src/new.ts"], coordinationState: "blocked" }],
       attributedChangedPaths: ["src/new.ts"],
       attributedPathsTruncated: true,
       leaseAttributionComplete: false,
+      passiveWriteBlock: {
+        leaseId: "holder-lease-1",
+        sessionId: "holder-session-1",
+        paths: ["src/held.ts"],
+        requestedPaths: ["src/held.ts", "src/also-held.ts"],
+      },
+      writeBlockSyncPending: {
+        dirty: true,
+        paths: ["src/held.ts", "src/also-held.ts"],
+      },
       pendingWrite: { proposedEdits: [{ symbols: ["createItem"] }] },
       externalChangeDiagnostics: [{ paths: ["Assets/Scene.unity"] }],
       loadedFeatureVersions: { "inventory-move": "revision-2" },

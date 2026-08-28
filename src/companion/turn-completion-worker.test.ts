@@ -67,6 +67,66 @@ describe("Stop hook and turn completion worker", () => {
     });
   });
 
+  it("returns Stop within the host budget when the conservative job queue lock is busy", async () => {
+    const userDataPath = await temporaryDirectory();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    const state = hookState(userDataPath);
+    const queue = new TurnCompletionQueueStore(userDataPath);
+    const conservativeState: CodexHookSessionState = {
+      ...state,
+      attributedPathsTruncated: true,
+    };
+    const job = await queue.enqueue({
+      operationId: "completion-busy-stop-lock",
+      turnId: "turn-busy-stop-lock",
+      activityEpoch: 2,
+      state: conservativeState,
+    });
+    state.pendingCompletion = {
+      operationId: job.operationId,
+      turnId: job.turnId,
+      activityEpoch: job.activityEpoch,
+      phase: "awaiting_commit",
+      recordedAt: job.createdAt,
+    };
+    await stateStore.save(state);
+    const entered = deferred();
+    const release = deferred();
+    const held = queue.runExclusive(job.operationId, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const output = outputSink();
+    const startedAt = performance.now();
+    let exitCode: number;
+    try {
+      exitCode = await runCodexHook({
+        eventName: "Stop",
+        userDataPath,
+        stdin: Readable.from([JSON.stringify({
+          session_id: state.codexSessionId,
+          cwd: userDataPath,
+          hook_event_name: "Stop",
+          turn_id: job.turnId,
+          stop_hook_active: false,
+        })]),
+        stdout: output.stream,
+      });
+    } finally {
+      release.resolve();
+      await held;
+    }
+
+    expect(exitCode!).toBe(0);
+    expect(output.text()).toBe('{"continue":true}\n');
+    expect(performance.now() - startedAt).toBeLessThan(2_500);
+    await expect(queue.load(job.operationId)).resolves.toMatchObject({
+      revision: 1,
+      attributedPathsTruncated: true,
+    });
+  });
+
   it("returns continue JSON even when Stop input cannot be parsed", async () => {
     const output = outputSink();
     await expect(runCodexHook({
@@ -115,6 +175,295 @@ describe("Stop hook and turn completion worker", () => {
     expect(retried).toMatchObject({ operationId: job.operationId, attempts: 1, lastError: "network offline" });
     expect(retried!.nextAttemptAt).toBe("2026-08-27T00:00:16.000Z");
     expect(onError).toHaveBeenCalledOnce();
+  });
+
+  it("reloads the job after locking and skips a retry deferred from the listed snapshot", async () => {
+    const userDataPath = await temporaryDirectory();
+    const state = hookState(userDataPath);
+    const queue = new TurnCompletionQueueStore(userDataPath);
+    const job = await queue.enqueue({
+      operationId: "completion-deferred-after-list",
+      turnId: "turn-deferred-after-list",
+      activityEpoch: 2,
+      state,
+    }, new Date("2026-08-27T00:00:00.000Z"));
+    let deferred = false;
+    const fetchImpl = vi.fn<typeof fetch>();
+    const worker = startTurnCompletionWorker({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl,
+      now: () => new Date("2026-08-27T00:00:01.000Z"),
+      intervalMs: 60_000,
+      operationTracker: {
+        run: async (_connectionId, task) => {
+          if (!deferred) {
+            deferred = true;
+            await queue.recordRetry(
+              job,
+              null,
+              new Date("2026-08-27T00:00:01.000Z"),
+              60_000,
+            );
+          }
+          return task();
+        },
+      },
+    });
+
+    await worker.scanNow();
+    await worker.stop();
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(queue.load(job.operationId)).resolves.toMatchObject({
+      attempts: 1,
+      nextAttemptAt: "2026-08-27T00:01:01.000Z",
+    });
+  });
+
+  it("does not hold the queue lock across remote work or delete evidence enqueued meanwhile", async () => {
+    const userDataPath = await temporaryDirectory();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    const state = hookState(userDataPath);
+    state.leases = [];
+    state.attributedChangedPaths = [];
+    state.attributedPathEvidence = [];
+    const queue = new TurnCompletionQueueStore(userDataPath);
+    const job = await queue.enqueue({
+      operationId: "completion-evidence-during-request",
+      turnId: "turn-evidence-during-request",
+      activityEpoch: 2,
+      state,
+    }, new Date("2026-08-27T00:00:00.000Z"));
+    state.pendingCompletion = {
+      operationId: job.operationId,
+      turnId: job.turnId,
+      activityEpoch: job.activityEpoch,
+      phase: "awaiting_commit",
+      recordedAt: job.createdAt,
+    };
+    await stateStore.save(state);
+    const requestStarted = deferred();
+    const releaseResponse = deferred();
+    const fetchImpl = vi.fn<typeof fetch>(async () => {
+      requestStarted.resolve();
+      await releaseResponse.promise;
+      return jsonResponse(200, { result: "awaiting_commit", awaitingAutomaticLeases: [] });
+    });
+    const worker = startTurnCompletionWorker({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl,
+      now: () => new Date("2026-08-27T00:00:01.000Z"),
+      intervalMs: 60_000,
+      operationTracker: { run: async (_connectionId, task) => task() },
+    });
+    await requestStarted.promise;
+    const latestState: CodexHookSessionState = {
+      ...state,
+      attributedChangedPaths: ["src/latest.ts"],
+      attributedPathEvidence: [{
+        path: "src/latest.ts",
+        baseEntry: `blob:${"a".repeat(40)}`,
+        attributedEntry: `blob:${"b".repeat(40)}`,
+      }],
+    };
+
+    await expect(queue.enqueue({
+      operationId: job.operationId,
+      turnId: job.turnId,
+      activityEpoch: job.activityEpoch,
+      state: latestState,
+    }, new Date("2026-08-27T00:00:02.000Z"))).resolves.toMatchObject({ revision: 2 });
+    releaseResponse.resolve();
+    await worker.scanNow();
+    await worker.stop();
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    await expect(queue.load(job.operationId)).resolves.toMatchObject({
+      revision: 2,
+      attributedPaths: ["src/latest.ts"],
+      baselineEvidence: [{ path: "src/latest.ts" }],
+    });
+  });
+
+  it("retries a non-terminal HTTP 404 instead of deleting the completion", async () => {
+    const userDataPath = await temporaryDirectory();
+    const state = hookState(userDataPath);
+    const queue = new TurnCompletionQueueStore(userDataPath);
+    const job = await queue.enqueue({
+      operationId: "completion-endpoint-404",
+      turnId: "turn-endpoint-404",
+      activityEpoch: 2,
+      state,
+    }, new Date("2026-08-27T00:00:00.000Z"));
+    const onError = vi.fn();
+    const worker = startTurnCompletionWorker({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl: async () => jsonResponse(404, {
+        error: "not_found",
+        message: "Completion endpoint unavailable.",
+      }),
+      now: () => new Date("2026-08-27T00:00:01.000Z"),
+      intervalMs: 60_000,
+      operationTracker: { run: async (_connectionId, task) => task() },
+      onError,
+    });
+
+    await worker.scanNow();
+    await worker.stop();
+
+    await expect(queue.load(job.operationId)).resolves.toMatchObject({
+      attempts: 1,
+      lastError: "Completion endpoint unavailable.",
+    });
+    expect(onError).toHaveBeenCalledOnce();
+  });
+
+  it("removes a completion only for an explicit terminal session error", async () => {
+    const userDataPath = await temporaryDirectory();
+    const state = hookState(userDataPath);
+    const queue = new TurnCompletionQueueStore(userDataPath);
+    await queue.enqueue({
+      operationId: "completion-session-missing",
+      turnId: "turn-session-missing",
+      activityEpoch: 2,
+      state,
+    }, new Date("2026-08-27T00:00:00.000Z"));
+    const worker = startTurnCompletionWorker({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl: async () => jsonResponse(404, {
+        error: "session_not_found",
+        message: "Session not found.",
+      }),
+      now: () => new Date("2026-08-27T00:00:01.000Z"),
+      intervalMs: 60_000,
+      operationTracker: { run: async (_connectionId, task) => task() },
+    });
+
+    await worker.scanNow();
+    await worker.stop();
+
+    await expect(queue.list()).resolves.toEqual([]);
+  });
+
+  it("processes an old Hub generation without resuming or clearing the reopened state", async () => {
+    const userDataPath = await temporaryDirectory();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    const oldState = hookState(userDataPath);
+    const queue = new TurnCompletionQueueStore(userDataPath);
+    const job = await queue.enqueue({
+      operationId: "completion-old-generation",
+      turnId: "turn-old-generation",
+      activityEpoch: 2,
+      state: oldState,
+    }, new Date("2026-08-27T00:00:00.000Z"));
+    const newState: CodexHookSessionState = {
+      ...oldState,
+      hubSessionId: "hub-session-reopened",
+      activityEpoch: 9,
+      currentTurnId: "turn-reopened",
+      pendingCompletion: {
+        operationId: "resume-reopened-generation",
+        turnId: "turn-reopened",
+        activityEpoch: 9,
+        phase: "resuming",
+        recordedAt: "2026-08-27T00:00:01.000Z",
+      },
+    };
+    await stateStore.save(newState);
+    const requestedPaths: string[] = [];
+    const worker = startTurnCompletionWorker({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl: vi.fn(async (request) => {
+        requestedPaths.push(new URL(request instanceof Request ? request.url : String(request)).pathname);
+        throw new Error("old generation remains pending");
+      }) as typeof fetch,
+      now: () => new Date("2026-08-27T00:00:01.000Z"),
+      intervalMs: 60_000,
+      operationTracker: { run: async (_connectionId, task) => task() },
+    });
+    await worker.scanNow();
+    await worker.stop();
+
+    expect(requestedPaths).toEqual([`/api/sessions/${job.hubSessionId}/stop`]);
+    await expect(stateStore.load(oldState.codexSessionId)).resolves.toMatchObject({
+      hubSessionId: newState.hubSessionId,
+      currentTurnId: "turn-reopened",
+      pendingCompletion: { operationId: "resume-reopened-generation", phase: "resuming" },
+    });
+    await expect(queue.list()).resolves.toEqual([
+      expect.objectContaining({ operationId: job.operationId, attempts: 1 }),
+    ]);
+  });
+
+  it("does not apply an old resume response to a replacement Hub generation", async () => {
+    const userDataPath = await temporaryDirectory();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    const oldState = hookState(userDataPath);
+    oldState.finalizationId = "finalization-old-generation";
+    const queue = new TurnCompletionQueueStore(userDataPath);
+    const job = await queue.enqueue({
+      operationId: "completion-before-resume",
+      turnId: "turn-before-resume",
+      activityEpoch: 2,
+      state: oldState,
+    }, new Date("2026-08-27T00:00:00.000Z"));
+    oldState.activityEpoch = 3;
+    oldState.currentTurnId = "turn-resuming";
+    oldState.pendingCompletion = {
+      operationId: "resume-shared-token",
+      turnId: "turn-resuming",
+      activityEpoch: 3,
+      phase: "resuming",
+      recordedAt: "2026-08-27T00:00:01.000Z",
+    };
+    await stateStore.save(oldState);
+    const replacementState: CodexHookSessionState = {
+      ...oldState,
+      hubSessionId: "hub-session-replacement",
+      finalizationId: "finalization-replacement-generation",
+      currentTurnId: "turn-replacement",
+      // 故意复用 token，证明锁内必须核对 Hub generation，不能把 operation ID 当成身份。
+      pendingCompletion: {
+        ...oldState.pendingCompletion,
+        turnId: "turn-replacement",
+      },
+      openedAt: "2026-08-27T00:00:02.000Z",
+    };
+    const requestedPaths: string[] = [];
+    const worker = startTurnCompletionWorker({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl: vi.fn(async (request) => {
+        requestedPaths.push(new URL(request instanceof Request ? request.url : String(request)).pathname);
+        await stateStore.save(replacementState);
+        return jsonResponse(200, { result: "resumed" });
+      }) as typeof fetch,
+      now: () => new Date("2026-08-27T00:00:02.000Z"),
+      intervalMs: 60_000,
+      operationTracker: { run: async (_connectionId, task) => task() },
+    });
+    await worker.scanNow();
+    await worker.stop();
+
+    expect(requestedPaths).toEqual([`/api/sessions/${oldState.hubSessionId}/resume`]);
+    await expect(stateStore.load(oldState.codexSessionId)).resolves.toMatchObject({
+      hubSessionId: replacementState.hubSessionId,
+      finalizationId: replacementState.finalizationId,
+      currentTurnId: "turn-replacement",
+      pendingCompletion: {
+        operationId: "resume-shared-token",
+        turnId: "turn-replacement",
+        phase: "resuming",
+      },
+    });
+    await expect(queue.list()).resolves.toEqual([
+      expect.objectContaining({ operationId: job.operationId, hubSessionId: oldState.hubSessionId }),
+    ]);
   });
 
   it("processes two healthy jobs even when one persisted queue file is malformed", async () => {
@@ -599,4 +948,10 @@ function jsonResponse(status: number, body: unknown): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
 }

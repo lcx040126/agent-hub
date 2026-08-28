@@ -14,7 +14,15 @@ import {
 } from "./integration-operations.js";
 import { hasPendingPauseForConnection } from "./pause-retry.js";
 import { hasPendingPausePreparationForConnection } from "./pause-preparation.js";
-import { TurnCompletionQueueStore } from "./turn-completion-queue.js";
+import {
+  matchesSessionEndJob,
+  SessionEndQueueStore,
+  type SessionEndQueueJob,
+} from "./session-end-queue.js";
+import {
+  matchesTurnCompletionJob,
+  TurnCompletionQueueStore,
+} from "./turn-completion-queue.js";
 
 export interface CodexSessionHeartbeatScheduler {
   scanNow(): Promise<void>;
@@ -87,64 +95,139 @@ async function heartbeatAll(
   operationTracker: Pick<ConnectionOperationTracker, "run">,
 ): Promise<void> {
   const states = await readHookStates(stateStore, options.onError);
-  const pendingCompletionSessions = new Set(
-    (await new TurnCompletionQueueStore(options.userDataPath).list((error) => options.onError?.(error)))
-      .map((job) => job.codexSessionId),
-  );
+  const completionQueue = new TurnCompletionQueueStore(options.userDataPath);
+  const sessionEndQueue = new SessionEndQueueStore(options.userDataPath);
+  const sessionEndJobs = await sessionEndQueue.list();
+  const pendingCompletionJobs = await completionQueue.list((error) => options.onError?.(error));
   const now = (options.now?.() ?? new Date()).getTime();
   const activeOwnerIds = options.store.list
     ? await unambiguousActiveOwnerIds(await options.store.list())
     : undefined;
   await Promise.all(states.map(async (state) => {
     try {
+      if (hasMatchingSessionEnd(sessionEndJobs, state)) {
+        await reconcileMatchingSessionEnd(stateStore, sessionEndQueue, state);
+        return;
+      }
       if (!shouldHeartbeat(state, now)) {
         return;
       }
-      if (state.pendingCompletion || pendingCompletionSessions.has(state.codexSessionId)) return;
-      if (activeOwnerIds && !activeOwnerIds.has(state.connectionId)) {
-        await stateStore.remove(state.codexSessionId);
-        return;
-      }
+      if (
+        state.pendingCompletion
+        || pendingCompletionJobs.some((job) => matchesTurnCompletionJob(job, state))
+      ) return;
       await operationTracker.run(state.connectionId, async () => {
-        const connection = await options.store.get(state.connectionId);
-        if (!connection || connection.integrationEnabled === false) {
-          await stateStore.remove(state.codexSessionId);
-          return;
-        }
-        if (
-          await hasPendingPausePreparationForConnection(options.userDataPath, state.connectionId)
-          || await hasPendingPauseForConnection(options.userDataPath, state.connectionId)
-        ) return;
-        const memberToken = await options.store.readMemberToken(state.connectionId);
-        const client = new AgentHubClient({
-          serverUrl: connection.serverUrl,
-          memberToken,
-          fetchImpl: options.fetchImpl,
+        await stateStore.runExclusiveLeaseRenewal(state.codexSessionId, async (currentState) => {
+          if (currentState.connectionId !== state.connectionId) return undefined;
+          if (await mergeAndRemoveQueuedSessionEnd(sessionEndQueue, stateStore, currentState)) {
+            return undefined;
+          }
+          if (!shouldHeartbeat(currentState, now) || currentState.pendingCompletion) return undefined;
+          if (
+            pendingCompletionJobs.some((job) => matchesTurnCompletionJob(job, currentState))
+            || (await completionQueue.listForLifecycle(
+              currentState,
+              (error) => options.onError?.(error, currentState),
+            )).length > 0
+          ) return undefined;
+          if (activeOwnerIds && !activeOwnerIds.has(currentState.connectionId)) {
+            await stateStore.remove(currentState.codexSessionId);
+            return undefined;
+          }
+          const connection = await options.store.get(currentState.connectionId);
+          if (!connection || connection.integrationEnabled === false) {
+            await stateStore.remove(currentState.codexSessionId);
+            return undefined;
+          }
+          if (
+            await hasPendingPausePreparationForConnection(options.userDataPath, currentState.connectionId)
+            || await hasPendingPauseForConnection(options.userDataPath, currentState.connectionId)
+          ) return undefined;
+          const memberToken = await options.store.readMemberToken(currentState.connectionId);
+          const client = new AgentHubClient({
+            serverUrl: connection.serverUrl,
+            memberToken,
+            fetchImpl: options.fetchImpl,
+          });
+          const heartbeat = await client.post<HeartbeatResponse>(
+            `/api/sessions/${encodeURIComponent(currentState.hubSessionId)}/heartbeat`,
+            {
+              clientVersion: AGENT_HUB_VERSION,
+              protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
+              schemaVersion: AGENT_HUB_SCHEMA_VERSION,
+              turnId: currentState.currentTurnId,
+              activityEpoch: currentState.activityEpoch ?? 0,
+            },
+          );
+          if (await mergeAndRemoveQueuedSessionEnd(sessionEndQueue, stateStore, currentState)) {
+            return undefined;
+          }
+          return heartbeat.renewedLeases ?? [];
         });
-        const heartbeat = await client.post<HeartbeatResponse>(
-          `/api/sessions/${encodeURIComponent(state.hubSessionId)}/heartbeat`,
-          {
-            clientVersion: AGENT_HUB_VERSION,
-            protocolVersion: AGENT_HUB_PROTOCOL_VERSION,
-            schemaVersion: AGENT_HUB_SCHEMA_VERSION,
-            turnId: state.currentTurnId,
-            activityEpoch: state.activityEpoch ?? 0,
-          },
-        );
-        await stateStore.updateLeaseExpiries(
-          state.codexSessionId,
-          heartbeat.renewedLeases ?? [],
-        );
       });
     } catch (error) {
       if (error instanceof AgentHubHttpError && error.status === 404) {
-        await stateStore.remove(state.codexSessionId);
+        await removeMatchingState(stateStore, state);
         return;
       }
       if (error instanceof AgentHubHttpError && error.status === 409) return;
       options.onError?.(toError(error), state);
     }
   }));
+}
+
+async function mergeAndRemoveQueuedSessionEnd(
+  queue: SessionEndQueueStore,
+  stateStore: CodexHookStateStore,
+  state: CodexHookSessionState,
+): Promise<boolean> {
+  const job = (await queue.listForSession(state.codexSessionId))
+    .find((candidate) => matchesSessionEndJob(candidate, state));
+  if (!job) return false;
+  await queue.mergeState(job.finalizationId, state);
+  await stateStore.remove(state.codexSessionId);
+  return true;
+}
+
+function hasMatchingSessionEnd(
+  jobs: SessionEndQueueJob[],
+  state: CodexHookSessionState,
+): boolean {
+  return jobs.some((job) => matchesSessionEndJob(job, state));
+}
+
+async function reconcileMatchingSessionEnd(
+  stateStore: CodexHookStateStore,
+  queue: SessionEndQueueStore,
+  snapshot: CodexHookSessionState,
+): Promise<void> {
+  await stateStore.runExclusive(snapshot.codexSessionId, async () => {
+    const current = await stateStore.load(snapshot.codexSessionId);
+    if (!current || !sameLifecycleState(current, snapshot)) return;
+    await mergeAndRemoveQueuedSessionEnd(queue, stateStore, current);
+  });
+}
+
+async function removeMatchingState(
+  store: CodexHookStateStore,
+  snapshot: CodexHookSessionState,
+): Promise<void> {
+  await store.runExclusive(snapshot.codexSessionId, async () => {
+    const current = await store.load(snapshot.codexSessionId);
+    if (
+      current
+      && current.connectionId === snapshot.connectionId
+      && current.hubSessionId === snapshot.hubSessionId
+      && current.finalizationId === snapshot.finalizationId
+    ) await store.remove(snapshot.codexSessionId);
+  });
+}
+
+function sameLifecycleState(left: CodexHookSessionState, right: CodexHookSessionState): boolean {
+  return left.codexSessionId === right.codexSessionId
+    && left.connectionId === right.connectionId
+    && left.hubSessionId === right.hubSessionId
+    && left.finalizationId === right.finalizationId;
 }
 
 async function unambiguousActiveOwnerIds(
@@ -166,6 +249,10 @@ async function unambiguousActiveOwnerIds(
 }
 
 function shouldHeartbeat(state: CodexHookSessionState, now: number): boolean {
+  if (
+    state.writeBlockSyncPending
+    || state.leases.some((lease) => lease.coordinationState === "blocked")
+  ) return false;
   // updatedAt is written only by real Hook state changes; this scheduler never refreshes it.
   if (!state.pendingWrite) return ageMs(state.updatedAt, now) <= ACTIVE_STATE_MAX_AGE_MS;
   return ageMs(state.pendingWrite.recordedAt, now) <= PENDING_WRITE_MAX_AGE_MS;
