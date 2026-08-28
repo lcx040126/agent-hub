@@ -144,6 +144,21 @@ describe("Agent Hub database migrations", () => {
         risk_reason TEXT,
         PRIMARY KEY (lease_id, path_key)
       );
+      CREATE TABLE local_scans (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES work_sessions(id) ON DELETE CASCADE,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        repository TEXT,
+        branch TEXT,
+        worktree TEXT,
+        base_commit TEXT,
+        changed_paths_json TEXT NOT NULL,
+        rule_files_json TEXT NOT NULL,
+        systems_json TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        scanned_at TEXT NOT NULL
+      );
       INSERT INTO rooms (
         id, code, name, project_name, repository, default_branch, created_at
       ) VALUES (
@@ -170,6 +185,15 @@ describe("Agent Hub database migrations", () => {
           'active', '{"codexSessionId":"codex-schema3-duplicate"}',
           '2026-08-27T08:00:00.000Z', '2026-08-27T09:00:00.000Z', NULL
         );
+      INSERT INTO local_scans (
+        id, session_id, room_id, member_id, repository, branch, worktree,
+        base_commit, changed_paths_json, rule_files_json, systems_json,
+        metadata_json, scanned_at
+      ) VALUES (
+        'schema3-scan', 'schema3-session-newer', 'schema3-room', 'schema3-member',
+        'C:/repo', 'main', 'C:/repo', 'base-commit', '[]', '[]', '[]', '{}',
+        '2026-08-27T10:00:00.000Z'
+      );
       INSERT INTO leases (
         id, room_id, member_id, session_id, title, intent, mode, kind, status,
         decision, expires_at, created_at, updated_at
@@ -240,6 +264,12 @@ describe("Agent Hub database migrations", () => {
     `).get()).toEqual({ count: 1 });
     expect(migrated.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 4 });
     expect(migrated.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(migrated.connection.prepare(`
+      SELECT id, finalization_id FROM local_scans WHERE id = 'schema3-scan'
+    `).get()).toEqual({ id: "schema3-scan", finalization_id: null });
+    expect(migrated.connection.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'scans_finalization_idx'
+    `).get()).toEqual({ name: "scans_finalization_idx" });
 
     let currentTime = new Date("2026-08-27T11:30:00.000Z");
     const service = new AgentHubService(migrated, { now: () => currentTime });

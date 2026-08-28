@@ -351,8 +351,6 @@ export class AgentHubDatabase {
         finalization_id TEXT
       );
       CREATE INDEX IF NOT EXISTS scans_session_idx ON local_scans(session_id, scanned_at DESC);
-      CREATE UNIQUE INDEX IF NOT EXISTS scans_finalization_idx
-        ON local_scans(finalization_id) WHERE finalization_id IS NOT NULL;
 
       CREATE TABLE IF NOT EXISTS feature_memories (
         id TEXT PRIMARY KEY,
@@ -592,6 +590,7 @@ export class AgentHubDatabase {
 
     const scanColumns = this.connection.prepare("PRAGMA table_info(local_scans)").all() as Array<{ name: string }>;
     if (!scanColumns.some((column) => column.name === "finalization_id")) this.connection.exec("ALTER TABLE local_scans ADD COLUMN finalization_id TEXT");
+    // schema 3 已存在 local_scans，必须先补兼容字段，再创建依赖它的索引。
     this.connection.exec("CREATE UNIQUE INDEX IF NOT EXISTS scans_finalization_idx ON local_scans(finalization_id) WHERE finalization_id IS NOT NULL");
 
     const releaseRequestColumns = this.connection.prepare("PRAGMA table_info(release_requests)").all() as Array<{ name: string }>;
