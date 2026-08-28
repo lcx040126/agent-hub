@@ -576,3 +576,13 @@ v0.2.5 已确认修复（正式发布准备，2026-08-28）
 
 发布授权
 - v0.2.5 正式发布已获明确授权。发布准备提交、主分支 CI、标签 CI、Windows Release 和六项资产审计全部通过后，Draft Release 才可公开并设为 `latest`；发布结果和正式资产哈希在公开后另行追加审计记录。
+
+v0.2.5 正式发布验证（2026-08-28）
+- Annotated tag `v0.2.5` 指向提交 `38ab5e5d7af5e4b212d7e227d858813176ae0982`；发布后标签未移动，后续审计记录只追加到 `main`。
+- 主分支 CI `33178361703`、标签 CI `33178485207` 和 Windows Release `33178485234` 均成功；发布门禁、类型检查、全量测试、NSIS 打包、恢复探针、schema 2/3/4 到 5 打包迁移探针、Ed25519 签名和资产上传全部通过。
+- GitHub Release `378529879` 于 `2026-08-28T14:21:58Z` 正式公开并设为 latest：`https://github.com/lcx040126/agent-hub/releases/tag/v0.2.5`。
+- 正式 Setup `AgentHub-Setup-0.2.5-x64.exe` 为 119,741,977 字节，SHA-256 `e54b2106cf5e55e136893ecd2f1bfc3ca86524674fe7fd4e1b552d064d8eac63`，Authenticode 状态为 `NotSigned`。
+- 正式 blockmap SHA-256 `7b56b01c8d6a57dd6fc2f2324f5f651bdd6d49e15dd784573a7f96bc592b695b`；`latest.yml` `e2bae1100a3db4a93ba23660f6e5e5d0841f5965fb89ede26aa251507ec4017e`；更新清单 `3231eaf5d6eaf349513811530f9a61e6ee2db55ab934ac38716983685ab27fb8`；签名文件 `65c40fcaa90f6fc18bea0ffbcd3a671a6b5ecf9bcd73893493803c80964551d1`；`SHA256SUMS.txt` `3789d6d0ddef02a3f65709e40f0accaec8a245f76bf2a7e83f6c26d3b17f1eae`。
+- 六项资产的独立下载 SHA-256、GitHub asset digest 和校验文件一致；Ed25519 验签通过。更新清单为 v0.2.5、协议 1、schema 5、最低来源 schema 2，`latest.yml` 的大小与 Setup 一致，SHA-512 为 `7awjhSCDMiMLS3N2kRWSXubq0w3uyn9yxHxiTWF6tWsAkVbqcl49/fFa2VijLylMOANk8Hd7IvrsyrIC130GsA==`。
+- 匿名访问发布页、`releases/latest` 和六项正式资产均返回 HTTP 200 并解析到 v0.2.5。
+- 当前正式安装目录覆盖升级、真实 Codex 首次写入、长时间房间轮询和双机协作仍列为未完成的实机验收，不因正式发布而改记为通过。
