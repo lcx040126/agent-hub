@@ -64,6 +64,7 @@ import {
 } from "./integration-lifecycle.js";
 import { candidatePorts, collectLanUrls } from "./network.js";
 import { requestRoomServer } from "./room-server-proxy.js";
+import * as desktopLogger from "./desktop-logger.js";
 import {
   startReleaseRequestNotificationScheduler,
   type ReleaseRequestNotificationScheduler,
@@ -94,6 +95,7 @@ let quitCleanupComplete = false;
 let quitCleanupPromise: Promise<void> | null = null;
 let updateInstallInProgress = false;
 
+desktopLogger.installProcessStreamGuards();
 startDesktopLifecycle();
 
 function startDesktopLifecycle(): void {
@@ -114,9 +116,10 @@ function startDesktopLifecycle(): void {
     isQuitting = true;
     quitCleanupPromise = cleanupBeforeQuit()
       .catch((error: unknown) => {
-        console.error(`Agent Hub shutdown cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+        desktopLogger.error("desktop.shutdown", "Desktop shutdown cleanup failed.", error);
       })
-      .finally(() => {
+      .finally(async () => {
+        await flushDesktopLogWithin(750);
         quitCleanupComplete = true;
         quitCleanupPromise = null;
         electronApp.quit();
@@ -128,6 +131,7 @@ function startDesktopLifecycle(): void {
   });
 
   electronApp.whenReady().then(bootstrap).catch((error: unknown) => {
+    desktopLogger.error("desktop.bootstrap", "Desktop startup failed.", error);
     const message = error instanceof Error ? error.message : String(error);
     dialog.showErrorBox("Agent Hub could not start", message);
     electronApp.quit();
@@ -136,6 +140,8 @@ function startDesktopLifecycle(): void {
 
 async function bootstrap(): Promise<void> {
   const userDataDirectory = electronApp.getPath("userData");
+  await desktopLogger.initialize({ userDataPath: userDataDirectory });
+  desktopLogger.info("desktop.lifecycle", "Desktop lifecycle initialization started.");
   const updateDirectory = path.join(userDataDirectory, "updates");
   const recovery = new FileDesktopUpdateRecovery(updateDirectory);
   const recoveryExecutor = new WindowsUpdateRecoveryExecutor(updateDirectory);
@@ -162,6 +168,13 @@ async function bootstrap(): Promise<void> {
     scriptPath: serviceScript,
     port: servicePort,
     dataDir: path.join(userDataDirectory, "server"),
+    onOutput(stream, output) {
+      if (stream === "stderr") {
+        desktopLogger.warn("service.stderr", output);
+      } else {
+        desktopLogger.info("service.stdout", output);
+      }
+    },
   });
   await hostServer.start();
   const serverInfo: DesktopServerInfo = {
@@ -180,7 +193,7 @@ async function bootstrap(): Promise<void> {
     userDataPath: userDataDirectory,
     store,
     onError(error) {
-      console.error(`Agent Hub integration lifecycle warning: ${error.message}`);
+      desktopLogger.warn("integration.lifecycle", "Integration lifecycle warning.", error);
     },
   });
   await integrationController.start();
@@ -200,12 +213,10 @@ async function bootstrap(): Promise<void> {
           }).show();
         },
         onError(error) {
-          console.error(`Agent Hub Codex configuration reconciliation warning: ${error.message}`);
+          desktopLogger.warn("codex.reconciliation", "Codex configuration reconciliation warning.", error);
         },
       })).catch((error: unknown) => {
-        console.error(
-          `Agent Hub Codex reconciliation queue warning: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        desktopLogger.warn("codex.reconciliation", "Codex reconciliation queue warning.", error);
       });
   }
   const integrationIsActive = () => integrationController?.getPresence()?.record.status === "active";
@@ -213,26 +224,23 @@ async function bootstrap(): Promise<void> {
     userDataPath: userDataDirectory,
     store,
     integrationActive: integrationIsActive,
-    onError(error, job) {
-      const session = job?.hubSessionId ? ` (${job.hubSessionId})` : "";
-      console.error(`Agent Hub background finalization failed${session}: ${error.message}`);
+    onError(error) {
+      desktopLogger.error("session.finalization", "Background finalization failed.", error);
     },
   });
   turnCompletionWorker = startTurnCompletionWorker({
     userDataPath: userDataDirectory,
     store,
     integrationActive: integrationIsActive,
-    onError(error, job) {
-      const session = job?.hubSessionId ? ` (${job.hubSessionId})` : "";
-      console.error(`Agent Hub turn completion check failed${session}: ${error.message}`);
+    onError(error) {
+      desktopLogger.error("turn.completion", "Turn completion check failed.", error);
     },
   });
   const startScanner = () => startRepositoryScanScheduler({
     store,
     integrationActive: integrationIsActive,
-    onError(error, connection) {
-      const repository = connection?.repositoryPath ? ` (${connection.repositoryPath})` : "";
-      console.error(`Agent Hub repository scan failed${repository}: ${error.message}`);
+    onError(error) {
+      desktopLogger.error("repository.scan", "Background repository scan failed.", error);
     },
   });
   if (integrationIsActive()) {
@@ -240,9 +248,8 @@ async function bootstrap(): Promise<void> {
     hookHeartbeatScheduler = startCodexSessionHeartbeatScheduler({
       userDataPath: userDataDirectory,
       store,
-      onError(error, state) {
-        const session = state?.hubSessionId ? ` (${state.hubSessionId})` : "";
-        console.error(`Agent Hub Codex heartbeat failed${session}: ${error.message}`);
+      onError(error) {
+        desktopLogger.warn("codex.heartbeat", "Codex session heartbeat failed.", error);
       },
     });
     releaseRequestNotifier = startReleaseRequestNotificationScheduler({
@@ -257,9 +264,8 @@ async function bootstrap(): Promise<void> {
         notification.on("click", () => showMainWindow());
         notification.show();
       },
-      onError(error, connection) {
-        const room = connection?.roomName ? ` (${connection.roomName})` : "";
-        console.error(`Agent Hub release-request notification check failed${room}: ${error.message}`);
+      onError(error) {
+        desktopLogger.warn("release-request.notification", "Release-request notification check failed.", error);
       },
     });
   }
@@ -327,9 +333,8 @@ async function bootstrap(): Promise<void> {
                 hookHeartbeatScheduler = startCodexSessionHeartbeatScheduler({
                   userDataPath: userDataDirectory,
                   store,
-                  onError(error, state) {
-                    const session = state?.hubSessionId ? ` (${state.hubSessionId})` : "";
-                    console.error(`Agent Hub Codex heartbeat failed${session}: ${error.message}`);
+                  onError(error) {
+                    desktopLogger.warn("codex.heartbeat", "Codex session heartbeat failed.", error);
                   },
                 });
               }
@@ -404,6 +409,23 @@ async function cleanupBeforeQuit(): Promise<void> {
   integrationController = null;
   tray?.destroy();
   tray = null;
+}
+
+async function flushDesktopLogWithin(timeoutMs: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      desktopLogger.flush(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+        timer.unref();
+      }),
+    ]);
+  } catch {
+    // 正常退出不能因为诊断日志停滞或失败而无限等待。
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function findAvailableServicePort(): Promise<number> {

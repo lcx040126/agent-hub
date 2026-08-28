@@ -494,15 +494,44 @@ v0.2.3 正式发布验证（2026-08-27）
 - 六项资产的独立下载 SHA-256、GitHub asset digest 和校验文件一致；Ed25519 签名通过，更新清单的 v0.2.3、协议 1、schema 2 到 4、Setup URL/大小/SHA-256 和发布正文均正确；`latest.yml` 的大小及 SHA-512 与 Setup 一致。
 - 匿名访问 `releases/latest`、latest 更新清单和正式 Setup 下载地址均返回 HTTP 200 并解析到 v0.2.3。
 
-v0.2.4 已确认更新：旧数据库升级热修复
-- 本版本只修复旧房间数据库升级失败，不混入错误日志、watchdog 或其他功能改造。
+v0.2.4 已确认功能：后台扫描容量约束与桌面日志防崩
+
+事故链
+- `D:\UGit\CombatDemo` 的后台仓库快照包含 7,068 条依赖；旧扫描端只按 500 条固定截断，没有按服务端对最终 metadata 的 32,000 字符限制收敛，生成的请求会被服务端拒绝。
+- 扫描失败随后通过 Electron 主进程的 `console.error` 写入继承输出管道；父进程退出或管道失效后触发 `EPIPE`，日志告警反而成为未捕获流错误并终止桌面进程。
+- metadata 超限行为在 v0.1.0 已存在；桌面进程继承管道、服务子进程输出转写及相关崩溃条件从 v0.2.0 引入，v0.2.2/v0.2.3 未改变该链路。
+
+目标
+- 扫描端与服务端共享 32,000 字符 metadata 上限；扫描端按最终 `JSON.stringify(metadata).length` 动态保留规则哈希和依赖的稳定前缀。
+- metadata 保留依赖、规则哈希的原始总数与实际上传数，并在任何数据被省略时标记 `metadataTruncated`；固定 metadata 自身超限时在本机受控失败，不发送非法请求。
+- 桌面诊断日志写入 `%APPDATA%\agent-hub\logs\desktop.log` UTF-8 JSONL，单文件最多 2 MiB并保留 3 个轮转文件；只记录诊断字段，不记录令牌、请求头、环境变量或扫描正文。
+- Electron 生命周期启动前保护 `stdout`/`stderr` 错误；`EPIPE` 及其他流错误只进入诊断日志或启动期缓冲，不能终止主进程。
+- 服务子进程输出直接交给诊断日志回调，不再写入桌面进程的 `stdout`/`stderr`。日志写入、轮转、刷新失败均静默降级，正常退出只做有时限的尽力刷新。
+
+验收标准
+- 7,068 条长依赖、多字节路径、规则哈希占满预算、空依赖、刚好命中上限和单条异常长内容均有自动化覆盖；所有生成 metadata 都不超过共享上限，且真实扫描接口接受裁剪后的请求。
+- 日志覆盖初始化前缓冲、并发写入、轮转、写盘失败、敏感字段过滤和 `stdout`/`stderr` 的 `EPIPE`；supervisor 输出不得调用桌面进程输出流。
+- 串行通过扫描、服务端、日志、supervisor 定向测试与全量测试，并通过两套类型检查、生产构建及 `git diff --check`。
+- 对 `D:\UGit\CombatDemo` 做只读扫描测量，并以隔离用户数据验证本地 v0.2.4 unpacked 与 unsigned NSIS 候选；不得覆盖现有安装或修改房间数据。
+
+当前状态
+- v0.2.4 后台扫描容量约束、桌面 JSONL 日志、进程流防护和服务输出路由已经实现；包版本为 0.2.4，协议版本保持 1，数据库 schema 保持 4。
+- 扫描、真实服务端接口、日志和 supervisor 的 4 个定向测试文件共 23 项通过；两套 TypeScript 配置检查、59 个测试文件共 456 项串行全量测试、生产构建和 `git diff --check` 通过。
+- `D:\UGit\CombatDemo` 只读实测仍产生 7,068 条依赖和 1 条规则哈希；裁剪后保留依赖稳定前缀 238 条、规则哈希 1 条，最终 metadata 为 31,938 字符并被真实扫描接口接受。
+- 隔离 Electron 候选通过启动和 EPIPE 冒烟：主进程 `stdout`、`stderr` 各模拟一次 `EPIPE` 后仍继续运行，两条错误和本地服务启动记录均写入隔离 `desktop.log`。正常安装的日志路径保持 `%APPDATA%\agent-hub\logs\desktop.log`。
+- 最终 Windows x64 NSIS 本地候选 `AgentHub-Setup-0.2.4-x64.exe` 位于 `%TEMP%\agent-hub-v0.2.4-candidate`：119,726,009 字节，SHA-256 `005E817C81E5C7E265A6C84A290A45F0DBE77EB20FA49A1FB349327481374EAD`，Authenticode 状态为 `NotSigned`。
+- 最终候选 `app.asar` 为 46,720,471 字节，SHA-256 `59FCC9FF1DB72BAFC8A044B70291FDB66B27554B786C565A61323BE59C92E8E7`；物理文件恢复备份一致，备份健康、MCP bridge 和 Codex Hook 均返回 `ok`。
+- 本轮没有覆盖 `D:\AgentHub` 或修改现有房间数据；v0.2.4 正式发布已获明确授权，将在提交、主分支 CI、标签 CI、Windows Release 和六项资产审计全部通过后公开，并在发布后追加正式审计记录。
+
+v0.2.4 已确认更新：旧数据库升级热修复（前置验证记录）
+- 该更新点最初只包含旧房间数据库升级修复；本次另行确认后台扫描容量和桌面日志防崩后，v0.2.4 现包含两组并列修复，但仍不扩展界面日志中心、更新器或会话生命周期。
 - v0.2.3 的 schema 3 到 4 迁移曾在 `local_scans.finalization_id` 尚不存在时先创建 `scans_finalization_idx`，SQLite 因 `no such column: finalization_id` 终止语句；外层事务随后回滚，因此数据库通常仍保持 schema 3 和原数据，但应用无法完成启动。
 - 现有修复提交 `774c4c8` 调整为先检查并补齐 `local_scans.finalization_id`，再幂等创建依赖索引。已失败回滚的 schema 3、已手工补列但 `user_version` 仍为 3、已成功迁移的 schema 4 均可安全重试或重复打开。
 - 兼容测试使用正式历史结构覆盖 v0.1.0 schema 2，v0.2.0/v0.2.1/v0.2.2 共用 schema 3，v0.2.3 失败回滚状态、手工补列恢复状态、已迁移 schema 4 和全新数据库；升级断言房间、成员、会话、租约和扫描记录保留，最终 `user_version=4`、目标字段与索引存在，SQLite 完整性与外键检查通过。
 - 应用版本升至 `0.2.4`；协议版本保持 1，数据库 schema 保持 4，最低可读取来源 schema 保持 2。
 - v0.2.2 在正式发布后可应用内更新；v0.2.0/v0.2.1 必须使用 v0.2.4 Setup 原目录覆盖安装；无法启动的 v0.2.3 必须手动覆盖；已修复或已正常迁移到 schema 4 的 v0.2.3 可正常更新。所有情况都禁止先卸载或删除 `%APPDATA%\agent-hub`。
-- 当前只准备本地安装候选并验证，不覆盖安装到本机，不推送、不打标签、不创建 GitHub Release、不生成正式签名清单，也不修改 GitHub latest Release。
-- 两套 TypeScript 配置检查、57 个测试文件共 444 项串行全量测试、生产构建和 `git diff --check` 已通过。
-- Windows x64 NSIS 本地候选 `AgentHub-Setup-0.2.4-x64.exe` 已在短路径临时工作树构建成功：119,721,531 字节，SHA-256 `3CE08DE4B58F8C4E6A3376B0E229AEEB372F4D418EAFF73445A0E11C40D9DF8B`，Authenticode 状态为 `NotSigned`。
-- 打包恢复探针已通过：`app.asar` 为 46,699,120 字节，SHA-256 `DF2F9AD17803A59AAE55C12420159A835BCA4C3394EED7FC12FBE4C09D7471C6`，备份健康返回 v0.2.4 和 `ok`；打包后的 MCP bridge 与 Codex Hook 健康检查均为 `ok`。
+- 本地安装候选已完成隔离验证且未覆盖本机正式安装；v0.2.4 正式发布已获明确授权，正式签名清单与 GitHub Release 由标签工作流生成并在审计通过后公开。
+- 后台扫描与日志修复纳入前的数据库热修前置验证为两套 TypeScript 配置检查、57 个测试文件共 444 项串行全量测试、生产构建和 `git diff --check` 通过；本次扩展后的最终汇总结果见上一节。
+- 前置 Windows x64 NSIS 数据库热修候选为 119,721,531 字节，SHA-256 `3CE08DE4B58F8C4E6A3376B0E229AEEB372F4D418EAFF73445A0E11C40D9DF8B`，Authenticode 状态为 `NotSigned`；它已被上一节的最终候选替代。
+- 前置候选恢复探针曾验证 `app.asar` 为 46,699,120 字节，SHA-256 `DF2F9AD17803A59AAE55C12420159A835BCA4C3394EED7FC12FBE4C09D7471C6`，备份健康、MCP bridge 与 Codex Hook 为 `ok`；最终候选恢复结果见上一节。
 - 打包后的真实服务已使用隔离数据库验证 schema 2、普通 schema 3、v0.2.3 失败回滚、手工补列和全新数据库；每种状态均成功升级或创建到 schema 4，并在第二次启动时继续通过数据保留、目标字段/索引、SQLite 完整性和外键检查。

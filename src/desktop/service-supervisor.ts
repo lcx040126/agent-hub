@@ -10,6 +10,7 @@ export interface ServiceSupervisorOptions {
   startupTimeoutMs?: number;
   stopTimeoutMs?: number;
   spawnImpl?: typeof spawn;
+  onOutput: (stream: "stdout" | "stderr", output: string) => void;
 }
 
 export interface ServiceSupervisor {
@@ -60,8 +61,8 @@ export function createServiceSupervisor(options: ServiceSupervisorOptions): Serv
       windowsHide: true,
     });
     child = current;
-    current.stdout?.on("data", (chunk) => process.stdout.write(`[agent-hub-service] ${chunk}`));
-    current.stderr?.on("data", (chunk) => process.stderr.write(`[agent-hub-service] ${chunk}`));
+    forwardOutput(current.stdout, "stdout", options.onOutput);
+    forwardOutput(current.stderr, "stderr", options.onOutput);
     current.once("exit", () => {
       if (child === current) child = null;
     });
@@ -102,6 +103,26 @@ export function createServiceSupervisor(options: ServiceSupervisorOptions): Serv
       await startInternal();
     }),
   };
+}
+
+function forwardOutput(
+  stream: NodeJS.ReadableStream | null,
+  source: "stdout" | "stderr",
+  onOutput: ServiceSupervisorOptions["onOutput"],
+): void {
+  if (!stream) return;
+  const deliver = (output: string) => {
+    try {
+      onOutput(source, output);
+    } catch {
+      // 子进程监管不能被诊断回调反向中断。
+    }
+  };
+  stream.on("data", (chunk: Buffer | string) => deliver(String(chunk)));
+  stream.on("error", (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    deliver(`Agent Hub service ${source} stream error: ${message}`);
+  });
 }
 
 async function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {

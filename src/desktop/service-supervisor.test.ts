@@ -1,5 +1,6 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { ChildProcess, type spawn } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -12,6 +13,7 @@ describe("service supervisor", () => {
       scriptPath: "unused",
       port: 49123,
       dataDir: "data",
+      onOutput: vi.fn(),
     });
     expect(supervisor.port).toBe(49123);
     expect(supervisor.url).toBe("http://127.0.0.1:49123");
@@ -21,7 +23,14 @@ describe("service supervisor", () => {
     const directory = await mkdtemp(path.join(tmpdir(), "agent-hub-supervisor-"));
     const good = path.join(directory, "good.cjs");
     await writeFile(good, "require('node:http').createServer((_,r)=>{r.writeHead(200,{'content-type':'application/json'});r.end(JSON.stringify({status:'ok'}));}).listen(Number(process.env.PORT),'0.0.0.0');");
-    const supervisor = createServiceSupervisor({ executable: process.execPath, scriptPath: good, port: 49131, dataDir: directory, startupTimeoutMs: 3_000 });
+    const supervisor = createServiceSupervisor({
+      executable: process.execPath,
+      scriptPath: good,
+      port: 49131,
+      dataDir: directory,
+      startupTimeoutMs: 3_000,
+      onOutput: vi.fn(),
+    });
     try {
       await supervisor.start();
       await supervisor.restart();
@@ -42,6 +51,7 @@ describe("service supervisor", () => {
       port: 49132,
       dataDir: directory,
       startupTimeoutMs: 3_000,
+      onOutput: vi.fn(),
     });
     try {
       await supervisor.start();
@@ -68,6 +78,7 @@ describe("service supervisor", () => {
       startupTimeoutMs: 100,
       stopTimeoutMs: 20,
       spawnImpl,
+      onOutput: vi.fn(),
     });
 
     await supervisor.start();
@@ -102,6 +113,7 @@ describe("service supervisor", () => {
       startupTimeoutMs: 20,
       stopTimeoutMs: 20,
       spawnImpl,
+      onOutput: vi.fn(),
     });
 
     await expect(supervisor.start()).rejects.toThrow("Agent Hub service failed health check: HTTP 503");
@@ -114,6 +126,41 @@ describe("service supervisor", () => {
     expect(spawnImpl).toHaveBeenCalledTimes(2);
 
     await supervisor.stop();
+  });
+
+  it("routes child output to its callback without writing desktop stdout or stderr", async () => {
+    const child = controlledChild(false);
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    Object.defineProperty(child, "stdout", { value: stdout });
+    Object.defineProperty(child, "stderr", { value: stderr });
+    const onOutput = vi.fn();
+    const stdoutWrite = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const supervisor = createServiceSupervisor({
+      executable: process.execPath,
+      scriptPath: "unused",
+      port: 49135,
+      dataDir: "data",
+      fetchImpl: vi.fn(async () => new Response(null, { status: 200 })),
+      spawnImpl: vi.fn(() => child) as unknown as typeof spawn,
+      onOutput,
+    });
+
+    try {
+      await supervisor.start();
+      stdout.write("service ready\n");
+      stderr.write("service warning\n");
+
+      expect(onOutput).toHaveBeenCalledWith("stdout", "service ready\n");
+      expect(onOutput).toHaveBeenCalledWith("stderr", "service warning\n");
+      expect(stdoutWrite).not.toHaveBeenCalled();
+      expect(stderrWrite).not.toHaveBeenCalled();
+    } finally {
+      stdoutWrite.mockRestore();
+      stderrWrite.mockRestore();
+      await supervisor.stop();
+    }
   });
 });
 

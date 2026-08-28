@@ -4,6 +4,7 @@ import {
   type ConnectionStore,
 } from "../desktop/connection-store.js";
 import type { SavedRoomConnection } from "../desktop/contracts.js";
+import { AGENT_HUB_SCAN_METADATA_MAX_LENGTH } from "../shared/limits.js";
 import { AgentHubClient, AgentHubHttpError } from "./hub-client.js";
 import {
   IntegrationOperationTracker,
@@ -136,6 +137,8 @@ async function scanConnection(
   );
   const current = await activeConnection(options, connection.id);
   if (!current) return;
+  // 在读取凭证或建立远端扫描会话前完成本地容量验证。
+  const payload = createBackgroundScanPayload(snapshot);
   const memberToken = await options.store.readMemberToken(current.id);
   const client = new AgentHubClient({
     serverUrl: current.serverUrl,
@@ -150,14 +153,14 @@ async function scanConnection(
   }
 
   try {
-    await uploadSnapshot(client, sessionId, snapshot);
+    await uploadSnapshot(client, sessionId, payload);
   } catch (error) {
     if (!(error instanceof AgentHubHttpError) || (error.status !== 404 && error.status !== 409)) {
       throw error;
     }
     sessionId = await openScanSession(client, snapshot);
     sessions.set(current.id, sessionId);
-    await uploadSnapshot(client, sessionId, snapshot);
+    await uploadSnapshot(client, sessionId, payload);
   }
 }
 
@@ -211,12 +214,13 @@ async function openScanSession(client: AgentHubClient, snapshot: RepositorySnaps
 async function uploadSnapshot(
   client: AgentHubClient,
   sessionId: string,
-  snapshot: RepositorySnapshot,
+  payload: Record<string, unknown>,
 ): Promise<void> {
-  await client.post(`/api/sessions/${encodeURIComponent(sessionId)}/scan`, createBackgroundScanPayload(snapshot));
+  await client.post(`/api/sessions/${encodeURIComponent(sessionId)}/scan`, payload);
 }
 
 export function createBackgroundScanPayload(snapshot: RepositorySnapshot): Record<string, unknown> {
+  const metadata = createBackgroundScanMetadata(snapshot);
   return {
     repository: snapshot.repository.remote ?? snapshot.repository.name,
     branch: snapshot.repository.branch,
@@ -226,24 +230,82 @@ export function createBackgroundScanPayload(snapshot: RepositorySnapshot): Recor
     changedPaths: [],
     ruleFiles: snapshot.ruleFiles.map((rule) => rule.path).slice(0, 100),
     systems: snapshot.systems.map((system) => system.id).slice(0, 200),
-    metadata: {
-      source: "desktop-companion",
-      generatedAt: snapshot.generatedAt,
-      repositoryFingerprint: snapshot.repository.fingerprint,
-      analysis: snapshot.analysis,
-      ruleHashes: snapshot.ruleFiles.slice(0, 100).map((rule) => ({
-        path: rule.path,
-        sha256: rule.sha256,
-      })),
-      dependencies: snapshot.dependencies.slice(0, 500),
-      dependencyCount: snapshot.dependencies.length,
-      systemCount: snapshot.systems.length,
-      externalChangesExcluded: true,
-      metadataTruncated:
-        snapshot.dependencies.length > 500
-        || snapshot.systems.length > 200,
-    },
+    metadata,
   };
+}
+
+function createBackgroundScanMetadata(snapshot: RepositorySnapshot): Record<string, unknown> {
+  const ruleHashes = snapshot.ruleFiles.map((rule) => ({
+    path: rule.path,
+    sha256: rule.sha256,
+  }));
+  const dependencies = snapshot.dependencies;
+  const createCandidate = (ruleHashIncludedCount: number, dependencyIncludedCount: number) => ({
+    source: "desktop-companion",
+    generatedAt: snapshot.generatedAt,
+    repositoryFingerprint: snapshot.repository.fingerprint,
+    analysis: snapshot.analysis,
+    ruleHashes: ruleHashes.slice(0, ruleHashIncludedCount),
+    dependencies: dependencies.slice(0, dependencyIncludedCount),
+    dependencyCount: dependencies.length,
+    dependencyIncludedCount,
+    ruleHashCount: ruleHashes.length,
+    ruleHashIncludedCount,
+    systemCount: snapshot.systems.length,
+    externalChangesExcluded: true,
+    metadataTruncated:
+      ruleHashIncludedCount < ruleHashes.length
+      || dependencyIncludedCount < dependencies.length
+      || snapshot.ruleFiles.length > 100
+      || snapshot.systems.length > 200,
+  });
+
+  // 先验证不含可裁剪列表的固定字段，避免构造出服务端必然拒绝的请求。
+  const minimum = createCandidate(0, 0);
+  if (JSON.stringify(minimum).length > AGENT_HUB_SCAN_METADATA_MAX_LENGTH) {
+    throw new BackgroundScanMetadataTooLargeError();
+  }
+
+  // 两类数据都只保留原有顺序的前缀；规则哈希沿用原字段顺序并优先占用预算。
+  const ruleHashIncludedCount = maximumFittingPrefix(
+    ruleHashes.length,
+    (count) => createCandidate(count, 0),
+  );
+  const dependencyIncludedCount = maximumFittingPrefix(
+    dependencies.length,
+    (count) => createCandidate(ruleHashIncludedCount, count),
+  );
+  const metadata = createCandidate(ruleHashIncludedCount, dependencyIncludedCount);
+  if (JSON.stringify(metadata).length > AGENT_HUB_SCAN_METADATA_MAX_LENGTH) {
+    throw new BackgroundScanMetadataTooLargeError();
+  }
+  return metadata;
+}
+
+function maximumFittingPrefix(
+  itemCount: number,
+  createCandidate: (includedCount: number) => Record<string, unknown>,
+): number {
+  let lower = 0;
+  let upper = itemCount;
+  while (lower < upper) {
+    const middle = Math.ceil((lower + upper) / 2);
+    if (JSON.stringify(createCandidate(middle)).length <= AGENT_HUB_SCAN_METADATA_MAX_LENGTH) {
+      lower = middle;
+    } else {
+      upper = middle - 1;
+    }
+  }
+  return lower;
+}
+
+export class BackgroundScanMetadataTooLargeError extends Error {
+  constructor() {
+    super(
+      `Agent Hub could not create scan metadata within the ${AGENT_HUB_SCAN_METADATA_MAX_LENGTH} character limit.`,
+    );
+    this.name = "BackgroundScanMetadataTooLargeError";
+  }
 }
 
 function asError(error: unknown): Error {

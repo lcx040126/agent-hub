@@ -72,6 +72,7 @@ import {
   AGENT_HUB_PROTOCOL_VERSION,
   AGENT_HUB_SCHEMA_VERSION,
 } from "../shared/version.js";
+import { AGENT_HUB_SCAN_METADATA_MAX_LENGTH } from "../shared/limits.js";
 import {
   FeatureMemoryError,
   FeatureMemoryStore,
@@ -4681,7 +4682,7 @@ function objectValue(value: unknown, label: string): Record<string, unknown> {
     throw new AgentHubError("invalid_input", `${label} must be an object.`);
   }
   const object = value as Record<string, unknown>;
-  if (json(object).length > 32_000) {
+  if (json(object).length > AGENT_HUB_SCAN_METADATA_MAX_LENGTH) {
     throw new AgentHubError("invalid_input", `${label} is too large.`);
   }
   return object;
