@@ -535,3 +535,14 @@ v0.2.4 已确认更新：旧数据库升级热修复（前置验证记录）
 - 前置 Windows x64 NSIS 数据库热修候选为 119,721,531 字节，SHA-256 `3CE08DE4B58F8C4E6A3376B0E229AEEB372F4D418EAFF73445A0E11C40D9DF8B`，Authenticode 状态为 `NotSigned`；它已被上一节的最终候选替代。
 - 前置候选恢复探针曾验证 `app.asar` 为 46,699,120 字节，SHA-256 `DF2F9AD17803A59AAE55C12420159A835BCA4C3394EED7FC12FBE4C09D7471C6`，备份健康、MCP bridge 与 Codex Hook 为 `ok`；最终候选恢复结果见上一节。
 - 打包后的真实服务已使用隔离数据库验证 schema 2、普通 schema 3、v0.2.3 失败回滚、手工补列和全新数据库；每种状态均成功升级或创建到 schema 4，并在第二次启动时继续通过数据保留、目标字段/索引、SQLite 完整性和外键检查。
+
+v0.2.4 正式发布验证（2026-08-28）
+- Annotated tag `v0.2.4` 指向提交 `5e32074d59af6bd205806219c84109817fba5bfa`，发布时与 `main`、`origin/main` 一致；标签发布后未移动。
+- 主分支 CI `33140200506`、标签 CI `33140268556` 和 Windows Release `33140268602` 均成功；Windows Release 的文档门禁、类型检查、全量测试、NSIS 打包、恢复探针、Ed25519 清单签名和资产上传全部通过。
+- 远端 publication gate 未配置，工作流按仓库已审计的 `AGENT_HUB_ALLOW_UNGATED_RELEASE=true` 显式继续并留下日志；没有把跳过远端 gate 表述为已执行 gate。
+- GitHub Release `378252351` 于 `2026-08-28T04:05:32Z` 正式公开并设为 latest：`https://github.com/lcx040126/agent-hub/releases/tag/v0.2.4`。
+- 正式 Setup `AgentHub-Setup-0.2.4-x64.exe` 为 119,725,884 字节，SHA-256 `8FA94558A62D485D00BE09432163290CD7978FE20D1B70872272F2BC666FF910`，Authenticode 状态为 `NotSigned`。
+- 正式 blockmap SHA-256 `A2345A9239C688A8B20FA8ED9366759F3C9EE9402DF112E531A0C5FB623B905A`；更新清单 `CA6E9B172D20554DE5783D309EC4BE731698763007A9C1DD975B7CF2D965DBCE`；签名文件 `99A8B6FF291B9170D9C905864119F276DEE2D6E640EFF3B1CFB8C31242DEC4AA`；`latest.yml` `8B703C3556A245132D0DA3307E021EE08B107BFFFC5A311662295B1D9A07B5BF`；`SHA256SUMS.txt` `9815B82C20D89E42EFE924381F24A17DF83339987B95D743B3B9B25907F3FB40`。
+- 六项资产的独立下载 SHA-256、GitHub asset digest 和校验文件一致；Ed25519 签名通过，更新清单的 v0.2.4、协议 1、schema 2 到 4、Setup URL/大小/SHA-256 和发布正文均正确；`latest.yml` 的大小与 Setup 一致，SHA-512 为 `q7v0nihAMNQTslu6UasfGGS8k1gvtYkZkgqFhA3Ldi88BBlgxYubfMGauPbZY0CGcKZKqPpxmCSSzmy6uKBdzg==`。
+- 匿名访问 `releases/latest`、latest 更新清单、签名和正式 Setup 均返回 HTTP 200 并解析到 v0.2.4；匿名下载的清单与签名字节和已审计资产一致。
+- 真实 v0.2.2 应用内升级、无法启动的 v0.2.3 覆盖恢复、非默认目录升级、断网长时间恢复和双机协作仍按发布说明列为未完成的实机验收，不因正式发布而改记为通过。
