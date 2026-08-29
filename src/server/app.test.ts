@@ -1657,6 +1657,34 @@ describe("Agent Hub REST API", () => {
       ) VALUES (?, ?, ?, 'Alice', 'test.activity', 'test', NULL, 'summary', '{}', ?)
     `);
     database.transaction(() => {
+      database.connection.prepare(`
+        INSERT INTO decisions (
+          id, room_id, author_member_id, status, supersedes_decision_id,
+          title, decision, rationale, paths_json, created_at
+        ) VALUES (?, ?, ?, 'current', NULL, ?, ?, ?, '[]', ?)
+      `).run(
+        "window-current-decision",
+        owner.body.room.id,
+        owner.body.member.id,
+        "Old current decision",
+        "Keep the still-active rule visible.",
+        "The team has not replaced this decision.",
+        "2026-08-24T10:00:00.000Z",
+      );
+      database.connection.prepare(`
+        INSERT INTO records (
+          id, room_id, member_id, kind, title, summary, paths_json, status,
+          evidence_json, commit_hash, created_at
+        ) VALUES (?, ?, ?, 'decision', ?, ?, '[]', 'current', ?, NULL, ?)
+      `).run(
+        "window-current-decision",
+        owner.body.room.id,
+        owner.body.member.id,
+        "Old current decision",
+        "Keep the still-active rule visible.",
+        '["The team has not replaced this decision."]',
+        "2026-08-24T10:00:00.000Z",
+      );
       for (let index = 0; index < 501; index += 1) {
         const timestamp = new Date(Date.parse("2026-08-25T10:00:00.000Z") + index).toISOString();
         insertRecord.run(
@@ -1698,6 +1726,11 @@ describe("Agent Hub REST API", () => {
     expect(dashboard.status).toBe(200);
     expect(dashboard.body.sectionTotals).toMatchObject(expected);
     expect(dashboard.body.records).toHaveLength(500);
+    expect(dashboard.body.records).toContainEqual(expect.objectContaining({
+      id: "window-current-decision",
+      kind: "decision",
+      status: "current",
+    }));
     expect(dashboard.body.sessions).toHaveLength(500);
     expect(dashboard.body.activity).toHaveLength(100);
     expect(dashboard.body.partialSections).toEqual(expect.arrayContaining([
@@ -2326,6 +2359,361 @@ describe("Agent Hub REST API", () => {
       token,
     );
     expect(closed.body.session.status).toBe("closed");
+  });
+
+  it("preserves a linear decision history while exposing only the current decision to agents", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    const original = await auth(request(app).post("/api/decisions").send({
+      title: "Inventory capacity",
+      decision: "The backpack has 20 slots.",
+      rationale: "The first playable scope uses a compact inventory.",
+      paths: ["Assets/Inventory"],
+    }), owner.body.token);
+    expect(original.status).toBe(201);
+    expect(original.body.decision).toMatchObject({
+      status: "current",
+      supersedesDecisionId: null,
+      supersededByDecisionId: null,
+    });
+
+    for (const invalidSupersedesDecisionId of [123, { id: original.body.decision.id }, "   "]) {
+      const invalidReplacement = await auth(request(app).post("/api/decisions").send({
+        title: "Invalid replacement",
+        decision: "This request must not create an independent decision.",
+        rationale: "The replacement identifier is malformed.",
+        supersedesDecisionId: invalidSupersedesDecisionId,
+      }), owner.body.token);
+      expect(invalidReplacement.status).toBe(400);
+      expect(invalidReplacement.body.error).toBe("invalid_input");
+    }
+
+    const missingRationale = await auth(request(app).post("/api/decisions").send({
+      title: "Inventory capacity",
+      decision: "The backpack has 24 slots.",
+      supersedesDecisionId: original.body.decision.id,
+    }), bob.body.token);
+    expect(missingRationale.status).toBe(400);
+    expect(missingRationale.body.error).toBe("invalid_input");
+
+    const replacement = await auth(request(app)
+      .post(`/api/decisions/${original.body.decision.id}/supersede`)
+      .send({
+      title: "Inventory capacity",
+      decision: "The backpack has 24 slots.",
+      rationale: "The user confirmed that the crafting loop needs four more slots.",
+      paths: ["Assets/Inventory"],
+    }), bob.body.token);
+    expect(replacement.status).toBe(201);
+    expect(replacement.body.decision).toMatchObject({
+      status: "current",
+      supersedesDecisionId: original.body.decision.id,
+      authorName: "Bob",
+    });
+
+    const third = await auth(request(app).post("/api/decisions").send({
+      title: "Inventory capacity",
+      decision: "The backpack has 30 slots.",
+      rationale: "Runtime pacing tests and the user-approved plan require 30 slots.",
+      paths: ["Assets/Inventory"],
+      supersedesDecisionId: replacement.body.decision.id,
+    }), owner.body.token);
+    expect(third.status).toBe(201);
+
+    const repeatOldReplacement = await auth(request(app).post("/api/decisions").send({
+      title: "Conflicting branch",
+      decision: "This must not create a second successor.",
+      rationale: "A stale member tried to replace the original decision.",
+      supersedesDecisionId: original.body.decision.id,
+    }), bob.body.token);
+    expect(repeatOldReplacement.status).toBe(409);
+    expect(repeatOldReplacement.body).toMatchObject({
+      error: "decision_already_superseded",
+      details: { currentDecisionId: replacement.body.decision.id },
+    });
+
+    const otherRoom = await createRoom(app);
+    const crossRoom = await auth(request(app).post("/api/decisions").send({
+      title: "Foreign replacement",
+      decision: "A room cannot replace another room's decision.",
+      rationale: "This request intentionally uses an out-of-room identifier.",
+      supersedesDecisionId: third.body.decision.id,
+    }), otherRoom.body.token);
+    expect(crossRoom.status).toBe(404);
+    expect(crossRoom.body.error).toBe("decision_not_found");
+
+    const concurrent = await Promise.all([
+      auth(request(app).post("/api/decisions").send({
+        title: "Inventory capacity",
+        decision: "The backpack has 32 slots.",
+        rationale: "First concurrent replacement candidate.",
+        supersedesDecisionId: third.body.decision.id,
+      }), owner.body.token),
+      auth(request(app).post("/api/decisions").send({
+        title: "Inventory capacity",
+        decision: "The backpack has 36 slots.",
+        rationale: "Second concurrent replacement candidate.",
+        supersedesDecisionId: third.body.decision.id,
+      }), bob.body.token),
+    ]);
+    expect(concurrent.map((response) => response.status).sort()).toEqual([201, 409]);
+    expect(concurrent.find((response) => response.status === 409)?.body.error)
+      .toBe("decision_already_superseded");
+    const winningDecision = concurrent.find((response) => response.status === 201)!.body.decision;
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    const decisions = new Map(
+      dashboard.body.records
+        .filter((record: { kind: string }) => record.kind === "decision")
+        .map((record: { id: string }) => [record.id, record]),
+    );
+    expect(decisions.get(original.body.decision.id)).toMatchObject({
+      status: "superseded",
+      supersededByDecisionId: replacement.body.decision.id,
+    });
+    expect(decisions.get(replacement.body.decision.id)).toMatchObject({
+      status: "superseded",
+      supersedesDecisionId: original.body.decision.id,
+      supersededByDecisionId: third.body.decision.id,
+    });
+    expect(decisions.get(third.body.decision.id)).toMatchObject({
+      status: "superseded",
+      supersedesDecisionId: replacement.body.decision.id,
+      supersededByDecisionId: winningDecision.id,
+    });
+    expect(decisions.get(winningDecision.id)).toMatchObject({
+      status: "current",
+      supersedesDecisionId: third.body.decision.id,
+    });
+
+    const relevant = await auth(
+      request(app).get("/api/context").query({ paths: "Assets/Inventory/Backpack.cs" }),
+      owner.body.token,
+    );
+    expect(relevant.body.decisions).toEqual([
+      expect.objectContaining({ id: winningDecision.id, status: "current" }),
+    ]);
+    expect(relevant.body.records.filter((record: { kind: string }) => record.kind === "decision"))
+      .toEqual([expect.objectContaining({ id: winningDecision.id, status: "current" })]);
+  });
+
+  it("round-trips decision replacement chains and rejects corrupt imported histories", async () => {
+    const { app } = testApp();
+    const source = await createRoom(app);
+    const first = await auth(request(app).post("/api/decisions").send({
+      title: "Backpack sort order",
+      decision: "Sort by item type.",
+      rationale: "Initial user-confirmed layout.",
+    }), source.body.token);
+    const second = await auth(request(app).post("/api/decisions").send({
+      title: "Backpack sort order",
+      decision: "Sort by rarity, then item type.",
+      rationale: "The user confirmed that rarity must be visible first.",
+      supersedesDecisionId: first.body.decision.id,
+    }), source.body.token);
+    await auth(request(app).post("/api/decisions").send({
+      title: "Backpack sort order",
+      decision: "Sort manually and preserve the player's order.",
+      rationale: "The user approved manual ordering after the usability review.",
+      supersedesDecisionId: second.body.decision.id,
+    }), source.body.token);
+
+    const exported = await auth(
+      request(app).get("/api/room/context/export"),
+      source.body.token,
+    );
+    expect(exported.status).toBe(200);
+    expect(exported.body.version).toBe(2);
+    expect(exported.body.decisions).toHaveLength(3);
+    expect(exported.body.records.filter((record: { kind: string }) => record.kind === "decision"))
+      .toHaveLength(3);
+
+    const target = await createRoom(app);
+    const imported = await auth(
+      request(app).post("/api/room/context/import").send(exported.body),
+      target.body.token,
+    );
+    expect(imported.status).toBe(200);
+    const targetDashboard = await auth(
+      request(app).get("/api/dashboard"),
+      target.body.token,
+    );
+    const importedDecisions = targetDashboard.body.records.filter(
+      (record: { kind: string }) => record.kind === "decision",
+    ) as Array<{
+      id: string;
+      status: string;
+      supersedesDecisionId?: string;
+      supersededByDecisionId?: string;
+    }>;
+    expect(importedDecisions).toHaveLength(3);
+    expect(importedDecisions.filter((decision) => decision.status === "current")).toHaveLength(1);
+    expect(importedDecisions.filter((decision) => decision.status === "superseded")).toHaveLength(2);
+    const current = importedDecisions.find((decision) => decision.status === "current")!;
+    const middle = importedDecisions.find((decision) => decision.id === current.supersedesDecisionId)!;
+    const oldest = importedDecisions.find((decision) => decision.id === middle.supersedesDecisionId)!;
+    expect(middle.supersededByDecisionId).toBe(current.id);
+    expect(oldest.supersededByDecisionId).toBe(middle.id);
+
+    const reexported = await auth(
+      request(app).get("/api/room/context/export"),
+      target.body.token,
+    );
+    const decisionIds = new Set(
+      reexported.body.decisions.map((decision: { originalId: string }) => decision.originalId),
+    );
+    const decisionRecordIds = new Set(
+      reexported.body.records
+        .filter((record: { kind: string }) => record.kind === "decision")
+        .map((record: { originalId: string }) => record.originalId),
+    );
+    expect(decisionRecordIds).toEqual(decisionIds);
+
+    const invalidTarget = await createRoom(app);
+    const invalidBase = {
+      format: "agent-hub-context",
+      version: 2,
+      room: { id: "external-room", name: "External", projectName: "External" },
+      exportedAt: "2026-08-29T00:00:00.000Z",
+      contextEntries: [],
+      verifications: [],
+      handoffs: [],
+      records: [],
+    };
+    const invalidDecision = (originalId: string, supersedesDecisionId?: string) => ({
+      originalId,
+      title: `Decision ${originalId}`,
+      decision: `Value ${originalId}`,
+      rationale: "Imported test evidence.",
+      paths: [],
+      ...(supersedesDecisionId ? { supersedesDecisionId } : {}),
+    });
+    for (const decisions of [
+      [invalidDecision("missing-child", "outside-room")],
+      [
+        invalidDecision("branch-root"),
+        invalidDecision("branch-a", "branch-root"),
+        invalidDecision("branch-b", "branch-root"),
+      ],
+      [invalidDecision("cycle-a", "cycle-b"), invalidDecision("cycle-b", "cycle-a")],
+    ]) {
+      const rejected = await auth(
+        request(app).post("/api/room/context/import").send({ ...invalidBase, decisions }),
+        invalidTarget.body.token,
+      );
+      expect(rejected.status).toBe(400);
+      expect(rejected.body.error).toBe("invalid_context_export");
+    }
+    const invalidDashboard = await auth(
+      request(app).get("/api/dashboard"),
+      invalidTarget.body.token,
+    );
+    expect(invalidDashboard.body.records).toEqual([]);
+  });
+
+  it("imports v1 backups with split decision projection ids as one replaceable decision", async () => {
+    const { app } = testApp();
+    const target = await createRoom(app);
+    const imported = await auth(
+      request(app).post("/api/room/context/import").send({
+        format: "agent-hub-context",
+        version: 1,
+        room: { id: "legacy-room", name: "Legacy", projectName: "Legacy" },
+        exportedAt: "2026-08-29T00:00:00.000Z",
+        contextEntries: [],
+        decisions: [{
+          originalId: "legacy-decision-id",
+          title: "Backpack capacity",
+          decision: "Use 20 slots.",
+          rationale: "Confirmed for the first playable scope.",
+          paths: ["Assets/Inventory"],
+        }],
+        verifications: [],
+        handoffs: [],
+        records: [{
+          originalId: "legacy-record-id",
+          kind: "decision",
+          title: "Backpack capacity",
+          summary: "Use 20 slots.",
+          paths: ["Assets/Inventory"],
+          status: "accepted",
+          evidence: ["Confirmed for the first playable scope."],
+        }],
+      }),
+      target.body.token,
+    );
+    expect(imported.status).toBe(200);
+    expect(imported.body).toEqual({ imported: 2, rejected: 0 });
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), target.body.token);
+    const decisions = dashboard.body.records.filter(
+      (record: { kind: string }) => record.kind === "decision",
+    );
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      title: "Backpack capacity",
+      status: "current",
+    });
+
+    const replacement = await auth(
+      request(app).post(`/api/decisions/${decisions[0].id}/supersede`).send({
+        title: "Backpack capacity",
+        decision: "Use 24 slots.",
+        rationale: "The team confirmed the expanded crafting scope.",
+        paths: ["Assets/Inventory"],
+      }),
+      target.body.token,
+    );
+    expect(replacement.status).toBe(201);
+
+    const relevant = await auth(
+      request(app).get("/api/context").query({ paths: "Assets/Inventory/Backpack.cs" }),
+      target.body.token,
+    );
+    expect(relevant.body.decisions).toEqual([
+      expect.objectContaining({
+        id: replacement.body.decision.id,
+        status: "current",
+      }),
+    ]);
+    expect(relevant.body.records.filter((record: { kind: string }) => record.kind === "decision"))
+      .toEqual([expect.objectContaining({ id: replacement.body.decision.id, status: "current" })]);
+  });
+
+  it("refuses to return a truncated context export", async () => {
+    const { app, database } = testApp();
+    const owner = await createRoom(app);
+    const insert = database.connection.prepare(`
+      INSERT INTO context_entries (
+        id, room_id, author_member_id, kind, title, content,
+        paths_json, created_at, updated_at
+      ) VALUES (?, ?, ?, 'note', ?, ?, '[]', ?, ?)
+    `);
+    database.transaction(() => {
+      for (let index = 0; index < 501; index += 1) {
+        const timestamp = `2026-08-29T00:${String(index % 60).padStart(2, "0")}:00.000Z`;
+        insert.run(
+          `context-${index}`,
+          owner.body.room.id,
+          owner.body.member.id,
+          `Context ${index}`,
+          `Content ${index}`,
+          timestamp,
+          timestamp,
+        );
+      }
+    });
+
+    const exported = await auth(
+      request(app).get("/api/room/context/export"),
+      owner.body.token,
+    );
+    expect(exported.status).toBe(409);
+    expect(exported.body).toMatchObject({
+      error: "context_export_too_large",
+      details: { section: "contextEntries", count: 501, limit: 500 },
+    });
   });
 
   it("exposes feature revision history and requires explicit confirmation for exact historical impacts", async () => {

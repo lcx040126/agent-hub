@@ -18,6 +18,7 @@ import {
   FolderOpen,
   GitBranch,
   Handshake,
+  History,
   KeyRound,
   Layers3,
   Link2,
@@ -26,6 +27,7 @@ import {
   Menu,
   Network,
   Plus,
+  PencilLine,
   Radio,
   RefreshCw,
   Server,
@@ -203,7 +205,24 @@ export type DashboardModal =
   | { type: "claim" }
   | { type: "close"; lease: Lease }
   | { type: "record"; recordKind: RecordModalKind }
+  | { type: "replace-decision"; decision: ProjectRecord }
   | { type: "release"; requestId: string };
+
+export function decisionReplacementConflictRecovery(
+  error: unknown,
+  refreshSucceeded: boolean,
+): { closeModal: true; notice: Notice } | null {
+  if (!(error instanceof ApiError) || error.code !== "decision_already_superseded") return null;
+  return {
+    closeModal: true,
+    notice: {
+      tone: "warning",
+      message: refreshSucceeded
+        ? "这条决定已被其他成员更新。当前决定已刷新，请基于最新决定重新操作。"
+        : "这条决定已被其他成员更新，但当前决定刷新失败。请恢复连接并刷新后再操作。",
+    },
+  };
+}
 
 export function nextPendingReleaseRequestId(
   activeModal: DashboardModal | null,
@@ -384,6 +403,8 @@ function recordLabel(kind: RecordKind): string {
 function statusLabel(value: string): string {
   return {
     accepted: "已确认",
+    current: "当前决定",
+    superseded: "已替代",
     passed: "通过",
     failed: "失败",
     pending: "待验证",
@@ -407,6 +428,49 @@ function recordIcon(kind: RecordKind): ReactNode {
   if (kind === "handoff") return <Handshake aria-hidden="true" />;
   if (kind === "risk") return <AlertTriangle aria-hidden="true" />;
   return <Layers3 aria-hidden="true" />;
+}
+
+export function isCurrentDecision(record: Pick<ProjectRecord, "kind" | "status">): boolean {
+  // 旧版本使用 accepted，缺失状态的快照也代表尚未被替代；只排除明确失效的决定。
+  return record.kind === "decision" && record.status !== "superseded";
+}
+
+export function visibleProjectRecords(records: readonly ProjectRecord[]): ProjectRecord[] {
+  return records.filter((record) => record.kind !== "decision" || isCurrentDecision(record));
+}
+
+export function decisionHistoryFor(
+  records: readonly ProjectRecord[],
+  currentDecisionId: string,
+): ProjectRecord[] {
+  return decisionHistoryStateFor(records, currentDecisionId).records;
+}
+
+export function decisionHistoryStateFor(
+  records: readonly ProjectRecord[],
+  currentDecisionId: string,
+): { records: ProjectRecord[]; incomplete: boolean } {
+  const decisions = new Map(
+    records
+      .filter((record) => record.kind === "decision" && record.id)
+      .map((record) => [record.id, record] as const),
+  );
+  const history: ProjectRecord[] = [];
+  const visited = new Set<string>();
+  let incomplete = false;
+  let decision = decisions.get(currentDecisionId);
+  while (decision && !visited.has(decision.id)) {
+    history.push(decision);
+    visited.add(decision.id);
+    if (!decision.supersedesDecisionId || visited.has(decision.supersedesDecisionId)) break;
+    const predecessor = decisions.get(decision.supersedesDecisionId);
+    if (!predecessor) {
+      incomplete = true;
+      break;
+    }
+    decision = predecessor;
+  }
+  return { records: history, incomplete };
 }
 
 async function copyText(value: string): Promise<boolean> {
@@ -1829,9 +1893,20 @@ export function WorkView({
   );
 }
 
-function RecordsView({ dashboard, onAdd }: { dashboard: Dashboard; onAdd: (kind: Exclude<RecordKind, "context">) => void }) {
+export function RecordsView({
+  dashboard,
+  onAdd,
+  onReplaceDecision,
+}: {
+  dashboard: Dashboard;
+  onAdd: (kind: Exclude<RecordKind, "context">) => void;
+  onReplaceDecision: (decision: ProjectRecord) => void;
+}) {
   const [filter, setFilter] = useState<RecordKind | "all">("all");
-  const records = filter === "all" ? dashboard.records : dashboard.records.filter((record) => record.kind === filter);
+  const [expandedDecisionId, setExpandedDecisionId] = useState<string>();
+  const currentRecords = visibleProjectRecords(dashboard.records);
+  const records = filter === "all" ? currentRecords : currentRecords.filter((record) => record.kind === filter);
+  const currentDecisionCount = currentRecords.filter((record) => record.kind === "decision").length;
   return (
     <section className="records-view">
       <div className="records-header">
@@ -1846,7 +1921,7 @@ function RecordsView({ dashboard, onAdd }: { dashboard: Dashboard; onAdd: (kind:
         </div>
       </div>
       <div className="record-summary" aria-label="记录统计">
-        <span><CheckCircle2 aria-hidden="true" /><b>{dashboard.records.filter((item) => item.kind === "decision").length}</b> 项决定</span>
+        <span><CheckCircle2 aria-hidden="true" /><b>{currentDecisionCount}</b> 项决定</span>
         <span><FileCheck2 aria-hidden="true" /><b>{dashboard.records.filter((item) => item.kind === "validation").length}</b> 项验证</span>
         <span><Handshake aria-hidden="true" /><b>{dashboard.records.filter((item) => item.kind === "handoff").length}</b> 项交接</span>
         <span><AlertTriangle aria-hidden="true" /><b>{dashboard.records.filter((item) => item.kind === "risk").length}</b> 项风险</span>
@@ -1860,7 +1935,23 @@ function RecordsView({ dashboard, onAdd }: { dashboard: Dashboard; onAdd: (kind:
       </div>
       {records.length ? (
         <div className="record-list">
-          {records.map((record) => <RecordItem record={record} key={`${record.kind}-${record.id}`} />)}
+          {records.map((record) => {
+            const decisionHistory = record.kind === "decision"
+              ? decisionHistoryStateFor(dashboard.records, record.id)
+              : { records: [], incomplete: false };
+            const expanded = record.kind === "decision" && expandedDecisionId === record.id;
+            return (
+              <RecordItem
+                record={record}
+                decisionHistory={decisionHistory.records}
+                decisionHistoryIncomplete={decisionHistory.incomplete}
+                historyExpanded={expanded}
+                key={`${record.kind}-${record.id}`}
+                onReplaceDecision={onReplaceDecision}
+                onToggleHistory={() => setExpandedDecisionId((current) => current === record.id ? undefined : record.id)}
+              />
+            );
+          })}
         </div>
       ) : (
         <EmptyState icon={<FileClock aria-hidden="true" />} title="当前筛选下没有记录" detail="相关决定和验证完成后会自动同步。" />
@@ -1873,9 +1964,57 @@ function RecordsView({ dashboard, onAdd }: { dashboard: Dashboard; onAdd: (kind:
   );
 }
 
-function RecordItem({ record }: { record: ProjectRecord }) {
+export function DecisionHistory({ records, incomplete = false }: { records: readonly ProjectRecord[]; incomplete?: boolean }) {
+  return (
+    <div className="decision-history" role="region" aria-label="决定历史">
+      <strong><History aria-hidden="true" />决定历史</strong>
+      <ol>
+        {records.map((record, index) => {
+          const current = index === 0 && isCurrentDecision(record);
+          return (
+            <li className={current ? "current" : "superseded"} key={record.id}>
+              <div className="decision-history-heading">
+                <span className={`record-status ${current ? "current" : "superseded"}`}>{current ? "当前决定" : "已替代"}</span>
+                <time>{formatDate(record.createdAt, true)}</time>
+              </div>
+              <h4>{record.title}</h4>
+              {record.summary && <p>{record.summary}</p>}
+              {record.evidence && <small>判断依据：{record.evidence}</small>}
+              {record.paths.length > 0 && <div className="scope-list compact">{record.paths.map((path) => <span key={path}>{path}</span>)}</div>}
+              {record.memberName && <small className="record-author">由 {record.memberName} 记录</small>}
+            </li>
+          );
+        })}
+      </ol>
+      {incomplete && (
+        <p className="decision-history-incomplete"><AlertTriangle aria-hidden="true" />更早决定未包含在当前刷新结果中。</p>
+      )}
+    </div>
+  );
+}
+
+export function RecordItem({
+  record,
+  decisionHistory = [],
+  decisionHistoryIncomplete = false,
+  historyExpanded = false,
+  onReplaceDecision,
+  onToggleHistory,
+}: {
+  record: ProjectRecord;
+  decisionHistory?: ProjectRecord[];
+  decisionHistoryIncomplete?: boolean;
+  historyExpanded?: boolean;
+  onReplaceDecision?: (decision: ProjectRecord) => void;
+  onToggleHistory?: () => void;
+}) {
   const isPassed = record.kind === "validation" && ["passed", "pass", "success"].includes(record.status ?? "");
   const isFailed = record.kind === "validation" && ["failed", "fail"].includes(record.status ?? "");
+  const canUpdateDecision = Boolean(record.id) && isCurrentDecision(record);
+  const hasDecisionHistory = canUpdateDecision && (
+    decisionHistory.length > 1 || Boolean(record.supersedesDecisionId)
+  );
+  const historyId = `decision-history-${record.id.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
   return (
     <article className={`record-item ${record.kind}`}>
       <span className={`record-icon ${isPassed ? "passed" : ""} ${isFailed ? "failed" : ""}`}>{recordIcon(record.kind)}</span>
@@ -1897,6 +2036,27 @@ function RecordItem({ record }: { record: ProjectRecord }) {
           </div>
         )}
         {record.memberName && <small className="record-author">由 {record.memberName} 记录</small>}
+        {canUpdateDecision && (
+          <div className="record-item-actions">
+            {hasDecisionHistory && (
+              <button
+                type="button"
+                className="text-button"
+                aria-controls={historyId}
+                aria-expanded={historyExpanded}
+                onClick={onToggleHistory}
+              >
+                <History aria-hidden="true" />{historyExpanded ? "收起历史" : "查看历史"}
+              </button>
+            )}
+            <button type="button" className="text-button" onClick={() => onReplaceDecision?.(record)}>
+              <PencilLine aria-hidden="true" />更新决定
+            </button>
+          </div>
+        )}
+        {historyExpanded && hasDecisionHistory && (
+          <div id={historyId}><DecisionHistory records={decisionHistory} incomplete={decisionHistoryIncomplete} /></div>
+        )}
       </div>
     </article>
   );
@@ -2215,8 +2375,21 @@ function CloseLeaseModal({ lease, onClose, onSubmit }: { lease: Lease; onClose: 
   );
 }
 
-function RecordModal({ kind, leases, members, onClose, onSubmit }: { kind: Exclude<RecordKind, "context">; leases: Lease[]; members: Dashboard["members"]; onClose: () => void; onSubmit: (input: CreateRecordInput) => Promise<void> }) {
-  const [values, setValues] = useState({ title: "", summary: "", paths: "", status: kind === "validation" ? "passed" : "", evidence: "", command: "", leaseId: "", toMemberId: "", completed: "", remaining: "", risks: "" });
+export function RecordModal({ kind, leases, members, supersedesDecision, onClose, onSubmit }: { kind: Exclude<RecordKind, "context">; leases: Lease[]; members: Dashboard["members"]; supersedesDecision?: ProjectRecord; onClose: () => void; onSubmit: (input: CreateRecordInput) => Promise<void> }) {
+  const effectiveKind = supersedesDecision ? "decision" : kind;
+  const [values, setValues] = useState({
+    title: supersedesDecision?.title ?? "",
+    summary: supersedesDecision?.summary ?? "",
+    paths: supersedesDecision?.paths.join("\n") ?? "",
+    status: effectiveKind === "validation" ? "passed" : "",
+    evidence: supersedesDecision?.evidence ?? "",
+    command: "",
+    leaseId: "",
+    toMemberId: "",
+    completed: "",
+    remaining: "",
+    risks: "",
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const titles = { decision: "记录团队决定", validation: "补充验证结果", handoff: "补充工作交接", risk: "登记项目风险" };
@@ -2226,8 +2399,8 @@ function RecordModal({ kind, leases, members, onClose, onSubmit }: { kind: Exclu
     setError("");
     try {
       await onSubmit({
-        kind,
-        title: values.title || recordLabel(kind),
+        kind: effectiveKind,
+        title: values.title || recordLabel(effectiveKind),
         summary: values.summary,
         paths: splitLines(values.paths),
         status: values.status || undefined,
@@ -2238,6 +2411,7 @@ function RecordModal({ kind, leases, members, onClose, onSubmit }: { kind: Exclu
         completed: splitLines(values.completed),
         remaining: splitLines(values.remaining),
         risks: splitLines(values.risks),
+        supersedesDecisionId: supersedesDecision?.id,
       });
       onClose();
     } catch (caught) {
@@ -2247,9 +2421,21 @@ function RecordModal({ kind, leases, members, onClose, onSubmit }: { kind: Exclu
     }
   };
   return (
-    <Modal title={titles[kind]} detail="这类信息通常由 Agent 自动记录，必要时可以在这里补充。" onClose={onClose}>
+    <Modal
+      title={supersedesDecision ? "更新团队决定" : titles[effectiveKind]}
+      detail={supersedesDecision
+        ? "保存后，原决定会标记为已替代并保留在决定历史中。"
+        : "这类信息通常由 Agent 自动记录，必要时可以在这里补充。"}
+      onClose={onClose}
+    >
       <form className="modal-form" onSubmit={submit}>
-        {kind === "validation" ? (
+        {supersedesDecision && (
+          <div className="decision-replacement-summary">
+            <History aria-hidden="true" />
+            <div><strong>正在更新既有决定</strong><span>{supersedesDecision.title}</span></div>
+          </div>
+        )}
+        {effectiveKind === "validation" ? (
           <Field label="验证类型">
             <select required value={values.title} onChange={(event) => setValues({ ...values, title: event.target.value })}>
               <option value="">请选择</option>
@@ -2261,16 +2447,16 @@ function RecordModal({ kind, leases, members, onClose, onSubmit }: { kind: Exclu
             </select>
           </Field>
         ) : (
-          <Field label="标题"><input required={kind !== "handoff"} maxLength={160} placeholder="简短描述这条记录" value={values.title} onChange={(event) => setValues({ ...values, title: event.target.value })} /></Field>
+          <Field label="标题"><input required={effectiveKind !== "handoff"} maxLength={160} placeholder="简短描述这条记录" value={values.title} onChange={(event) => setValues({ ...values, title: event.target.value })} /></Field>
         )}
-        <Field label={kind === "decision" ? "最终决定" : kind === "validation" ? "验证结果摘要" : kind === "handoff" ? "交接摘要" : "风险说明"}><textarea required rows={4} value={values.summary} onChange={(event) => setValues({ ...values, summary: event.target.value })} /></Field>
-        {kind === "validation" && <div className="field-grid two-columns"><Field label="结果"><select value={values.status} onChange={(event) => setValues({ ...values, status: event.target.value })}><option value="passed">通过</option><option value="failed">失败</option><option value="pending">待验证</option></select></Field><Field label="关联工作"><select value={values.leaseId} onChange={(event) => setValues({ ...values, leaseId: event.target.value })}><option value="">不指定</option>{leases.map((lease) => <option value={lease.id} key={lease.id}>{lease.title}</option>)}</select></Field></div>}
-        {kind === "handoff" && <><div className="field-grid two-columns"><Field label="交接给"><select value={values.toMemberId} onChange={(event) => setValues({ ...values, toMemberId: event.target.value })}><option value="">整个团队</option>{members.map((member) => <option value={member.id} key={member.id}>{member.name}</option>)}</select></Field><Field label="关联工作"><select value={values.leaseId} onChange={(event) => setValues({ ...values, leaseId: event.target.value })}><option value="">不指定</option>{leases.map((lease) => <option value={lease.id} key={lease.id}>{lease.title}</option>)}</select></Field></div><Field label="已完成"><textarea rows={2} placeholder="每行一项" value={values.completed} onChange={(event) => setValues({ ...values, completed: event.target.value })} /></Field><div className="field-grid two-columns"><Field label="待处理"><textarea rows={2} value={values.remaining} onChange={(event) => setValues({ ...values, remaining: event.target.value })} /></Field><Field label="风险"><textarea rows={2} value={values.risks} onChange={(event) => setValues({ ...values, risks: event.target.value })} /></Field></div></>}
-        {kind !== "handoff" && <Field label="涉及范围" hint="可留空；每行一个相对路径。"><textarea className="path-input" rows={3} value={values.paths} onChange={(event) => setValues({ ...values, paths: event.target.value })} /></Field>}
-        {(kind === "decision" || kind === "validation") && <Field label={kind === "decision" ? "判断依据" : "证据或观察"}><textarea rows={2} value={values.evidence} onChange={(event) => setValues({ ...values, evidence: event.target.value })} /></Field>}
-        {kind === "validation" && <Field label="执行命令"><input placeholder="没有命令可留空" value={values.command} onChange={(event) => setValues({ ...values, command: event.target.value })} /></Field>}
+        <Field label={effectiveKind === "decision" ? "最终决定" : effectiveKind === "validation" ? "验证结果摘要" : effectiveKind === "handoff" ? "交接摘要" : "风险说明"}><textarea required rows={4} value={values.summary} onChange={(event) => setValues({ ...values, summary: event.target.value })} /></Field>
+        {effectiveKind === "validation" && <div className="field-grid two-columns"><Field label="结果"><select value={values.status} onChange={(event) => setValues({ ...values, status: event.target.value })}><option value="passed">通过</option><option value="failed">失败</option><option value="pending">待验证</option></select></Field><Field label="关联工作"><select value={values.leaseId} onChange={(event) => setValues({ ...values, leaseId: event.target.value })}><option value="">不指定</option>{leases.map((lease) => <option value={lease.id} key={lease.id}>{lease.title}</option>)}</select></Field></div>}
+        {effectiveKind === "handoff" && <><div className="field-grid two-columns"><Field label="交接给"><select value={values.toMemberId} onChange={(event) => setValues({ ...values, toMemberId: event.target.value })}><option value="">整个团队</option>{members.map((member) => <option value={member.id} key={member.id}>{member.name}</option>)}</select></Field><Field label="关联工作"><select value={values.leaseId} onChange={(event) => setValues({ ...values, leaseId: event.target.value })}><option value="">不指定</option>{leases.map((lease) => <option value={lease.id} key={lease.id}>{lease.title}</option>)}</select></Field></div><Field label="已完成"><textarea rows={2} placeholder="每行一项" value={values.completed} onChange={(event) => setValues({ ...values, completed: event.target.value })} /></Field><div className="field-grid two-columns"><Field label="待处理"><textarea rows={2} value={values.remaining} onChange={(event) => setValues({ ...values, remaining: event.target.value })} /></Field><Field label="风险"><textarea rows={2} value={values.risks} onChange={(event) => setValues({ ...values, risks: event.target.value })} /></Field></div></>}
+        {effectiveKind !== "handoff" && <Field label="涉及范围" hint="可留空；每行一个相对路径。"><textarea className="path-input" rows={3} value={values.paths} onChange={(event) => setValues({ ...values, paths: event.target.value })} /></Field>}
+        {(effectiveKind === "decision" || effectiveKind === "validation") && <Field label={effectiveKind === "decision" ? "判断依据" : "证据或观察"}><textarea required={Boolean(supersedesDecision)} rows={2} value={values.evidence} onChange={(event) => setValues({ ...values, evidence: event.target.value })} /></Field>}
+        {effectiveKind === "validation" && <Field label="执行命令"><input placeholder="没有命令可留空" value={values.command} onChange={(event) => setValues({ ...values, command: event.target.value })} /></Field>}
         {error && <div className="form-error"><AlertTriangle aria-hidden="true" />{error}</div>}
-        <div className="modal-actions"><button type="button" className="text-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <Check aria-hidden="true" />}保存记录</button></div>
+        <div className="modal-actions"><button type="button" className="text-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <Check aria-hidden="true" />}{supersedesDecision ? "保存更新" : "保存记录"}</button></div>
       </form>
     </Modal>
   );
@@ -2312,7 +2498,7 @@ function DashboardApp({
   };
 
   const refresh = useCallback(async (quiet = false) => {
-    if (leaving) return;
+    if (leaving) return false;
     if (!quiet) setRefreshing(true);
     try {
       const next = await getDashboard(session, session.roomToken);
@@ -2328,11 +2514,13 @@ function DashboardApp({
       // 容量受控的部分响应仍代表连接成功；只有传输或数据契约失败才进入陈旧状态。
       setSyncState(dashboardSyncStateForPartialSections(partialSections));
       setError(partial ? dashboardPartialRefreshMessage(partialSections) : "");
+      return true;
     } catch (caught) {
       // 数据契约或响应体错误只会让缓存数据变旧，不能伪装成房间断线。
       const failureState = classifyDashboardRefreshFailure(caught);
       setSyncState(failureState);
       setError(dashboardRefreshErrorMessage(caught, failureState));
+      return false;
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -2441,9 +2629,21 @@ function DashboardApp({
   };
 
   const handleRecord = async (input: CreateRecordInput) => {
-    await createRecord(session, input);
-    setNotice({ tone: "success", message: "记录已同步给房间内的 Agent。" });
-    await refresh(true);
+    try {
+      await createRecord(session, input);
+      setNotice({ tone: "success", message: input.supersedesDecisionId ? "新决定已生效，原决定已保留到历史中。" : "记录已同步给房间内的 Agent。" });
+      await refresh(true);
+    } catch (caught) {
+      if (caught instanceof ApiError && caught.code === "decision_already_superseded") {
+        const refreshed = await refresh(true);
+        const recovery = decisionReplacementConflictRecovery(caught, refreshed);
+        if (!recovery) throw caught;
+        if (recovery.closeModal) setActiveModal(null);
+        setNotice(recovery.notice);
+        return;
+      }
+      throw caught;
+    }
   };
 
   const handleReleaseRequest = async (requestId: string, decision: "approve" | "reject", reason?: string) => {
@@ -2498,8 +2698,8 @@ function DashboardApp({
           <DesktopUpdateControl onNotice={(message, tone = "success") => setNotice({ message, tone })} />
           {error && <div className="inline-alert"><AlertTriangle aria-hidden="true" />{error}</div>}
           {view === "work" && <WorkView dashboard={dashboard} access={session} busyLeaseId={busyLeaseId} transientConflicts={transientConflicts} now={leaseNow} onClaim={() => openModal({ type: "claim" })} onRenew={handleRenew} onClose={(lease) => openModal({ type: "close", lease })} />}
-          {view === "records" && <RecordsView dashboard={dashboard} onAdd={(recordKind) => openModal({ type: "record", recordKind })} />}
-          {view === "management" && <ManagementView dashboard={dashboard} session={session} onRefresh={() => refresh(true)} onNotice={(message, tone = "success") => setNotice({ message, tone })} />}
+          {view === "records" && <RecordsView dashboard={dashboard} onAdd={(recordKind) => openModal({ type: "record", recordKind })} onReplaceDecision={(decision) => openModal({ type: "replace-decision", decision })} />}
+          {view === "management" && <ManagementView dashboard={dashboard} session={session} onRefresh={async () => { await refresh(true); }} onNotice={(message, tone = "success") => setNotice({ message, tone })} />}
           {view === "connection" && <ConnectionView dashboard={dashboard} session={session} syncState={syncState} now={leaseNow} deleting={deletingCurrentConnection} onRemoveLocal={onDeleteCurrentConnection} />}
         </main>
       </div>
@@ -2507,6 +2707,7 @@ function DashboardApp({
       {activeModal?.type === "release" && activeReleaseRequest && <ReleaseRequestModal request={activeReleaseRequest} onClose={dismissReleaseRequest} onResolve={(decision, reason) => handleReleaseRequest(activeReleaseRequest.id, decision, reason)} />}
       {activeModal?.type === "close" && <CloseLeaseModal lease={activeModal.lease} onClose={() => setActiveModal(null)} onSubmit={handleClose} />}
       {activeModal?.type === "record" && <RecordModal kind={activeModal.recordKind} leases={dashboard.leases} members={dashboard.members} onClose={() => setActiveModal(null)} onSubmit={handleRecord} />}
+      {activeModal?.type === "replace-decision" && <RecordModal kind="decision" leases={dashboard.leases} members={dashboard.members} supersedesDecision={activeModal.decision} onClose={() => setActiveModal(null)} onSubmit={handleRecord} />}
       {notice && <div className={`toast ${notice.tone}`} role="status">{notice.tone === "success" ? <CheckCircle2 aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}<span>{notice.message}</span><IconButton label="关闭提示" onClick={() => setNotice(null)}><X aria-hidden="true" /></IconButton></div>}
     </div>
   );

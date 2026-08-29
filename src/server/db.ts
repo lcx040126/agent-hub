@@ -195,6 +195,8 @@ export class AgentHubDatabase {
         id TEXT PRIMARY KEY,
         room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
         author_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'current' CHECK (status IN ('current', 'superseded')),
+        supersedes_decision_id TEXT REFERENCES decisions(id) ON DELETE SET NULL,
         title TEXT NOT NULL,
         decision TEXT NOT NULL,
         rationale TEXT,
@@ -444,6 +446,27 @@ export class AgentHubDatabase {
       );
       CREATE INDEX IF NOT EXISTS feature_confirmations_session_idx
         ON feature_change_confirmations(session_id, status, expires_at);
+    `);
+    const decisionColumns = this.connection
+      .prepare("PRAGMA table_info(decisions)")
+      .all() as Array<{ name: string }>;
+    if (!decisionColumns.some((column) => column.name === "status")) {
+      this.connection.exec(
+        "ALTER TABLE decisions ADD COLUMN status TEXT NOT NULL DEFAULT 'current' CHECK (status IN ('current', 'superseded'))",
+      );
+    }
+    if (!decisionColumns.some((column) => column.name === "supersedes_decision_id")) {
+      this.connection.exec(
+        "ALTER TABLE decisions ADD COLUMN supersedes_decision_id TEXT REFERENCES decisions(id) ON DELETE SET NULL",
+      );
+    }
+    // v0.2.6 的上下文导入会分别生成决定和 records 投影的 ID。只有字段完全一致且
+    // 一一对应时才修复投影 ID，避免把独立手工记录误归到某条决定上。
+    repairLegacyImportedDecisionRecordIds(this.connection);
+    this.connection.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS decisions_single_successor_idx
+      ON decisions(supersedes_decision_id)
+      WHERE supersedes_decision_id IS NOT NULL;
     `);
     const operationColumns = this.connection
       .prepare("PRAGMA table_info(session_operations)")
@@ -799,6 +822,128 @@ export class AgentHubDatabase {
     } catch (error) {
       this.connection.exec("ROLLBACK");
       throw error;
+    }
+  }
+}
+
+interface LegacyDecisionProjection {
+  readonly rowId: number;
+  readonly id: string;
+  readonly roomId: string;
+  readonly memberId: string;
+  readonly status: "current" | "superseded";
+  readonly title: string;
+  readonly summary: string;
+  readonly pathsJson: string;
+  readonly evidenceJson: string;
+  readonly createdAt: string;
+}
+
+function repairLegacyImportedDecisionRecordIds(connection: DatabaseSync): void {
+  const decisions = connection.prepare(`
+    SELECT d.rowid AS row_id, d.id, d.room_id, d.author_member_id,
+      d.status, d.title, d.decision, d.paths_json, d.rationale, d.created_at
+    FROM decisions d
+    WHERE NOT EXISTS (SELECT 1 FROM records linked WHERE linked.id = d.id)
+    ORDER BY d.rowid
+  `).all() as Array<{
+    row_id: number;
+    id: string;
+    room_id: string;
+    author_member_id: string;
+    status: "current" | "superseded";
+    title: string;
+    decision: string;
+    paths_json: string;
+    rationale: string | null;
+    created_at: string;
+  }>;
+  const records = connection.prepare(`
+    SELECT r.rowid AS row_id, r.id, r.room_id, r.member_id, r.title, r.summary,
+      r.paths_json, r.evidence_json, r.created_at
+    FROM records r
+    WHERE r.kind = 'decision'
+      AND NOT EXISTS (SELECT 1 FROM decisions linked WHERE linked.id = r.id)
+    ORDER BY r.rowid
+  `).all() as Array<{
+    row_id: number;
+    id: string;
+    room_id: string;
+    member_id: string;
+    title: string;
+    summary: string;
+    paths_json: string;
+    evidence_json: string;
+    created_at: string;
+  }>;
+  if (decisions.length === 0 || records.length === 0) return;
+
+  const decisionGroups = new Map<string, LegacyDecisionProjection[]>();
+  const recordGroups = new Map<string, LegacyDecisionProjection[]>();
+  const add = (
+    groups: Map<string, LegacyDecisionProjection[]>,
+    projection: LegacyDecisionProjection,
+  ) => {
+    const key = JSON.stringify([
+      projection.roomId,
+      projection.memberId,
+      projection.title,
+      projection.summary,
+      projection.pathsJson,
+      projection.evidenceJson,
+      projection.createdAt,
+    ]);
+    const group = groups.get(key) ?? [];
+    group.push(projection);
+    groups.set(key, group);
+  };
+  for (const decision of decisions) {
+    add(decisionGroups, {
+      rowId: decision.row_id,
+      id: decision.id,
+      roomId: decision.room_id,
+      memberId: decision.author_member_id,
+      status: decision.status,
+      title: decision.title,
+      summary: decision.decision,
+      pathsJson: decision.paths_json,
+      evidenceJson: JSON.stringify(decision.rationale ? [decision.rationale] : []),
+      createdAt: decision.created_at,
+    });
+  }
+  for (const record of records) {
+    add(recordGroups, {
+      rowId: record.row_id,
+      id: record.id,
+      roomId: record.room_id,
+      memberId: record.member_id,
+      status: "current",
+      title: record.title,
+      summary: record.summary,
+      pathsJson: record.paths_json,
+      evidenceJson: record.evidence_json,
+      createdAt: record.created_at,
+    });
+  }
+
+  const updateActivity = connection.prepare(`
+    UPDATE activities SET entity_id = ?
+    WHERE entity_type = 'record' AND entity_id = ?
+  `);
+  const updateRecord = connection.prepare(`
+    UPDATE records SET id = ?, status = ?
+    WHERE id = ? AND kind = 'decision'
+  `);
+  for (const [key, decisionGroup] of decisionGroups) {
+    const recordGroup = recordGroups.get(key);
+    if (!recordGroup || recordGroup.length !== decisionGroup.length) continue;
+    decisionGroup.sort((left, right) => left.rowId - right.rowId);
+    recordGroup.sort((left, right) => left.rowId - right.rowId);
+    for (let index = 0; index < decisionGroup.length; index += 1) {
+      const decision = decisionGroup[index];
+      const record = recordGroup[index];
+      updateActivity.run(decision.id, record.id);
+      updateRecord.run(decision.id, decision.status, record.id);
     }
   }
 }

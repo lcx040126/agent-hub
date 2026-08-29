@@ -206,6 +206,9 @@ export interface Decision {
   roomId: string;
   authorMemberId: string;
   authorName: string;
+  status: "current" | "superseded";
+  supersedesDecisionId: string | null;
+  supersededByDecisionId: string | null;
   title: string;
   decision: string;
   rationale: string | null;
@@ -619,6 +622,8 @@ export interface ProjectRecord {
   status: string;
   evidence: string[];
   commitHash: string | null;
+  supersedesDecisionId?: string | null;
+  supersededByDecisionId?: string | null;
   createdAt: string;
 }
 
@@ -680,7 +685,7 @@ export interface RoomSettings {
 
 export interface ContextExport {
   format: "agent-hub-context";
-  version: 1;
+  version: 1 | 2;
   room: { id: string; name: string; projectName: string };
   exportedAt: string;
   contextEntries: Array<Omit<ContextEntry, "id" | "roomId" | "authorMemberId"> & { originalId?: string }>;
@@ -720,6 +725,7 @@ export interface AddDecisionInput {
   decision: string;
   rationale?: string;
   paths?: string[];
+  supersedesDecisionId?: string;
 }
 
 export interface AddVerificationInput {

@@ -10,7 +10,7 @@ const SERVER_INSTRUCTIONS = [
   "1. If Codex SessionStart context supplies an Agent Hub sessionId, reuse that exact Hook session for every MCP tool and do not call session_open. Otherwise call session_open once, retain its returned session.id, then call context_query for the paths and systems involved.",
   "2. Call lease_acquire with that sessionId before writing. Only decision=deny stops writing. A conflict with blocking severity but decision=warn is a writable high-risk warning.",
   "3. Call edit_check with the same sessionId before touching newly discovered paths, and call lease_renew with it while long-running work is active.",
-  "4. Use event_append with the same sessionId to record decisions, verification evidence, risks, and handoffs as they occur.",
+  "4. Use event_append with the same sessionId to record decisions, verification evidence, risks, and handoffs as they occur. To replace an existing decision, pass supersedesDecisionId only after the current user explicitly confirms the changed decision, and include the replacement rationale.",
   "5. Use feature_context_query during planning and before related edits. When protection is enabled and edit_check requires historical confirmation, ask the current member and call feature_change_confirm only after an explicit answer. In monitor-only mode historical confirmation is advisory: report the warning, but do not stop writing for that confirmation. Lease conflicts remain governed by step 2's decision=deny rule.",
   "6. Submit a structured feature revision before finishing coding work. When the session came from Codex SessionStart, record the outcome with event_append and leave closing to SessionEnd; never call session_close for that Hook session. Only call session_close for a fallback session created by session_open, including when fallback work is incomplete. Never claim compatibility without relevant verification.",
   "Handle technical coordination automatically. Ask a human only when requirements or business rules genuinely conflict.",
@@ -207,6 +207,7 @@ const decisionEventSchema = z.object({
   decision: z.string().trim().min(1).max(20_000),
   rationale: optionalLongText,
   paths: pathsSchema.optional(),
+  supersedesDecisionId: z.string().trim().min(1).max(128).optional(),
 });
 
 const verificationEventSchema = z.object({
@@ -264,6 +265,7 @@ const eventAppendDiscoverableSchema = z.object({
   paths: pathsSchema.optional(),
   decision: z.string().trim().min(1).max(20_000).optional(),
   rationale: optionalLongText,
+  supersedesDecisionId: z.string().trim().min(1).max(128).optional(),
   leaseId: z.string().trim().min(1).max(128).optional(),
   result: z.enum(["passed", "failed", "pending"]).optional(),
   summary: z.string().trim().min(1).max(10_000).optional(),
@@ -577,7 +579,7 @@ function createServer(service: AgentHubServiceLike, context: AgentHubToolContext
     {
       title: "Append collaboration evidence",
       description:
-        "Record a context note, technical decision, verification result, or handoff in the shared room timeline.",
+        "Record a context note, technical decision, verification result, or handoff in the shared room timeline. Replace a current decision only after explicit user confirmation by passing its exact supersedesDecisionId and a non-empty rationale; history is preserved.",
       inputSchema: eventAppendDiscoverableSchema,
       annotations: {
         readOnlyHint: false,

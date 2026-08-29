@@ -103,6 +103,8 @@ describe("createRequestPlan", () => {
       { method: "POST", path: "/api/features/revisions", body: {} },
       { method: "POST", path: "/api/features/feature_01/rollback", body: {} },
       { method: "POST", path: "/api/feature-confirmations/confirmation_01/resolve", body: {} },
+      { method: "POST", path: "/api/decisions/decision_01/supersede", body: {} },
+      { method: "POST", path: "/api/decisions/decision_01-abc/supersede", body: {} },
       { method: "POST", path: "/api/sessions/session_01/heartbeat", body: {} },
     ];
 
@@ -127,6 +129,37 @@ describe("createRequestPlan", () => {
         true,
       ),
     ).toThrow(/not allowed/i);
+    expect(() =>
+      createRequestPlan(
+        { method: "POST", path: `/api/decisions/${"x".repeat(129)}/supersede`, body: {} },
+        "https://hub.example",
+        "secret",
+        true,
+      ),
+    ).toThrow(/not allowed/i);
+  });
+
+  it("allows only strict decision supersession paths", () => {
+    expect(createRequestPlan(
+      { method: "POST", path: "/api/decisions/decision_01-abc/supersede", body: {} },
+      "https://hub.example",
+      "secret",
+      true,
+    ).url).toBe("https://hub.example/api/decisions/decision_01-abc/supersede");
+
+    const rejectedPaths = [
+      "/api/decisions/%2e%2e/supersede",
+      "/api/decisions/decision_01/supersede?force=true",
+      `/api/decisions/${"a".repeat(129)}/supersede`,
+    ];
+    for (const path of rejectedPaths) {
+      expect(() => createRequestPlan(
+        { method: "POST", path, body: {} },
+        "https://hub.example",
+        "secret",
+        true,
+      )).toThrow();
+    }
   });
 
   it("rejects tokens and oversized JSON in request bodies", () => {

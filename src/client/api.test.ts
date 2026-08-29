@@ -3,6 +3,7 @@ import {
   activateSavedConnection,
   ApiError,
   createLease,
+  createRecord,
   createRoom,
   deleteSavedConnection,
   getDashboard,
@@ -79,6 +80,216 @@ afterEach(() => {
 });
 
 describe("desktop room transport", () => {
+  it("sends the fixed decision predecessor when replacing a decision", async () => {
+    const requestRoomServer = vi.fn(async () => ({
+      status: 201,
+      body: { decision: { supersedesDecisionId: "decision-old" } },
+    }));
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: { requestRoomServer },
+      },
+    });
+
+    await createRecord(desktopSession("connection-a"), {
+      kind: "decision",
+      title: "背包容量规则",
+      summary: "背包满时将奖励发往邮箱。",
+      paths: ["src/inventory"],
+      evidence: "避免奖励丢失。",
+      supersedesDecisionId: "decision-old",
+    });
+
+    expect(requestRoomServer).toHaveBeenCalledWith(expect.objectContaining({
+      method: "POST",
+      path: "/api/decisions/decision-old/supersede",
+      body: {
+        paths: ["src/inventory"],
+        title: "背包容量规则",
+        decision: "背包满时将奖励发往邮箱。",
+        rationale: "避免奖励丢失。",
+        supersedesDecisionId: "decision-old",
+      },
+    }));
+  });
+
+  it("does not fall back to an independent record when replacement is unsupported", async () => {
+    const requestRoomServer = vi.fn(async () => ({
+      status: 404,
+      body: { error: "not_found", message: "Endpoint not found." },
+    }));
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: { requestRoomServer },
+      },
+    });
+
+    await expect(createRecord(desktopSession("connection-a"), {
+      kind: "decision",
+      title: "背包容量规则",
+      summary: "新的规则。",
+      evidence: "新的判断依据。",
+      supersedesDecisionId: "decision-old",
+    })).rejects.toMatchObject({
+      status: 409,
+      code: "decision_supersession_unsupported",
+    });
+    expect(requestRoomServer).toHaveBeenCalledTimes(1);
+    expect(requestRoomServer).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: "/api/records",
+    }));
+  });
+
+  it("requires the server to confirm the exact replacement relationship", async () => {
+    const requestRoomServer = vi.fn(async () => ({
+      status: 201,
+      body: { decision: { id: "decision-new", supersedesDecisionId: null } },
+    }));
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: { requestRoomServer },
+      },
+    });
+
+    await expect(createRecord(desktopSession("connection-a"), {
+      kind: "decision",
+      title: "背包容量规则",
+      summary: "新的规则。",
+      evidence: "新的判断依据。",
+      supersedesDecisionId: "decision-old",
+    })).rejects.toMatchObject({
+      status: 409,
+      code: "decision_supersession_unconfirmed",
+    });
+  });
+
+  it("translates a concurrent decision replacement conflict", async () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: {
+          requestRoomServer: vi.fn(async () => ({
+            status: 409,
+            body: {
+              error: "decision_already_superseded",
+              details: { currentDecisionId: "decision-current" },
+            },
+          })),
+        },
+      },
+    });
+
+    await expect(createRecord(desktopSession("connection-a"), {
+      kind: "decision",
+      title: "背包容量规则",
+      summary: "新的规则。",
+      evidence: "新的判断依据。",
+      supersedesDecisionId: "decision-old",
+    })).rejects.toMatchObject({
+      status: 409,
+      code: "decision_already_superseded",
+      message: "这条决定已被其他成员更新，请刷新后基于当前决定重试。",
+      details: { currentDecisionId: "decision-current" },
+    });
+  });
+
+  it("deduplicates snapshot decision projections while preserving replacement links", async () => {
+    const projectedDecision = {
+      id: "decision-current",
+      kind: "decision",
+      title: "当前背包规则",
+      summary: "背包满时将奖励发往邮箱。",
+      memberName: "成员 A",
+      paths: ["src/inventory"],
+      status: "current",
+      evidence: ["避免奖励丢失。"],
+      supersedesDecisionId: "decision-old",
+      createdAt: "2026-08-29T08:00:00.000Z",
+    };
+    const requestRoomServer = vi.fn(async (input: { path: string }) => input.path === "/api/dashboard"
+      ? { status: 404, body: { error: "not_found" } }
+      : {
+          status: 200,
+          body: {
+            room: desktopSession("connection-a").room,
+            currentMember: desktopSession("connection-a").member,
+            members: [],
+            activeLeases: [],
+            records: [
+              projectedDecision,
+              {
+                ...projectedDecision,
+                id: "decision-old",
+                title: "旧背包规则",
+                status: "superseded",
+                supersedesDecisionId: undefined,
+                supersededByDecisionId: "decision-current",
+                createdAt: "2026-08-28T08:00:00.000Z",
+              },
+            ],
+            decisions: [
+              {
+                id: "decision-current",
+                title: "当前背包规则",
+                decision: "背包满时将奖励发往邮箱。",
+                rationale: "避免奖励丢失。",
+                authorName: "成员 A",
+                paths: ["src/inventory"],
+                status: "current",
+                supersedesDecisionId: "decision-old",
+                createdAt: "2026-08-29T08:00:00.000Z",
+              },
+              {
+                id: "decision-old",
+                title: "旧背包规则",
+                decision: "背包满时保留在场景。",
+                authorName: "成员 A",
+                paths: ["src/inventory"],
+                status: "superseded",
+                supersededByDecisionId: "decision-current",
+                createdAt: "2026-08-28T08:00:00.000Z",
+              },
+            ],
+            verifications: [],
+            handoffs: [],
+            contextEntries: [],
+            sessions: [],
+            localScans: [],
+            activities: [],
+            server: { mcpUrl: "http://127.0.0.1:4173/mcp" },
+          },
+        });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: { requestRoomServer },
+      },
+    });
+
+    const result = await getDashboard(desktopSession("connection-a"));
+
+    expect(result.records).toHaveLength(2);
+    expect(result.records[0]).toMatchObject({
+      id: "decision-current",
+      status: "current",
+      evidence: "避免奖励丢失。",
+      supersedesDecisionId: "decision-old",
+    });
+    expect(result.records[1]).toMatchObject({
+      id: "decision-old",
+      status: "superseded",
+      supersededByDecisionId: "decision-current",
+    });
+  });
+
   it("sends only manual standard or exclusive lease kinds from the UI client", async () => {
     const requestRoomServer = vi.fn(async (_input: { body?: unknown }) => ({
       status: 200,

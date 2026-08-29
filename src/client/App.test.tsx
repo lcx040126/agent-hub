@@ -2,9 +2,12 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DeleteConnectionModal,
+  DecisionHistory,
   EntryScreen,
   ConflictList,
   ManagementView,
+  RecordModal,
+  RecordsView,
   SavedConnectionList,
   WorkItem,
   WorkView,
@@ -13,8 +16,11 @@ import {
   dashboardPartialRefreshMessage,
   dashboardSyncStateForPartialSections,
   dashboardClockOffsetMs,
+  decisionReplacementConflictRecovery,
+  decisionHistoryStateFor,
   formatLeaseExpiryCountdown,
   isRealtimeAgentSession,
+  isCurrentDecision,
   isValidLease,
   nextPendingReleaseRequestId,
   noticeForActivatedConnection,
@@ -25,8 +31,9 @@ import {
   ScopeEventRow,
   shortIdentifier,
   splitVisibleLeases,
+  visibleProjectRecords,
 } from "./App";
-import { ApiError, type Conflict, type Dashboard, type Lease, type SavedRoomConnection, type Session } from "./api";
+import { ApiError, type Conflict, type Dashboard, type Lease, type ProjectRecord, type SavedRoomConnection, type Session } from "./api";
 
 const originalWindow = globalThis.window;
 const LEASE_NOW = Date.parse("2026-08-27T08:00:00.000Z");
@@ -88,8 +95,149 @@ function dashboard(overrides: Partial<Dashboard> = {}): Dashboard {
   };
 }
 
+function projectRecord(overrides: Partial<ProjectRecord> = {}): ProjectRecord {
+  return {
+    id: "decision-current",
+    kind: "decision",
+    title: "当前背包规则",
+    summary: "背包满时将奖励发往邮箱。",
+    memberName: "成员 B",
+    paths: ["src/inventory"],
+    status: "current",
+    evidence: "避免奖励丢失。",
+    createdAt: "2026-08-29T08:00:00.000Z",
+    ...overrides,
+  };
+}
+
 afterEach(() => {
   Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
+});
+
+describe("decision replacement presentation", () => {
+  it("closes a stale replacement modal and warns after a concurrent replacement", () => {
+    const conflict = new ApiError(
+      "already superseded",
+      409,
+      "decision_already_superseded",
+      { currentDecisionId: "decision-current" },
+    );
+    expect(decisionReplacementConflictRecovery(conflict, true)).toEqual({
+      closeModal: true,
+      notice: {
+        tone: "warning",
+        message: "这条决定已被其他成员更新。当前决定已刷新，请基于最新决定重新操作。",
+      },
+    });
+    expect(decisionReplacementConflictRecovery(conflict, false)?.notice.message).toBe(
+      "这条决定已被其他成员更新，但当前决定刷新失败。请恢复连接并刷新后再操作。",
+    );
+    expect(decisionReplacementConflictRecovery(new ApiError("offline", 0), false)).toBeNull();
+  });
+
+  it("hides superseded decisions from the default list and count while keeping legacy accepted decisions current", () => {
+    const oldDecision = projectRecord({
+      id: "decision-old",
+      title: "旧背包规则",
+      status: "superseded",
+      createdAt: "2026-08-27T08:00:00.000Z",
+    });
+    const currentDecision = projectRecord({
+      supersedesDecisionId: oldDecision.id,
+    });
+    const legacyDecision = projectRecord({
+      id: "decision-legacy",
+      title: "旧版仍有效决定",
+      status: "accepted",
+    });
+    const records = [currentDecision, oldDecision, legacyDecision];
+
+    expect(isCurrentDecision(oldDecision)).toBe(false);
+    expect(isCurrentDecision(legacyDecision)).toBe(true);
+    expect(visibleProjectRecords(records).map((record) => record.id)).toEqual([
+      "decision-current",
+      "decision-legacy",
+    ]);
+
+    const markup = renderToStaticMarkup(
+      <RecordsView
+        dashboard={dashboard({ records })}
+        onAdd={() => undefined}
+        onReplaceDecision={() => undefined}
+      />,
+    );
+    expect(markup).toContain("<b>2</b> 项决定");
+    expect(markup).toContain("当前背包规则");
+    expect(markup).toContain("旧版仍有效决定");
+    expect(markup).not.toContain("旧背包规则");
+    expect(markup).toContain("查看历史");
+    expect(markup.match(/更新决定/g)).toHaveLength(2);
+  });
+
+  it("builds newest-to-oldest history and stops at missing links or cycles", () => {
+    const oldest = projectRecord({ id: "decision-a", status: "superseded", title: "第一版" });
+    const previous = projectRecord({
+      id: "decision-b",
+      status: "superseded",
+      title: "第二版",
+      supersedesDecisionId: oldest.id,
+    });
+    const current = projectRecord({
+      id: "decision-c",
+      title: "第三版",
+      supersedesDecisionId: previous.id,
+    });
+
+    const historyState = decisionHistoryStateFor([oldest, previous, current], current.id);
+    const history = historyState.records;
+    expect(history.map((record) => record.id)).toEqual(["decision-c", "decision-b", "decision-a"]);
+    expect(historyState.incomplete).toBe(false);
+
+    const missingHistoryState = decisionHistoryStateFor([current], current.id);
+    expect(missingHistoryState.records.map((record) => record.id)).toEqual(["decision-c"]);
+    expect(missingHistoryState.incomplete).toBe(true);
+
+    const cycleA = projectRecord({ id: "cycle-a", supersedesDecisionId: "cycle-b" });
+    const cycleB = projectRecord({ id: "cycle-b", status: "superseded", supersedesDecisionId: "cycle-a" });
+    const cycleHistoryState = decisionHistoryStateFor([cycleA, cycleB], cycleA.id);
+    expect(cycleHistoryState.records.map((record) => record.id)).toEqual([
+      "cycle-a",
+      "cycle-b",
+    ]);
+    expect(cycleHistoryState.incomplete).toBe(false);
+
+    const markup = renderToStaticMarkup(<DecisionHistory records={history} incomplete={historyState.incomplete} />);
+    expect(markup.indexOf("第三版")).toBeLessThan(markup.indexOf("第二版"));
+    expect(markup.indexOf("第二版")).toBeLessThan(markup.indexOf("第一版"));
+    expect(markup).toContain("当前决定");
+    expect(markup.match(/已替代/g)).toHaveLength(2);
+    expect(markup).not.toContain("更早决定未包含在当前刷新结果中。");
+
+    const incompleteMarkup = renderToStaticMarkup(
+      <DecisionHistory records={missingHistoryState.records} incomplete={missingHistoryState.incomplete} />,
+    );
+    expect(incompleteMarkup).toContain("更早决定未包含在当前刷新结果中。");
+  });
+
+  it("prefills replacement fields and requires a new rationale", () => {
+    const markup = renderToStaticMarkup(
+      <RecordModal
+        kind="decision"
+        leases={[]}
+        members={[]}
+        supersedesDecision={projectRecord()}
+        onClose={() => undefined}
+        onSubmit={async () => undefined}
+      />,
+    );
+
+    expect(markup).toContain("更新团队决定");
+    expect(markup).toContain('value="当前背包规则"');
+    expect(markup).toContain("背包满时将奖励发往邮箱。");
+    expect(markup).toContain("src/inventory");
+    expect(markup).toMatch(/判断依据<\/span><textarea required=""/);
+    expect(markup).toContain("保存更新");
+  });
 });
 
 describe("dashboard modal coordination", () => {

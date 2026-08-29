@@ -294,6 +294,44 @@ describe("Agent Hub MCP session lifecycle", () => {
     })).toThrow(expect.objectContaining({ code: "lease_session_mismatch", status: 409 }));
   });
 
+  it("passes an explicitly confirmed decision replacement through event_append", async () => {
+    const { service, adapter, context } = setup();
+    const opened = await adapter.sessionOpen(context, { objective: "Revise inventory capacity" }) as OpenResult;
+    const original = await adapter.eventAppend(context, {
+      sessionId: opened.session.id,
+      eventType: "decision",
+      title: "Inventory capacity",
+      decision: "Use 20 backpack slots.",
+      rationale: "Initial confirmed scope.",
+      paths: ["Assets/Inventory"],
+    }) as { id: string };
+    const replacement = await adapter.eventAppend(context, {
+      sessionId: opened.session.id,
+      eventType: "decision",
+      title: "Inventory capacity",
+      decision: "Use 24 backpack slots.",
+      rationale: "The current user explicitly confirmed the revised capacity.",
+      paths: ["Assets/Inventory"],
+      supersedesDecisionId: original.id,
+    }) as { id: string; supersedesDecisionId: string | null };
+
+    expect(replacement.supersedesDecisionId).toBe(original.id);
+    const records = service.getDashboard(context.memberToken).records
+      .filter((record) => record.kind === "decision");
+    expect(records).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: original.id,
+        status: "superseded",
+        supersededByDecisionId: replacement.id,
+      }),
+      expect.objectContaining({
+        id: replacement.id,
+        status: "current",
+        supersedesDecisionId: original.id,
+      }),
+    ]));
+  });
+
   it("cancels the canonical MCP Agent lease while preserving manual and other-session work", async () => {
     const { service, adapter, context } = setup();
     const first = await adapter.sessionOpen(context, { objective: "First task" }) as OpenResult;

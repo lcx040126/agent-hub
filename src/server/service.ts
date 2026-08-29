@@ -89,6 +89,7 @@ const DEFAULT_AUTOMATIC_TTL_MINUTES = 10;
 const DEFAULT_MAXIMUM_EXCLUSIVE_LEASE_MINUTES = 24 * 60;
 const RELEASE_REQUEST_COOLDOWN_MS = 2 * 60 * 1000;
 const MAX_ACTIVITY_LIMIT = 200;
+const CONTEXT_EXPORT_ENTRY_LIMIT = 500;
 const FEATURE_SUBMITTED_TARGET_PATHS_KEY = "agentHubSubmittedTargetPaths";
 
 type Row = Record<string, unknown>;
@@ -1160,9 +1161,45 @@ export class AgentHubService {
   exportContext(memberToken: string): ContextExport {
     const auth = this.authenticateMemberToken(memberToken);
     this.requireAdmin(auth);
+    const counts = this.database.connection.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM context_entries WHERE room_id = ?) AS context_entries,
+        (SELECT COUNT(*) FROM decisions WHERE room_id = ?) AS decisions,
+        (SELECT COUNT(*) FROM verifications WHERE room_id = ?) AS verifications,
+        (SELECT COUNT(*) FROM handoffs WHERE room_id = ?) AS handoffs,
+        (SELECT COUNT(*) FROM records WHERE room_id = ?) AS records
+    `).get(
+      auth.room.id,
+      auth.room.id,
+      auth.room.id,
+      auth.room.id,
+      auth.room.id,
+    ) as Row;
+    const oversized = [
+      ["contextEntries", Number(counts.context_entries ?? 0)],
+      ["decisions", Number(counts.decisions ?? 0)],
+      ["verifications", Number(counts.verifications ?? 0)],
+      ["handoffs", Number(counts.handoffs ?? 0)],
+      ["records", Number(counts.records ?? 0)],
+    ] as const;
+    const oversizedSection = oversized.find(([, count]) => count > CONTEXT_EXPORT_ENTRY_LIMIT);
+    if (oversizedSection) {
+      throw new AgentHubError(
+        "context_export_too_large",
+        `Context export section ${oversizedSection[0]} contains ${oversizedSection[1]} records; the complete-export limit is ${CONTEXT_EXPORT_ENTRY_LIMIT}.`,
+        409,
+        {
+          section: oversizedSection[0],
+          count: oversizedSection[1],
+          limit: CONTEXT_EXPORT_ENTRY_LIMIT,
+        },
+      );
+    }
     const exported: ContextExport = {
       format: "agent-hub-context",
-      version: 1,
+      // v2 prevents older clients from accepting replacement fields and silently
+      // restoring every historical decision as current.
+      version: 2,
       room: { id: auth.room.id, name: auth.room.name, projectName: auth.room.projectName },
       exportedAt: this.timestamp(),
       contextEntries: this.listContextEntries(auth.room.id).map(({ id, roomId, authorMemberId, ...entry }) => ({ ...entry, originalId: id })),
@@ -1183,32 +1220,74 @@ export class AgentHubService {
     const auth = this.authenticateMemberToken(input.memberToken);
     this.requireAdmin(auth);
     const payload = input.payload as Partial<ContextExport>;
-    if (!payload || payload.format !== "agent-hub-context" || payload.version !== 1) throw new AgentHubError("invalid_context_export", "Unsupported context export format.");
+    if (
+      !payload
+      || payload.format !== "agent-hub-context"
+      || (payload.version !== 1 && payload.version !== 2)
+    ) throw new AgentHubError("invalid_context_export", "Unsupported context export format.");
     const arrays = [payload.contextEntries, payload.decisions, payload.verifications, payload.handoffs, payload.records];
-    if (arrays.some((items) => !Array.isArray(items) || items.length > 500)) throw new AgentHubError("invalid_context_export", "Context export contains too many records.");
-    let imported = 0;
+    if (arrays.some((items) => !Array.isArray(items) || items.length > CONTEXT_EXPORT_ENTRY_LIMIT)) throw new AgentHubError("invalid_context_export", "Context export contains too many records.");
+    const decisionImport = prepareImportedDecisions(
+      payload.decisions ?? [],
+      payload.records ?? [],
+    );
+    const imported = arrays.reduce((total, items) => total + (items?.length ?? 0), 0);
     const now = this.timestamp();
     this.database.transaction(() => {
       for (const entry of payload.contextEntries ?? []) {
         const value = entry as any;
-        this.database.connection.prepare("INSERT INTO context_entries (id, room_id, author_member_id, kind, title, content, paths_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, value.kind, requiredString(value.title, "Context title", 200), requiredString(value.content, "Context content", 20000), json(normalizePathList(value.paths ?? [], true).map((p) => p.path)), now, now); imported++;
+        this.database.connection.prepare("INSERT INTO context_entries (id, room_id, author_member_id, kind, title, content, paths_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, value.kind, requiredString(value.title, "Context title", 200), requiredString(value.content, "Context content", 20000), json(normalizePathList(value.paths ?? [], true).map((p) => p.path)), now, now);
       }
-      for (const entry of payload.decisions ?? []) {
-        const value = entry as any;
-        this.database.connection.prepare("INSERT INTO decisions (id, room_id, author_member_id, title, decision, rationale, paths_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, requiredString(value.title, "Decision title", 200), requiredString(value.decision, "Decision", 20000), optionalString(value.rationale, "Rationale", 10000) ?? null, json(normalizePathList(value.paths ?? [], true).map((p) => p.path)), now); imported++;
+      for (const decision of decisionImport.decisions) {
+        this.database.connection.prepare(`
+          INSERT INTO decisions (
+            id, room_id, author_member_id, status, supersedes_decision_id,
+            title, decision, rationale, paths_json, created_at
+          ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+        `).run(
+          decision.id,
+          auth.room.id,
+          auth.member.id,
+          decision.status,
+          decision.title,
+          decision.decision,
+          decision.rationale,
+          json(decision.paths),
+          now,
+        );
+      }
+      for (const decision of decisionImport.decisions) {
+        if (!decision.supersedesDecisionId) continue;
+        this.database.connection.prepare(`
+          UPDATE decisions SET supersedes_decision_id = ? WHERE id = ?
+        `).run(decision.supersedesDecisionId, decision.id);
+      }
+      for (const decision of decisionImport.decisions) {
+        this.insertRecord(auth, {
+          id: decision.id,
+          kind: "decision",
+          title: decision.title,
+          summary: decision.decision,
+          paths: decision.paths,
+          status: decision.status,
+          evidence: decision.rationale ? [decision.rationale] : [],
+          commitHash: null,
+          createdAt: now,
+        });
       }
       for (const entry of payload.verifications ?? []) {
         const value = entry as any;
-        this.database.connection.prepare("INSERT INTO verifications (id, room_id, author_member_id, lease_id, kind, result, summary, command, evidence, created_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, value.kind, value.result, requiredString(value.summary, "Verification summary", 10000), optionalString(value.command, "Command", 10000) ?? null, optionalString(value.evidence, "Evidence", 10000) ?? null, now); imported++;
+        this.database.connection.prepare("INSERT INTO verifications (id, room_id, author_member_id, lease_id, kind, result, summary, command, evidence, created_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, value.kind, value.result, requiredString(value.summary, "Verification summary", 10000), optionalString(value.command, "Command", 10000) ?? null, optionalString(value.evidence, "Evidence", 10000) ?? null, now);
       }
       for (const entry of payload.handoffs ?? []) {
         const value = entry as any;
-        this.database.connection.prepare("INSERT INTO handoffs (id, room_id, from_member_id, to_member_id, lease_id, summary, completed_json, remaining_json, risks_json, created_at) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, requiredString(value.summary, "Handoff summary", 10000), json(stringArray(value.completed, "Completed", 100, 2000)), json(stringArray(value.remaining, "Remaining", 100, 2000)), json(stringArray(value.risks, "Risks", 100, 2000)), now); imported++;
+        this.database.connection.prepare("INSERT INTO handoffs (id, room_id, from_member_id, to_member_id, lease_id, summary, completed_json, remaining_json, risks_json, created_at) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)").run(randomUUID(), auth.room.id, auth.member.id, requiredString(value.summary, "Handoff summary", 10000), json(stringArray(value.completed, "Completed", 100, 2000)), json(stringArray(value.remaining, "Remaining", 100, 2000)), json(stringArray(value.risks, "Risks", 100, 2000)), now);
       }
-      for (const entry of payload.records ?? []) {
+      for (const [index, entry] of (payload.records ?? []).entries()) {
+        if (decisionImport.decisionRecordIndexes.has(index)) continue;
         const value = entry as any;
         const kind = normalizeRecordKind(value.kind);
-        this.insertRecord(auth, { kind, title: requiredString(value.title, "Record title", 200), summary: requiredString(value.summary, "Record summary", 12000), paths: normalizePathList(value.paths ?? [], true).map((p) => p.path), status: optionalString(value.status, "Record status", 100) ?? defaultRecordStatus(kind), evidence: stringArray(value.evidence, "Record evidence", 100, 4000), commitHash: optionalString(value.commitHash, "Commit hash", 255) ?? null, createdAt: now }); imported++;
+        this.insertRecord(auth, { kind, title: requiredString(value.title, "Record title", 200), summary: requiredString(value.summary, "Record summary", 12000), paths: normalizePathList(value.paths ?? [], true).map((p) => p.path), status: optionalString(value.status, "Record status", 100) ?? defaultRecordStatus(kind), evidence: stringArray(value.evidence, "Record evidence", 100, 4000), commitHash: optionalString(value.commitHash, "Commit hash", 255) ?? null, createdAt: now });
       }
       this.auditRecord(auth, "room.context.imported", "room", auth.room.id, `${auth.member.displayName} imported shared context.`, { imported });
     });
@@ -1230,10 +1309,14 @@ export class AgentHubService {
         relevant(lease.paths.map((path) => path.path)),
       ),
       contextEntries: snapshot.contextEntries.filter((entry) => relevant(entry.paths)),
-      decisions: snapshot.decisions.filter((entry) => relevant(entry.paths)),
+      decisions: snapshot.decisions.filter((entry) =>
+        entry.status === "current" && relevant(entry.paths),
+      ),
       verifications: snapshot.verifications,
       handoffs: snapshot.handoffs,
-      records: this.listRecords(snapshot.room.id).filter((entry) => relevant(entry.paths)),
+      records: snapshot.records.filter((entry) =>
+        (entry.kind !== "decision" || entry.status !== "superseded") && relevant(entry.paths),
+      ),
       sessions: snapshot.sessions,
       localScans: snapshot.localScans.filter((scan) => relevant(scan.changedPaths)),
       generatedAt: snapshot.generatedAt,
@@ -2753,28 +2836,82 @@ export class AgentHubService {
 
   addDecision(input: AddDecisionInput): Decision {
     const auth = this.authenticateMemberToken(input.memberToken);
+    const supersedesDecisionId = optionalString(
+      input.supersedesDecisionId,
+      "Superseded decision id",
+      128,
+    );
+    const rationale = supersedesDecisionId
+      ? requiredString(input.rationale, "Replacement rationale", 12000)
+      : optionalString(input.rationale, "Rationale", 12000);
     const decision: Decision = {
       id: randomUUID(),
       roomId: auth.room.id,
       authorMemberId: auth.member.id,
       authorName: auth.member.displayName,
+      status: "current",
+      supersedesDecisionId: supersedesDecisionId ?? null,
+      supersededByDecisionId: null,
       title: requiredString(input.title, "Decision title", 200),
       decision: requiredString(input.decision, "Decision", 12000),
-      rationale: optionalString(input.rationale, "Rationale", 12000),
+      rationale,
       paths: normalizePathList(input.paths ?? [], true).map((path) => path.path),
       createdAt: this.timestamp(),
     };
     this.database.transaction(() => {
+      if (supersedesDecisionId) {
+        const previous = this.database.connection.prepare(`
+          SELECT d.*, m.name AS author_name,
+            successor.id AS superseded_by_decision_id
+          FROM decisions d
+          JOIN members m ON m.id = d.author_member_id
+          LEFT JOIN decisions successor ON successor.supersedes_decision_id = d.id
+          WHERE d.id = ? AND d.room_id = ?
+        `).get(supersedesDecisionId, auth.room.id) as Row | undefined;
+        if (!previous) {
+          throw new AgentHubError(
+            "decision_not_found",
+            "The decision to supersede was not found in this room.",
+            404,
+          );
+        }
+        const previousDecision = mapDecision(previous);
+        if (previousDecision.status !== "current") {
+          throw new AgentHubError(
+            "decision_already_superseded",
+            "The selected decision has already been superseded.",
+            409,
+            { currentDecisionId: previousDecision.supersededByDecisionId },
+          );
+        }
+        const updated = this.database.connection.prepare(`
+          UPDATE decisions SET status = 'superseded'
+          WHERE id = ? AND room_id = ? AND status = 'current'
+        `).run(previousDecision.id, auth.room.id);
+        if (updated.changes !== 1) {
+          throw new AgentHubError(
+            "decision_already_superseded",
+            "The selected decision was superseded concurrently.",
+            409,
+          );
+        }
+        this.database.connection.prepare(`
+          UPDATE records SET status = 'superseded'
+          WHERE id = ? AND room_id = ? AND kind = 'decision'
+        `).run(previousDecision.id, auth.room.id);
+      }
       this.database.connection
         .prepare(`
           INSERT INTO decisions
-            (id, room_id, author_member_id, title, decision, rationale, paths_json, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (id, room_id, author_member_id, status, supersedes_decision_id,
+             title, decision, rationale, paths_json, created_at)
+          VALUES (?, ?, ?, 'current', ?, ?, ?, ?, ?, ?)
         `)
         .run(
           decision.id,
           decision.roomId,
           decision.authorMemberId,
+          decision.supersedesDecisionId,
           decision.title,
           decision.decision,
           decision.rationale,
@@ -2787,13 +2924,16 @@ export class AgentHubService {
         title: decision.title,
         summary: decision.decision,
         paths: decision.paths,
-        status: "accepted",
+        status: "current",
         evidence: decision.rationale ? [decision.rationale] : [],
         commitHash: null,
         createdAt: decision.createdAt,
       });
-      this.auditRecord(auth, "decision.added", "decision", decision.id, `Recorded decision: ${decision.title}.`, {
+      this.auditRecord(auth, supersedesDecisionId ? "decision.superseded" : "decision.added", "decision", decision.id, supersedesDecisionId
+        ? `Replaced decision ${supersedesDecisionId}: ${decision.title}.`
+        : `Recorded decision: ${decision.title}.`, {
         paths: decision.paths,
+        supersedesDecisionId,
       });
     });
     return decision;
@@ -4845,8 +4985,10 @@ export class AgentHubService {
   private listDecisions(roomId: string): Decision[] {
     const rows = this.database.connection
       .prepare(`
-        SELECT d.*, m.name AS author_name
+        SELECT d.*, m.name AS author_name,
+          successor.id AS superseded_by_decision_id
         FROM decisions d JOIN members m ON m.id = d.author_member_id
+        LEFT JOIN decisions successor ON successor.supersedes_decision_id = d.id
         WHERE d.room_id = ? ORDER BY d.created_at DESC LIMIT 500
       `)
       .all(roomId) as Row[];
@@ -4880,9 +5022,18 @@ export class AgentHubService {
   private listRecords(roomId: string): ProjectRecord[] {
     const rows = this.database.connection
       .prepare(`
-        SELECT r.*, m.name AS member_name
+        SELECT r.*, m.name AS member_name,
+          decision.supersedes_decision_id,
+          successor.id AS superseded_by_decision_id
         FROM records r JOIN members m ON m.id = r.member_id
-        WHERE r.room_id = ? ORDER BY r.created_at DESC LIMIT 500
+        LEFT JOIN decisions decision ON decision.id = r.id AND decision.room_id = r.room_id
+        LEFT JOIN decisions successor ON successor.supersedes_decision_id = decision.id
+        WHERE r.room_id = ?
+        ORDER BY CASE
+          WHEN r.kind = 'decision' AND r.status <> 'superseded' THEN 0
+          ELSE 1
+        END, r.created_at DESC
+        LIMIT 500
       `)
       .all(roomId) as Row[];
     return rows.map(mapRecord);
@@ -5776,6 +5927,9 @@ function mapDecision(row: Row): Decision {
     roomId: asString(row.room_id),
     authorMemberId: asString(row.author_member_id),
     authorName: asString(row.author_name),
+    status: asString(row.status ?? "current") as Decision["status"],
+    supersedesDecisionId: nullableString(row.supersedes_decision_id),
+    supersededByDecisionId: nullableString(row.superseded_by_decision_id),
     title: asString(row.title),
     decision: asString(row.decision),
     rationale: nullableString(row.rationale),
@@ -5830,6 +5984,8 @@ function mapRecord(row: Row): ProjectRecord {
     status: asString(row.status),
     evidence: parseStringArray(row.evidence_json),
     commitHash: nullableString(row.commit_hash),
+    supersedesDecisionId: nullableString(row.supersedes_decision_id),
+    supersededByDecisionId: nullableString(row.superseded_by_decision_id),
     createdAt: asString(row.created_at),
   };
 }
@@ -5993,6 +6149,280 @@ function normalizeMaximumExclusiveLeaseMinutes(value: number): number {
     );
   }
   return value;
+}
+
+interface ImportedDecisionPlan {
+  id: string;
+  originalId: string | null;
+  sourceSupersedesDecisionId: string | null;
+  supersedesDecisionId: string | null;
+  sourceStatus: string | null;
+  status: Decision["status"];
+  title: string;
+  decision: string;
+  rationale: string | null;
+  paths: string[];
+}
+
+interface ImportedDecisionRecordPlan {
+  index: number;
+  originalId: string | null;
+  sourceSupersedesDecisionId: string | null;
+  sourceStatus: string | null;
+  title: string;
+  decision: string;
+  rationale: string | null;
+  paths: string[];
+  evidenceCount: number;
+}
+
+function prepareImportedDecisions(
+  decisionEntries: readonly unknown[],
+  recordEntries: readonly unknown[],
+): { decisions: ImportedDecisionPlan[]; decisionRecordIndexes: Set<number> } {
+  const decisions: ImportedDecisionPlan[] = [];
+  const byOriginalId = new Map<string, ImportedDecisionPlan>();
+  const decisionRecordIndexes = new Set<number>();
+  const decisionRecordOriginalIds = new Set<string>();
+
+  const objectValue = (entry: unknown, label: string): Row => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new AgentHubError("invalid_context_export", `${label} must be an object.`);
+    }
+    return entry as Row;
+  };
+  const register = (plan: Omit<ImportedDecisionPlan, "id" | "supersedesDecisionId" | "status">) => {
+    if (plan.originalId && byOriginalId.has(plan.originalId)) {
+      throw new AgentHubError(
+        "invalid_context_export",
+        `Decision originalId ${plan.originalId} is duplicated.`,
+      );
+    }
+    const registered: ImportedDecisionPlan = {
+      ...plan,
+      id: randomUUID(),
+      supersedesDecisionId: null,
+      status: "current",
+    };
+    decisions.push(registered);
+    if (registered.originalId) byOriginalId.set(registered.originalId, registered);
+    return registered;
+  };
+
+  for (const entry of decisionEntries) {
+    const value = objectValue(entry, "Decision entry");
+    register({
+      originalId: optionalString(value.originalId, "Decision original id", 128),
+      sourceSupersedesDecisionId: optionalString(
+        value.supersedesDecisionId,
+        "Superseded decision id",
+        128,
+      ),
+      sourceStatus: optionalString(value.status, "Decision status", 32),
+      title: requiredString(value.title, "Decision title", 200),
+      decision: requiredString(value.decision, "Decision", 20000),
+      rationale: optionalString(value.rationale, "Rationale", 10000),
+      paths: normalizePathList(
+        stringArray(value.paths, "Decision paths", 500, 4000),
+        true,
+      ).map((path) => path.path),
+    });
+  }
+
+  const decisionRecords: ImportedDecisionRecordPlan[] = [];
+  for (const [index, entry] of recordEntries.entries()) {
+    const value = objectValue(entry, "Record entry");
+    const kind = normalizeRecordKind(value.kind as RecordKind);
+    if (kind !== "decision") continue;
+    decisionRecordIndexes.add(index);
+    const originalId = optionalString(value.originalId, "Record original id", 128);
+    if (originalId) {
+      if (decisionRecordOriginalIds.has(originalId)) {
+        throw new AgentHubError(
+          "invalid_context_export",
+          `Decision record originalId ${originalId} is duplicated.`,
+        );
+      }
+      decisionRecordOriginalIds.add(originalId);
+    }
+    const sourceSupersedesDecisionId = optionalString(
+      value.supersedesDecisionId,
+      "Superseded decision id",
+      128,
+    );
+    const evidence = stringArray(value.evidence, "Record evidence", 100, 4000);
+    decisionRecords.push({
+      index,
+      originalId,
+      sourceSupersedesDecisionId,
+      sourceStatus: optionalString(value.status, "Record status", 32),
+      title: requiredString(value.title, "Record title", 200),
+      decision: requiredString(value.summary, "Record summary", 12000),
+      rationale: evidence[0] ?? null,
+      paths: normalizePathList(
+        stringArray(value.paths, "Record paths", 500, 4000),
+        true,
+      ).map((path) => path.path),
+      evidenceCount: evidence.length,
+    });
+  }
+
+  const fingerprint = (value: Pick<ImportedDecisionPlan, "title" | "decision" | "rationale" | "paths">) =>
+    JSON.stringify([value.title, value.decision, value.rationale, value.paths]);
+  const normalizeSourceStatus = (value: string | null) => value === "accepted" ? "current" : value;
+  const pairedDecisionIds = new Set<string>();
+  const pairedRecordIndexes = new Set<number>();
+  const pairedRecords = new Map<string, ImportedDecisionRecordPlan>();
+  const pair = (decision: ImportedDecisionPlan, record: ImportedDecisionRecordPlan) => {
+    if (
+      pairedDecisionIds.has(decision.id)
+      || record.evidenceCount > 1
+      || fingerprint(decision) !== fingerprint(record)
+    ) {
+      throw new AgentHubError(
+        "invalid_context_export",
+        `Decision record ${record.originalId ?? record.index} conflicts with its decision projection.`,
+      );
+    }
+    const decisionStatus = normalizeSourceStatus(decision.sourceStatus);
+    const recordStatus = normalizeSourceStatus(record.sourceStatus);
+    if (decisionStatus && recordStatus && decisionStatus !== recordStatus) {
+      throw new AgentHubError(
+        "invalid_context_export",
+        `Decision record ${record.originalId ?? record.index} has a conflicting status.`,
+      );
+    }
+    if (!decision.sourceStatus && record.sourceStatus) decision.sourceStatus = record.sourceStatus;
+    pairedDecisionIds.add(decision.id);
+    pairedRecordIndexes.add(record.index);
+    pairedRecords.set(decision.id, record);
+    if (record.originalId && record.originalId !== decision.originalId) {
+      byOriginalId.set(record.originalId, decision);
+    }
+  };
+
+  // 新格式按相同 originalId 配对。v0.2.6 导入后再导出的备份会让决定与
+  // records 投影拥有不同 ID，因此第二阶段只对字段完全一致且数量一一对应的组配对。
+  for (const record of decisionRecords) {
+    const exact = record.originalId ? byOriginalId.get(record.originalId) : undefined;
+    if (exact) pair(exact, record);
+  }
+  const decisionsByFingerprint = new Map<string, ImportedDecisionPlan[]>();
+  for (const decision of decisions) {
+    if (pairedDecisionIds.has(decision.id)) continue;
+    const key = fingerprint(decision);
+    const group = decisionsByFingerprint.get(key) ?? [];
+    group.push(decision);
+    decisionsByFingerprint.set(key, group);
+  }
+  const recordsByFingerprint = new Map<string, ImportedDecisionRecordPlan[]>();
+  for (const record of decisionRecords) {
+    if (pairedRecordIndexes.has(record.index)) continue;
+    const key = fingerprint(record);
+    const group = recordsByFingerprint.get(key) ?? [];
+    group.push(record);
+    recordsByFingerprint.set(key, group);
+  }
+  for (const [key, records] of recordsByFingerprint) {
+    const candidates = decisionsByFingerprint.get(key);
+    if (!candidates || candidates.length !== records.length) continue;
+    for (let index = 0; index < records.length; index += 1) {
+      pair(candidates[index], records[index]);
+    }
+  }
+  for (const record of decisionRecords) {
+    if (pairedRecordIndexes.has(record.index)) continue;
+    register({
+      originalId: record.originalId,
+      sourceSupersedesDecisionId: record.sourceSupersedesDecisionId,
+      sourceStatus: record.sourceStatus,
+      title: record.title,
+      decision: record.decision,
+      rationale: record.rationale,
+      paths: record.paths,
+    });
+  }
+
+  for (const decision of decisions) {
+    const record = pairedRecords.get(decision.id);
+    if (!record?.sourceSupersedesDecisionId) continue;
+    if (!decision.sourceSupersedesDecisionId) {
+      decision.sourceSupersedesDecisionId = record.sourceSupersedesDecisionId;
+      continue;
+    }
+    const decisionTarget = byOriginalId.get(decision.sourceSupersedesDecisionId)?.id
+      ?? `missing:${decision.sourceSupersedesDecisionId}`;
+    const recordTarget = byOriginalId.get(record.sourceSupersedesDecisionId)?.id
+      ?? `missing:${record.sourceSupersedesDecisionId}`;
+    if (decisionTarget !== recordTarget) {
+      throw new AgentHubError(
+        "invalid_context_export",
+        `Decision record ${record.originalId ?? record.index} has a conflicting replacement target.`,
+      );
+    }
+  }
+
+  const byId = new Map(decisions.map((decision) => [decision.id, decision]));
+  const successorByDecisionId = new Map<string, string>();
+  for (const decision of decisions) {
+    if (!decision.sourceSupersedesDecisionId) continue;
+    const previous = byOriginalId.get(decision.sourceSupersedesDecisionId);
+    if (!previous) {
+      throw new AgentHubError(
+        "invalid_context_export",
+        `Replacement target ${decision.sourceSupersedesDecisionId} is missing from the export.`,
+      );
+    }
+    if (previous.id === decision.id) {
+      throw new AgentHubError("invalid_context_export", "A decision cannot replace itself.");
+    }
+    if (successorByDecisionId.has(previous.id)) {
+      throw new AgentHubError(
+        "invalid_context_export",
+        `Decision ${decision.sourceSupersedesDecisionId} has more than one replacement.`,
+      );
+    }
+    decision.supersedesDecisionId = previous.id;
+    successorByDecisionId.set(previous.id, decision.id);
+  }
+
+  for (const decision of decisions) {
+    const visited = new Set<string>();
+    let cursor: ImportedDecisionPlan | undefined = decision;
+    while (cursor) {
+      if (visited.has(cursor.id)) {
+        throw new AgentHubError("invalid_context_export", "Decision replacement history contains a cycle.");
+      }
+      visited.add(cursor.id);
+      cursor = cursor.supersedesDecisionId
+        ? byId.get(cursor.supersedesDecisionId)
+        : undefined;
+    }
+  }
+
+  for (const decision of decisions) {
+    const derivedStatus: Decision["status"] = successorByDecisionId.has(decision.id)
+      ? "superseded"
+      : "current";
+    const sourceStatus = decision.sourceStatus === "accepted"
+      ? "current"
+      : decision.sourceStatus;
+    if (sourceStatus && sourceStatus !== "current" && sourceStatus !== "superseded") {
+      throw new AgentHubError(
+        "invalid_context_export",
+        `Unsupported decision status ${decision.sourceStatus}.`,
+      );
+    }
+    if (sourceStatus && sourceStatus !== derivedStatus) {
+      throw new AgentHubError(
+        "invalid_context_export",
+        "Decision status does not match its replacement history.",
+      );
+    }
+    decision.status = derivedStatus;
+  }
+
+  return { decisions, decisionRecordIndexes };
 }
 
 function normalizeRecordKind(kind: RecordKind): RecordKind {

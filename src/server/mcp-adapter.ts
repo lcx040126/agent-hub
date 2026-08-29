@@ -718,6 +718,7 @@ function appendEvent(service: AgentHubService, memberToken: string, input: Event
         decision: input.decision,
         rationale: input.rationale,
         paths: input.paths,
+        supersedesDecisionId: input.supersedesDecisionId,
       });
     case "verification":
       return service.addVerification({

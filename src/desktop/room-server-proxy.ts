@@ -44,6 +44,7 @@ const SAVED_POST_ROUTES = [
   /^\/api\/feature-confirmations\/[A-Za-z0-9_-]{1,128}\/resolve$/,
   /^\/api\/records$/,
   /^\/api\/decisions$/,
+  /^\/api\/decisions\/[A-Za-z0-9_-]{1,128}\/supersede$/,
   /^\/api\/verifications$/,
   /^\/api\/handoffs$/,
   /^\/api\/sessions$/,

@@ -532,6 +532,20 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       decision: value(body, "decision", "summary"),
       rationale: optionalValue(body, "rationale"),
       paths: stringArrayValue(body.paths),
+      supersedesDecisionId: optionalNonEmptyValue(body, "supersedesDecisionId"),
+    });
+    response.status(201).json({ decision });
+  });
+
+  app.post("/api/decisions/:id/supersede", (request, response) => {
+    const body = bodyObject(request);
+    const decision = service.addDecision({
+      memberToken: bearerToken(request),
+      title: value(body, "title"),
+      decision: value(body, "decision", "summary"),
+      rationale: optionalValue(body, "rationale"),
+      paths: stringArrayValue(body.paths),
+      supersedesDecisionId: parameter(request, "id"),
     });
     response.status(201).json({ decision });
   });
@@ -836,6 +850,8 @@ function recordResponse(record: ReturnType<AgentHubService["addRecord"]>) {
     status: record.status,
     evidence: record.evidence,
     commitHash: record.commitHash ?? undefined,
+    supersedesDecisionId: record.supersedesDecisionId ?? undefined,
+    supersededByDecisionId: record.supersededByDecisionId ?? undefined,
     memberId: record.memberId,
     memberName: record.memberName,
     createdAt: record.createdAt,
@@ -1006,6 +1022,15 @@ function optionalValue(body: Record<string, unknown>, ...keys: string[]): string
     if (typeof body[key] === "string") return body[key];
   }
   return undefined;
+}
+
+function optionalNonEmptyValue(body: Record<string, unknown>, key: string): string | undefined {
+  if (!(key in body)) return undefined;
+  const candidate = body[key];
+  if (typeof candidate !== "string" || candidate.trim().length === 0) {
+    throw new AgentHubError("invalid_input", `${key} must be a non-empty string.`);
+  }
+  return candidate;
 }
 
 function stringArrayValue(value: unknown): string[] {

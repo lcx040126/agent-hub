@@ -752,6 +752,155 @@ describe("Agent Hub database migrations", () => {
     reopened.close();
   });
 
+  it("repairs an early schema 6 database that predates decision replacement columns", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-hub-early-schema6-decision-db-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "agent-hub.sqlite");
+    createHistoricalDatabaseFixture(databasePath, 5);
+    const earlySchema6 = new DatabaseSync(databasePath);
+    earlySchema6.exec(`
+      CREATE TABLE records (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('decision', 'validation', 'handoff', 'risk')),
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        paths_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        commit_hash TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE decisions (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        author_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        rationale TEXT,
+        paths_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO decisions (
+        id, room_id, author_member_id, title, decision, rationale, paths_json, created_at
+      ) VALUES (
+        'early-schema6-decision', 'schema5-room', 'schema5-member',
+        'Existing decision', 'Keep the existing behavior.', 'Previously confirmed.', '[]',
+        '2026-08-20T09:00:00.000Z'
+      );
+      INSERT INTO records (
+        id, room_id, member_id, kind, title, summary, paths_json, status,
+        evidence_json, commit_hash, created_at
+      ) VALUES (
+        'legacy-imported-record', 'schema5-room', 'schema5-member', 'decision',
+        'Existing decision', 'Keep the existing behavior.', '[]', 'accepted',
+        '["Previously confirmed."]', NULL, '2026-08-20T09:00:00.000Z'
+      );
+      PRAGMA user_version = 6;
+    `);
+    earlySchema6.close();
+
+    const repaired = new AgentHubDatabase({ path: databasePath });
+    expect(repaired.connection.prepare(`
+      SELECT id, status, supersedes_decision_id FROM decisions
+      WHERE id = 'early-schema6-decision'
+    `).get()).toEqual({
+      id: "early-schema6-decision",
+      status: "current",
+      supersedes_decision_id: null,
+    });
+    expect(repaired.connection.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'decisions_single_successor_idx'
+    `).get()).toEqual({ name: "decisions_single_successor_idx" });
+    expect(repaired.connection.prepare(`
+      SELECT id, status FROM records WHERE title = 'Existing decision'
+    `).get()).toEqual({ id: "early-schema6-decision", status: "current" });
+    repaired.connection.prepare(`
+      INSERT INTO decisions (
+        id, room_id, author_member_id, status, supersedes_decision_id,
+        title, decision, rationale, paths_json, created_at
+      ) VALUES (?, 'schema5-room', 'schema5-member', 'current',
+        'early-schema6-decision', ?, ?, ?, '[]', ?)
+    `).run(
+      "first-successor",
+      "First replacement",
+      "Use the first replacement.",
+      "Confirmed by the user.",
+      "2026-08-20T10:00:00.000Z",
+    );
+    expect(() => repaired.connection.prepare(`
+      INSERT INTO decisions (
+        id, room_id, author_member_id, status, supersedes_decision_id,
+        title, decision, rationale, paths_json, created_at
+      ) VALUES (?, 'schema5-room', 'schema5-member', 'current',
+        'early-schema6-decision', ?, ?, ?, '[]', ?)
+    `).run(
+      "second-successor",
+      "Second replacement",
+      "This branch must fail.",
+      "Conflicting replacement.",
+      "2026-08-20T10:01:00.000Z",
+    )).toThrow(/UNIQUE constraint failed/);
+    repaired.connection.exec(`
+      INSERT INTO decisions (
+        id, room_id, author_member_id, status, supersedes_decision_id,
+        title, decision, rationale, paths_json, created_at
+      ) VALUES (
+        'split-superseded-decision', 'schema5-room', 'schema5-member',
+        'superseded', NULL, 'Historical superseded decision',
+        'Keep the old choice only in history.', 'The team later changed it.', '[]',
+        '2026-08-20T11:00:00.000Z'
+      );
+      INSERT INTO records (
+        id, room_id, member_id, kind, title, summary, paths_json, status,
+        evidence_json, commit_hash, created_at
+      ) VALUES (
+        'legacy-split-superseded-record', 'schema5-room', 'schema5-member',
+        'decision', 'Historical superseded decision',
+        'Keep the old choice only in history.', '[]', 'accepted',
+        '["The team later changed it."]', NULL, '2026-08-20T11:00:00.000Z'
+      );
+      INSERT INTO decisions (
+        id, room_id, author_member_id, status, supersedes_decision_id,
+        title, decision, rationale, paths_json, created_at
+      ) VALUES (
+        'split-current-successor', 'schema5-room', 'schema5-member', 'current',
+        'split-superseded-decision', 'Current successor decision',
+        'Use the replacement choice.', 'The replacement was confirmed.', '[]',
+        '2026-08-20T12:00:00.000Z'
+      );
+      INSERT INTO records (
+        id, room_id, member_id, kind, title, summary, paths_json, status,
+        evidence_json, commit_hash, created_at
+      ) VALUES (
+        'split-current-successor', 'schema5-room', 'schema5-member', 'decision',
+        'Current successor decision', 'Use the replacement choice.', '[]',
+        'current', '["The replacement was confirmed."]', NULL,
+        '2026-08-20T12:00:00.000Z'
+      );
+    `);
+    expect(repaired.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    repaired.close();
+
+    const statusRepaired = new AgentHubDatabase({ path: databasePath });
+    expect(statusRepaired.connection.prepare(`
+      SELECT id, status FROM records WHERE title = 'Historical superseded decision'
+    `).get()).toEqual({ id: "split-superseded-decision", status: "superseded" });
+    expect(statusRepaired.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    statusRepaired.connection.prepare("DELETE FROM rooms WHERE id = 'schema5-room'").run();
+    expect(statusRepaired.connection.prepare("SELECT COUNT(*) AS count FROM decisions").get())
+      .toEqual({ count: 0 });
+    expect(statusRepaired.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    statusRepaired.close();
+
+    const reopened = new AgentHubDatabase({ path: databasePath });
+    expect(reopened.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
+    expect(reopened.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    reopened.close();
+  });
+
   it("migrates duplicate Codex sessions from the v0.2.2 schema 3 layout", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-hub-schema3-codex-session-db-"));
     temporaryDirectories.push(directory);

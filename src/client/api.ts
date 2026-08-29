@@ -93,6 +93,8 @@ export type ProjectRecord = {
   evidence?: string;
   command?: string;
   commitHash?: string;
+  supersedesDecisionId?: string;
+  supersededByDecisionId?: string;
   createdAt?: string;
   details?: string[];
 };
@@ -397,6 +399,7 @@ export type CreateRecordInput = {
   completed?: string[];
   remaining?: string[];
   risks?: string[];
+  supersedesDecisionId?: string;
 };
 
 export type LeaseDecision = {
@@ -669,6 +672,8 @@ function normalizeGenericRecord(value: unknown, fallbackKind: RecordKind): Proje
     evidence,
     command: asString(record.command) || undefined,
     commitHash: asString(record.commitHash) || undefined,
+    supersedesDecisionId: asString(record.supersedesDecisionId) || undefined,
+    supersededByDecisionId: asString(record.supersededByDecisionId) || undefined,
     createdAt: asString(record.createdAt) || undefined,
   };
 }
@@ -964,6 +969,8 @@ function translatedError(payload: Record<string, unknown>, status: number): ApiE
     invalid_verification_kind: "请选择有效的验证类型。",
     invalid_verification_result: "请选择有效的验证结果。",
     monitor_mode_upgrade_required: "开启纯监测模式前，房间中的所有成员都必须升级到当前协议并重新连接。",
+    decision_already_superseded: "这条决定已被其他成员更新，请刷新后基于当前决定重试。",
+    context_export_too_large: "共享上下文超过单次完整备份上限，请先归档部分历史记录后重试。",
   };
   return new ApiError(
     translated[code] ?? asString(payload.message, code || "请求未完成，请稍后重试。"),
@@ -1332,11 +1339,34 @@ export async function getDashboard(access: RequestAccess, roomToken?: string): P
       access,
     ),
   );
-  const records = firstArray(payload.records).map((record) => normalizeGenericRecord(record, "context"));
-  records.push(...firstArray(payload.contextEntries, payload.context).map(normalizeContext));
-  records.push(...firstArray(payload.decisions).map(normalizeDecision));
-  records.push(...firstArray(payload.verifications, payload.validations).map(normalizeVerification));
-  records.push(...firstArray(payload.handoffs).map(normalizeHandoff));
+  const normalizedRecords = [
+    ...firstArray(payload.contextEntries, payload.context).map(normalizeContext),
+    ...firstArray(payload.decisions).map(normalizeDecision),
+    ...firstArray(payload.verifications, payload.validations).map(normalizeVerification),
+    ...firstArray(payload.handoffs).map(normalizeHandoff),
+    // Snapshot 兼容响应会同时返回专用记录和 records 投影。投影最后合并，
+    // 让数据库中的 current/superseded 状态成为界面判断的最终依据。
+    ...firstArray(payload.records).map((record) => normalizeGenericRecord(record, "context")),
+  ];
+  const recordsByKey = new Map<string, ProjectRecord>();
+  const recordsWithoutId: ProjectRecord[] = [];
+  for (const record of normalizedRecords) {
+    if (!record.id) {
+      recordsWithoutId.push(record);
+      continue;
+    }
+    const key = `${record.kind}:${record.id}`;
+    const previous = recordsByKey.get(key);
+    recordsByKey.set(key, previous ? {
+      ...previous,
+      ...record,
+      evidence: record.evidence ?? previous.evidence,
+      details: record.details ?? previous.details,
+      supersedesDecisionId: record.supersedesDecisionId ?? previous.supersedesDecisionId,
+      supersededByDecisionId: record.supersededByDecisionId ?? previous.supersededByDecisionId,
+    } : record);
+  }
+  const records = [...recordsByKey.values(), ...recordsWithoutId];
   records.sort((left, right) => (right.createdAt ?? "").localeCompare(left.createdAt ?? ""));
   const rawConflicts = firstArray(payload.conflicts, payload.blockers);
   const room = normalizeRoom(payload.room, roomToken);
@@ -1580,12 +1610,15 @@ function recordRequest(input: CreateRecordInput): { path: string; body: string }
   const common = { paths: input.paths ?? [] };
   if (input.kind === "decision") {
     return {
-      path: "/api/decisions",
+      path: input.supersedesDecisionId
+        ? `/api/decisions/${encodeURIComponent(input.supersedesDecisionId)}/supersede`
+        : "/api/decisions",
       body: JSON.stringify({
         ...common,
         title: input.title,
         decision: input.summary,
         rationale: input.evidence,
+        supersedesDecisionId: input.supersedesDecisionId,
       }),
     };
   }
@@ -1623,14 +1656,37 @@ function recordRequest(input: CreateRecordInput): { path: string; body: string }
 
 export async function createRecord(access: RequestAccess, input: CreateRecordInput): Promise<void> {
   const specific = recordRequest(input);
-  await requestFirst(
-    [
-      { path: specific.path, init: { method: "POST", body: specific.body } },
-      {
-        path: "/api/records",
-        init: { method: "POST", body: JSON.stringify(input) },
-      },
-    ],
-    access,
-  );
+  const replacement = input.kind === "decision" && Boolean(input.supersedesDecisionId);
+  let result: unknown;
+  try {
+    result = await requestFirst(
+      [
+        { path: specific.path, init: { method: "POST", body: specific.body } },
+        ...(replacement ? [] : [{
+          path: "/api/records",
+          init: { method: "POST", body: JSON.stringify(input) },
+        }]),
+      ],
+      access,
+    );
+  } catch (error) {
+    if (replacement && error instanceof ApiError && [404, 405].includes(error.status)) {
+      throw new ApiError(
+        "当前 Agent Hub 服务不支持更新已有决定，请升级服务后重试。原决定未被修改。",
+        409,
+        "decision_supersession_unsupported",
+      );
+    }
+    throw error;
+  }
+  if (replacement) {
+    const responseDecision = asObject(asObject(result).decision);
+    if (asString(responseDecision.supersedesDecisionId) !== input.supersedesDecisionId) {
+      throw new ApiError(
+        "服务没有确认决定替代关系，请刷新后重试。",
+        409,
+        "decision_supersession_unconfirmed",
+      );
+    }
+  }
 }

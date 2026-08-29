@@ -171,14 +171,16 @@ describe("Codex hook integration", () => {
     await writeFile(temporaryLog, "temporary\n", "utf8");
     const outsideLog = path.join(path.dirname(fixture.repository), "outside-agent-hub-test.log");
     const cleanupCommand = [
-      "Remove-Item -LiteralPath '.tmp/agent-hub-test.log' -ErrorAction SilentlyContinue",
-      `Remove-Item -LiteralPath '${outsideLog.replaceAll("'", "''")}' -ErrorAction SilentlyContinue`,
-    ].join("; ");
+      "*** Begin Patch",
+      "*** Delete File: .tmp/agent-hub-test.log",
+      `*** Delete File: ${outsideLog}`,
+      "*** End Patch",
+    ].join("\n");
     await expect(handleCodexHook(
       fixture.options("PreToolUse", fetchImpl),
       fixture.input("PreToolUse", {
         turn_id: "scope-audit-turn",
-        tool_name: "Bash",
+        tool_name: "apply_patch",
         tool_input: { command: cleanupCommand },
       }),
     )).resolves.toMatchObject({

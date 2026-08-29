@@ -136,6 +136,7 @@ describe("Agent Hub Streamable HTTP MCP", () => {
     expect(client.getInstructions()).toContain("edit_check requires historical confirmation");
     expect(client.getInstructions()).toContain("monitor-only mode historical confirmation is advisory");
     expect(client.getInstructions()).toContain("Lease conflicts remain governed by step 2's decision=deny rule");
+    expect(client.getInstructions()).toContain("supersedesDecisionId only after the current user explicitly confirms");
     expect(client.getInstructions()).not.toContain("edit_check returns decision=deny for historical confirmation");
 
     const listed = await client.listTools();
@@ -157,6 +158,10 @@ describe("Agent Hub Streamable HTTP MCP", () => {
     const tools = Object.fromEntries(listed.tools.map((tool) => [tool.name, tool]));
     expect(tools.edit_check.description).toContain("Stop when allowed=false");
     expect(tools.edit_check.description).toContain("lease conflicts enter blockers only for decision=deny");
+    expect(tools.event_append.description).toContain("explicit user confirmation");
+    expect(tools.event_append.inputSchema).toMatchObject({
+      properties: { supersedesDecisionId: expect.any(Object) },
+    });
     expect(tools.context_query.annotations).toMatchObject({
       readOnlyHint: true,
       destructiveHint: false,

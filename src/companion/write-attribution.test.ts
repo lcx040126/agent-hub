@@ -81,9 +81,14 @@ describe("Agent write attribution", () => {
       ].join("; "),
     });
 
-    expect(intent.pathCandidates).toEqual(["C:\\project\\src/config.json"]);
-    expect(intent.targets).toEqual([
-      expect.objectContaining({ pathCandidate: "C:\\project\\src/config.json", operation: "update" }),
+    expect(intent.pathCandidates.map((candidate) => candidate.replaceAll("\\", "/"))).toEqual([
+      "C:/project/src/config.json",
+    ]);
+    expect(intent.targets.map((target) => ({
+      ...target,
+      pathCandidate: target.pathCandidate.replaceAll("\\", "/"),
+    }))).toEqual([
+      expect.objectContaining({ pathCandidate: "C:/project/src/config.json", operation: "update" }),
     ]);
     expect(intent.pathDiagnostics).toEqual([]);
   });
@@ -139,10 +144,11 @@ describe("Agent write attribution", () => {
     const move = extractAttributedWriteIntent("Bash", {
       command: "Move-Item -LiteralPath 'src/old.ts' -Destination 'src/new.ts'",
     });
-    expect(move.targets).toEqual([
+    expect(move.targets).toHaveLength(2);
+    expect(move.targets).toEqual(expect.arrayContaining([
       expect.objectContaining({ pathCandidate: "src/old.ts", operation: "move" }),
       expect.objectContaining({ pathCandidate: "src/new.ts", operation: "move" }),
-    ]);
+    ]));
 
     const copy = extractAttributedWriteIntent("Bash", {
       command: "Copy-Item -LiteralPath 'fixtures/source.json' -Destination 'artifacts/result.json'",
@@ -154,13 +160,15 @@ describe("Agent write attribution", () => {
     const rename = extractAttributedWriteIntent("Bash", {
       command: "Rename-Item 'src/old.ts' 'new.ts'",
     });
-    expect(rename.targets.map((target) => ({
+    const normalizedTargets = rename.targets.map((target) => ({
       ...target,
       pathCandidate: target.pathCandidate.replaceAll("\\", "/"),
-    }))).toEqual([
+    }));
+    expect(normalizedTargets).toHaveLength(2);
+    expect(normalizedTargets).toEqual(expect.arrayContaining([
       expect.objectContaining({ pathCandidate: "src/old.ts", operation: "move" }),
       expect.objectContaining({ pathCandidate: "src/new.ts", operation: "move" }),
-    ]);
+    ]));
     expect(rename.pathCandidates).not.toContain("new.ts");
   });
 

@@ -27,18 +27,34 @@ try {
     { name: "schema-3-failed-retry", schemaVersion: 3, failedUpgrade: true },
     { name: "schema-3-manual-repair", schemaVersion: 3, repaired: true },
     { name: "schema-4", schemaVersion: 4 },
-    { name: "schema-5", schemaVersion: 5 },
+    { name: "schema-5", schemaVersion: 5, legacyDecision: true },
+    { name: "schema-6-pre-decision-supersession", schemaVersion: 6, legacyDecision: true },
   ]) {
     const dataDirectory = path.join(probeRoot, testCase.name);
     const databasePath = path.join(dataDirectory, "agent-hub.sqlite");
-    createHistoricalFixture(databasePath, testCase.schemaVersion, testCase.repaired === true);
+    createHistoricalFixture(
+      databasePath,
+      testCase.schemaVersion,
+      testCase.repaired === true,
+      testCase.legacyDecision === true,
+    );
     if (testCase.failedUpgrade) simulateFailedUpgrade(databasePath);
 
     // 两次启动分别验证升级和已迁移 schema 6 的幂等重开。
     await startAndStopPackagedService(dataDirectory);
-    validateMigratedDatabase(databasePath, testCase.schemaVersion, testCase.repaired === true);
+    validateMigratedDatabase(
+      databasePath,
+      testCase.schemaVersion,
+      testCase.repaired === true,
+      testCase.legacyDecision === true,
+    );
     await startAndStopPackagedService(dataDirectory);
-    validateMigratedDatabase(databasePath, testCase.schemaVersion, testCase.repaired === true);
+    validateMigratedDatabase(
+      databasePath,
+      testCase.schemaVersion,
+      testCase.repaired === true,
+      testCase.legacyDecision === true,
+    );
     results.push({ name: testCase.name, status: "ok", reopened: true });
   }
 
@@ -55,7 +71,7 @@ try {
   rmSync(probeRoot, { recursive: true, force: true });
 }
 
-function createHistoricalFixture(databasePath, schemaVersion, repaired) {
+function createHistoricalFixture(databasePath, schemaVersion, repaired, legacyDecision) {
   mkdirSync(path.dirname(databasePath), { recursive: true });
   const database = new DatabaseSync(databasePath);
   const prefix = `schema${schemaVersion}`;
@@ -132,12 +148,48 @@ function createHistoricalFixture(databasePath, schemaVersion, repaired) {
       systems_json TEXT NOT NULL, metadata_json TEXT NOT NULL,
       scanned_at TEXT NOT NULL${finalizationColumn}
     );
+    ${legacyDecision ? `
+    CREATE TABLE decisions (
+      id TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      author_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+      title TEXT NOT NULL, decision TEXT NOT NULL, rationale TEXT,
+      paths_json TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE TABLE records (
+      id TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('decision', 'validation', 'handoff', 'risk')),
+      title TEXT NOT NULL, summary TEXT NOT NULL, paths_json TEXT NOT NULL,
+      status TEXT NOT NULL, evidence_json TEXT NOT NULL, commit_hash TEXT,
+      created_at TEXT NOT NULL
+    );` : ""}
     INSERT INTO rooms (id, code, name, project_name, repository, default_branch, created_at)
     VALUES ('${prefix}-room', 'PACKAGED${schemaVersion}', 'Packaged room', 'Packaged project',
       'C:/packaged/repo', 'main', '2026-08-20T08:00:00.000Z');
     INSERT INTO members (id, room_id, name, role, client_name, token_hash, created_at, last_seen_at)
     VALUES ('${prefix}-member', '${prefix}-room', 'Alice', 'host', 'Codex',
       'packaged-token-${schemaVersion}', '2026-08-20T08:00:00.000Z', '2026-08-20T09:00:00.000Z');
+    ${legacyDecision ? `
+    INSERT INTO decisions (
+      id, room_id, author_member_id, title, decision, rationale, paths_json, created_at
+    ) VALUES (
+      '${prefix}-decision', '${prefix}-room', '${prefix}-member',
+      'Preserve packaged decision', 'Keep the historical packaged behavior.',
+      'This decision predates decision supersession.', '["src/packaged.ts"]',
+      '2026-08-20T08:05:00.000Z'
+    );
+    INSERT INTO records (
+      id, room_id, member_id, kind, title, summary, paths_json, status,
+      evidence_json, commit_hash, created_at
+    ) VALUES (
+      '${prefix}-decision-record', '${prefix}-room', '${prefix}-member', 'decision',
+      'Preserve packaged decision', 'Keep the historical packaged behavior.',
+      '["src/packaged.ts"]', 'accepted',
+      '["This decision predates decision supersession."]', NULL,
+      '2026-08-20T08:05:00.000Z'
+    );` : ""}
     INSERT INTO work_sessions (
       id, room_id, member_id, client_name, agent_name, repository, branch, worktree,
       base_commit, task, status, metadata_json, opened_at, last_seen_at
@@ -246,7 +298,7 @@ async function startAndStopPackagedService(dataDirectory) {
   }
 }
 
-function validateMigratedDatabase(databasePath, sourceSchemaVersion, repaired) {
+function validateMigratedDatabase(databasePath, sourceSchemaVersion, repaired, legacyDecision) {
   const prefix = `schema${sourceSchemaVersion}`;
   const database = new DatabaseSync(databasePath);
   assertEqual(database.prepare("PRAGMA user_version").get().user_version, 6, "user_version");
@@ -297,6 +349,34 @@ function validateMigratedDatabase(databasePath, sourceSchemaVersion, repaired) {
   assertEqual(lease.created_via, "legacy", "created_via");
   assertAgentLeaseIndex(database);
   assertCodexIdentityIndex(database);
+  assertDecisionSupersessionSchema(database);
+  if (legacyDecision) {
+    const decision = database.prepare(`
+      SELECT title, decision, rationale, paths_json, status, supersedes_decision_id
+      FROM decisions WHERE id = ?
+    `).get(`${prefix}-decision`);
+    assertEqual(
+      JSON.stringify(decision),
+      JSON.stringify({
+        title: "Preserve packaged decision",
+        decision: "Keep the historical packaged behavior.",
+        rationale: "This decision predates decision supersession.",
+        paths_json: '["src/packaged.ts"]',
+        status: "current",
+        supersedes_decision_id: null,
+      }),
+      "legacy decision migration",
+    );
+    const record = database.prepare(`
+      SELECT id, status FROM records
+      WHERE room_id = ? AND kind = 'decision' AND title = 'Preserve packaged decision'
+    `).get(`${prefix}-room`);
+    assertEqual(
+      JSON.stringify(record),
+      JSON.stringify({ id: `${prefix}-decision`, status: "current" }),
+      "legacy decision record projection migration",
+    );
+  }
   if (sourceSchemaVersion === 4) {
     const generations = database.prepare(`
       SELECT id, status, closed_at, finalizing_at, finalization_id, current_turn_id
@@ -349,6 +429,7 @@ function validateNewDatabase(databasePath) {
   assertEqual(database.prepare("PRAGMA user_version").get().user_version, 6, "new user_version");
   assertCodexIdentityIndex(database);
   assertAgentLeaseIndex(database);
+  assertDecisionSupersessionSchema(database);
   assertEqual(database.prepare("PRAGMA integrity_check").get().integrity_check, "ok", "new integrity_check");
   assertEqual(database.prepare("PRAGMA foreign_key_check").all().length, 0, "new foreign_key_check");
   database.close();
@@ -397,6 +478,43 @@ function assertAgentLeaseIndex(database) {
   assertEqual(
     predicate,
     "status = 'active' and managed_by = 'agent' and session_id is not null",
+    `${indexName} predicate`,
+  );
+}
+
+function assertDecisionSupersessionSchema(database) {
+  const tableColumns = database.prepare("PRAGMA table_info('decisions')").all();
+  const statusColumn = tableColumns.find((column) => column.name === "status");
+  assertEqual(statusColumn?.type, "TEXT", "decision status column type");
+  assertEqual(statusColumn?.notnull, 1, "decision status not-null flag");
+  assertEqual(statusColumn?.dflt_value, "'current'", "decision status default");
+  const supersedesColumn = tableColumns.find(
+    (column) => column.name === "supersedes_decision_id",
+  );
+  assertEqual(
+    supersedesColumn?.type,
+    "TEXT",
+    "decision supersedes_decision_id column type",
+  );
+
+  const indexName = "decisions_single_successor_idx";
+  const index = database.prepare("PRAGMA index_list('decisions')").all()
+    .find((candidate) => candidate.name === indexName);
+  assertEqual(index?.unique, 1, `${indexName} unique flag`);
+  assertEqual(index?.partial, 1, `${indexName} partial flag`);
+  const columns = database.prepare(`PRAGMA index_info('${indexName}')`).all()
+    .map((column) => column.name)
+    .join(",");
+  assertEqual(columns, "supersedes_decision_id", `${indexName} columns`);
+  const definition = database.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?
+  `).get(indexName)?.sql;
+  const predicate = typeof definition === "string"
+    ? definition.split(/\bWHERE\b/i).slice(1).join(" WHERE ").replace(/\s+/g, " ").trim().toLowerCase()
+    : "";
+  assertEqual(
+    predicate,
+    "supersedes_decision_id is not null",
     `${indexName} predicate`,
   );
 }
