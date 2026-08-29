@@ -27,8 +27,10 @@ const SAVED_GET_ROUTES = new Set([
   "/api/update/status",
 ]);
 
+const LEASE_SCOPE_EVENTS_ROUTE = /^\/api\/leases\/[A-Za-z0-9_-]{1,128}\/scope-events$/;
 const SAVED_GET_ROUTE_PATTERNS = [
   /^\/api\/features\/[A-Za-z0-9_-]{1,128}\/history$/,
+  LEASE_SCOPE_EVENTS_ROUTE,
 ];
 
 const SAVED_POST_ROUTES = [
@@ -256,6 +258,8 @@ function validateQuery(target: URL): void {
       ? new Set(["limit", "after"])
       : target.pathname === "/api/release-requests"
         ? new Set(["status"])
+      : LEASE_SCOPE_EVENTS_ROUTE.test(target.pathname)
+        ? new Set(["limit", "before"])
       : new Set<string>();
   for (const key of target.searchParams.keys()) {
     if (!allowed.has(key)) throw new Error("The Agent Hub API query parameter is not allowed.");

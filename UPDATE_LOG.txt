@@ -699,3 +699,10 @@ v0.2.7 正式发布审计（2026-08-29）
 - 六项正式资产与 GitHub `digest`、本地重新计算的 SHA-256 及 `SHA256SUMS.txt` 交叉一致：`AgentHub-Setup-0.2.7-x64.exe` 为 119,780,131 字节，SHA-256 `1e4ae091663ce4fbb322f286ee870a5dff7a6f786f1f43139ac6ea8635633fe6`；`.exe.blockmap` 为 126,515 字节，SHA-256 `8904d80217d544b523a0e08200168e15d8b76ce27a907f2fe2230da88ac19257`；`latest.yml` 为 353 字节，SHA-256 `2e6e565b1019099a2cf7aa42c55b570fb6f42c76cc9e02aa03340689f9e0d825`；`agent-hub-update.json` 为 6,686 字节，SHA-256 `877f8f81cdace6b13cc408b087ed229f053a3f36cd0e1385200d86a97f13b34b`；`agent-hub-update.sig` 为 89 字节，SHA-256 `3bbdbe6f217d3184ea04f0add93980ba4a5618f6124a5def251b6ad34aee802d`；`SHA256SUMS.txt` 为 456 字节，SHA-256 `f400ddfca279916634cff5ecc109b4dfd11d8c40ce762e0a123297d936b1c9e0`。
 - 客户端内置公钥与 `assets/update-public-key.pem` 一致，Ed25519 验签通过；签名清单确认版本/protocol/schema/最低来源为 `0.2.7/2/6/1/2`，安装包名称、正式 URL、大小、SHA-256 和发布说明均匹配。`latest.yml` 通过 YAML 解析，版本、路径和大小匹配，安装包 SHA-512 为 `dAaf/i3iLAg5xVEdAm5ey2OKUr9m7a18FyXeTSo9LbHVEk3edI+5Idns1AHJNrII7MyoXQKQsplaVeG4oQS6Fg==`。
 - 正式安装包的文件版本与产品版本均为 `0.2.7`；Authenticode 状态仍为 `NotSigned`，Windows 可能显示未知发布者提示。本次没有覆盖本机正式安装目录，也没有修改或清理 `%APPDATA%\agent-hub` 用户数据；真实 Codex 多轮、提交后自动释放、长时间轮询、并发交互和双机协作仍保留为独立实机验收边界。
+
+v0.2.8 已确认更新（源码候选，2026-08-29）
+
+- 修复桌面代理未放行 `GET /api/leases/:id/scope-events` 及其 `limit`、`before` 查询参数的问题。该路由由 v0.2.7 的任务级 Agent 租约协调功能新增，服务端和客户端已经使用，但桌面代理白名单未同步更新。
+- 增加桌面代理成功读取、分页参数和未知参数拒绝测试，保持未知 GET 路由、路径编码和敏感参数保护不变。
+- 包版本候选更新为 `0.2.8`，protocol 保持 `2`，schema 保持 `6`；发布说明位于 `docs/releases/v0.2.8.md`。
+- 当前已完成源码和专项测试修改，尚未提交、推送、打标签或发布；完整 TypeScript/全量测试、NSIS 安装包、签名清单、覆盖升级和双机验收待后续验证。

@@ -29,9 +29,9 @@ describe("signed desktop update manifest", () => {
     });
   });
 
-  it("keeps the v0.2.7 manifest compatible with an in-place v0.2.6 upgrade", () => {
+  it("keeps the v0.2.8 manifest compatible with an in-place v0.2.7 upgrade", () => {
     expect(packageMetadata).toMatchObject({
-      version: "0.2.7",
+      version: "0.2.8",
       agentHub: {
         protocolVersion: 2,
         schemaVersion: 6,
@@ -51,12 +51,12 @@ describe("signed desktop update manifest", () => {
 
     expect(verifyDesktopUpdateManifest(signed.bytes, signed.signature, {
       publicKeyPem,
-      currentVersion: "0.2.6",
+      currentVersion: "0.2.7",
       currentProtocolVersion: 2,
       currentSchemaVersion: 5,
     })).toMatchObject({
       manifest: {
-        version: "0.2.7",
+        version: "0.2.8",
         protocolVersion: 2,
         schemaVersion: 6,
         minimumSourceProtocolVersion: 1,

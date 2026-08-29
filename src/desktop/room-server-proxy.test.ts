@@ -98,6 +98,8 @@ describe("createRequestPlan", () => {
       { method: "GET", path: "/api/release-requests?status=pending" },
       { method: "GET", path: "/api/sessions" },
       { method: "GET", path: "/api/features/feature_01/history" },
+      { method: "GET", path: "/api/leases/lease_01/scope-events" },
+      { method: "GET", path: "/api/leases/lease_01/scope-events?limit=100&before=activity_20" },
       { method: "POST", path: "/api/release-requests/request_01/resolve", body: {} },
       { method: "POST", path: "/api/features/query", body: {} },
       { method: "POST", path: "/api/features/revisions", body: {} },
@@ -116,6 +118,14 @@ describe("createRequestPlan", () => {
     expect(() =>
       createRequestPlan(
         { method: "GET", path: "/api/release-requests?memberToken=leak" },
+        "https://hub.example",
+        "secret",
+        true,
+      ),
+    ).toThrow(/query parameter/i);
+    expect(() =>
+      createRequestPlan(
+        { method: "GET", path: "/api/leases/lease_01/scope-events?memberToken=leak" },
         "https://hub.example",
         "secret",
         true,
