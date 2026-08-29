@@ -552,7 +552,7 @@ describe("lease protection presentation", () => {
     expect(markup).not.toContain("人工任务没有 Agent 调用记录");
   });
 
-  it("binds work cards by Hub Session ID and suppresses only the duplicate live row", () => {
+  it("binds work cards by Hub Session ID and keeps standalone live rows free of identifiers", () => {
     const markup = renderToStaticMarkup(
       <WorkView
         dashboard={dashboard({
@@ -591,7 +591,41 @@ describe("lease protection presentation", () => {
     expect(markup).toContain("codex-bo…sion");
     expect(markup).not.toContain("不应重复显示的会话行");
     expect(markup).toContain("保留的独立会话行");
-    expect(markup).toContain("hub-stan…sion");
+    expect(markup).not.toContain("hub-standalone-session");
+    expect(markup).not.toContain("codex-standalone-session");
+    expect(markup).not.toContain("turn-standalone-session");
+  });
+
+  it("hides the generated Codex session task until the session has a lease", () => {
+    const codexSessionId = "01a0469b-8192-7082-8fc7-c8a37e5ea76e";
+    const markup = renderToStaticMarkup(
+      <WorkView
+        dashboard={dashboard({
+          sessions: [{
+            id: "hub-unclaimed-session",
+            memberId: "member-current",
+            codexSessionId,
+            currentTurnId: "turn-unclaimed-session",
+            activityEpoch: 3,
+            status: "active",
+            lastSeenAt: "2026-08-27T08:00:00.000Z",
+            task: `Codex session ${codexSessionId}`,
+            agentName: "Codex",
+            branch: "dev",
+          }],
+        })}
+        transientConflicts={[]}
+        now={LEASE_NOW}
+        onClaim={() => undefined}
+        onRenew={() => undefined}
+        onClose={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("Codex · dev · Epoch 3");
+    expect(markup).not.toContain(codexSessionId);
+    expect(markup).not.toContain("hub-unclaimed-session");
+    expect(markup).not.toContain("turn-unclaimed-session");
   });
 
   it("derives protected systems only from valid leases and ignores historical scans", () => {

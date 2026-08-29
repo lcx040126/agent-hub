@@ -1831,20 +1831,18 @@ export function WorkView({
                     <span className="session-list-label"><Radio aria-hidden="true" />Agent 实时活动</span>
                     {activeSessions.map((agentSession) => {
                       const member = dashboard.members.find((item) => item.id === agentSession.memberId);
+                      const sessionTask = agentSession.task?.trim();
+                      const visibleTask = sessionTask && !/^Codex session [0-9a-f-]{16,}$/i.test(sessionTask)
+                        ? sessionTask
+                        : undefined;
                       return (
                         <div className="agent-session-row" key={agentSession.id}>
                           <span className="session-pulse" />
                           <div>
                             <strong>{member?.name ?? "团队成员"}</strong>
-                            <p>{agentSession.task || "正在分析项目与同步工作范围"}</p>
+                            {visibleTask && <p>{visibleTask}</p>}
                           </div>
                           <small>{agentSession.agentName || agentSession.clientName || "本地组件"}{agentSession.branch ? ` · ${agentSession.branch}` : ""}{agentSession.activityEpoch === undefined ? "" : ` · Epoch ${agentSession.activityEpoch}`}</small>
-                          <SessionIdentityStrip
-                            className="standalone-session-identifiers"
-                            hubSessionId={agentSession.id}
-                            codexSessionId={agentSession.codexSessionId}
-                            currentTurnId={agentSession.currentTurnId}
-                          />
                         </div>
                       );
                     })}
