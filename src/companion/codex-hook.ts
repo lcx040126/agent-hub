@@ -26,6 +26,7 @@ import {
   inspectGitWorkingPathsFromIdentity,
   inspectGitWorkingStateFromIdentity,
   inspectGitWorkingState,
+  trackedRepositoryScopes,
   toRepositoryRelativePath,
   type GitWorkingState,
 } from "./git-state.js";
@@ -65,12 +66,10 @@ import {
   type SessionEndQueueJob,
 } from "./session-end-queue.js";
 import {
-  matchesTurnCompletionJob,
   TurnCompletionQueueStore,
   type TurnCompletionJob,
 } from "./turn-completion-queue.js";
 import {
-  processTurnCompletionJob,
   resumePendingTurnCompletion,
 } from "./turn-completion-worker.js";
 import { collectAttributedPathEvidence, type AttributedPathEvidence } from "./turn-completion.js";
@@ -164,7 +163,13 @@ interface EditCheckResponse {
 interface LeaseResponse {
   acquired: boolean;
   decision: "allow" | "warn" | "deny" | "wait";
-  lease?: { id: string; paths?: string[]; expiresAt: string };
+  lease?: {
+    id: string;
+    paths?: string[];
+    expiresAt: string;
+    kind?: "automatic" | "standard" | "exclusive";
+    managedBy?: "manual" | "agent";
+  };
   conflicts?: Array<Record<string, unknown>>;
   waitingFor?: {
     leaseId: string;
@@ -174,6 +179,12 @@ interface LeaseResponse {
     expiresAt: string;
     paths: string[];
   };
+}
+
+interface ManagedLeaseResponse {
+  id: string;
+  paths?: string[];
+  expiresAt: string;
 }
 
 const MAX_HOOK_INPUT_BYTES = 1024 * 1024;
@@ -292,6 +303,7 @@ interface PrepareEditsResponse {
   check: EditCheckResponse;
   claim?: LeaseResponse;
   renewedLeases?: Array<{ id: string; paths?: string[]; expiresAt: string }>;
+  managedLease?: ManagedLeaseResponse;
 }
 
 interface WriteBlockedResponse {
@@ -483,10 +495,11 @@ async function handlePreToolUse(
 ): Promise<Record<string, unknown> | undefined> {
   const intent = extractAttributedWriteIntent(input.tool_name, input.tool_input);
   if (!intent.writes) return undefined;
+  const invocationId = randomUUID();
   const stateStore = new CodexHookStateStore(options.userDataPath);
   // PreToolUse 会跨多次网络调用读写 epoch、completion 与 pendingWrite；整段串行化才能阻止 Stop 覆盖新回合。
   return stateStore.runExclusive(input.session_id, () =>
-    handlePreToolUseExclusive(options, input, record, intent, policy));
+    handlePreToolUseExclusive(options, input, record, intent, invocationId, policy));
 }
 
 async function handlePreToolUseExclusive(
@@ -494,6 +507,7 @@ async function handlePreToolUseExclusive(
   input: CodexHookInput,
   record: ResolvedRoomConnectionRecord,
   intent: AttributedWriteIntent,
+  invocationId: string,
   policy: AuthoritativeHookProtectionPolicy,
 ): Promise<Record<string, unknown> | undefined> {
   const runtime = await findHookRuntime(options, input, record);
@@ -533,20 +547,38 @@ async function handlePreToolUseExclusive(
     runtime.state.currentTurnId = currentTurnId;
     await runtime.stateStore.save(runtime.state);
   }
-  let paths = normalizeCandidates(
+  const repositoryCwd = mapRepositoryCwd(
+    runtime.connection.repositoryPath,
     runtime.git.repositoryRoot,
-    mapRepositoryCwd(
-      runtime.connection.repositoryPath,
-      runtime.git.repositoryRoot,
-      input.cwd,
-    ),
+    input.cwd,
+  );
+  const normalizedCandidates = normalizeCandidatesWithIgnored(
+    runtime.git.repositoryRoot,
+    repositoryCwd,
     intent.pathCandidates,
   );
+  let paths = normalizedCandidates.paths;
+  let ignoredPaths = normalizedCandidates.ignoredPaths;
   let proposedEdits = normalizeProposedEdits(
     runtime.git.repositoryRoot,
-    mapRepositoryCwd(runtime.connection.repositoryPath, runtime.git.repositoryRoot, input.cwd),
+    repositoryCwd,
     intent,
   );
+  const cleanupCandidates = proposedEdits
+    .filter((edit) => edit.operation === "delete" && isTemporaryCleanupPath(edit.path))
+    .map((edit) => edit.path);
+  if (cleanupCandidates.length > 0) {
+    const tracked = await trackedRepositoryScopes(runtime.git, cleanupCandidates, {
+      gitExecutable: options.gitExecutable,
+    });
+    const ignoredCleanup = cleanupCandidates.filter((candidate) => !tracked.has(pathKey(candidate)));
+    if (ignoredCleanup.length > 0) {
+      const ignoredKeys = new Set(ignoredCleanup.map(pathKey));
+      ignoredPaths = unique([...ignoredPaths, ...ignoredCleanup]);
+      paths = paths.filter((candidate) => !ignoredKeys.has(pathKey(candidate)));
+      proposedEdits = proposedEdits.filter((edit) => !ignoredKeys.has(pathKey(edit.path)));
+    }
+  }
   if (paths.length > 0) {
     const targetedBaseline = await inspectGitWorkingPathsFromIdentity(runtime.git, paths, {
       gitExecutable: options.gitExecutable,
@@ -582,7 +614,50 @@ async function handlePreToolUseExclusive(
     if (writeBlockReason) return denyOutput(writeBlockReason);
   }
 
+  const hasRepositoryLease = runtime.state.leases.some((lease) =>
+    lease.coordinationState !== "blocked"
+    && Date.parse(lease.expiresAt) > Date.now()
+    && lease.paths.some((leasePath) => leasePath === "."));
+  if (intent.pathDiagnostics.length > 0) {
+    const diagnostic = formatPathDiagnostics(intent.pathDiagnostics);
+    if (!monitorMode && !hasRepositoryLease) {
+      return denyOutput(
+        `Agent Hub 无法静态证明本次 PowerShell 写入的全部目标：${diagnostic}`
+        + " 请改用字面量、单次常量变量或参数明确的 Join-Path，或先领取整个仓库范围。",
+      );
+    }
+    monitorWarnings.push(`PowerShell 路径归因不完整：${diagnostic}`);
+  }
+
   if (paths.length === 0) {
+    if (ignoredPaths.length > 0 && intent.pathDiagnostics.length === 0 && !intent.attributedSideEffects) {
+      const observed = await runtime.client.post<PrepareEditsResponse>("/api/edits/prepare", {
+        sessionId: runtime.state.hubSessionId,
+        title: `Codex 范围诊断 ${shortSessionId(input.session_id)}`,
+        intent: `由 ${input.tool_name ?? "写入工具"} 产生的仓库外或临时清理`,
+        branch: runtime.git.branch,
+        baseCommit: runtime.git.headCommit,
+        turnId: runtime.state.currentTurnId,
+        activityEpoch: runtime.state.activityEpoch ?? 0,
+        paths: [],
+        proposedEdits: [],
+        invocationId,
+        toolName: input.tool_name ?? "unknown",
+        stage: "pre",
+        pathDiagnostics: [],
+        ignoredPaths,
+      }).catch(() => undefined);
+      if (observed) {
+        updateRenewedLeases(runtime.state, observed.renewedLeases ?? []);
+        adoptPreparedManagedLease(runtime.state, observed, []);
+      }
+      setPendingWrite(runtime, input, intent, invocationId, [], ignoredPaths);
+      await runtime.stateStore.save(runtime.state);
+      return allowOutput(monitorContext(
+        "Agent Hub 已把仓库外目标或未跟踪临时清理记为调用诊断，不会为其创建协作租约。",
+        monitorWarnings,
+      ));
+    }
     if (!monitorMode && runtime.state.leaseAttributionComplete === false) {
       return denyOutput(
         "Agent Hub 复用了远端会话，但本机缺少该会话的完整租约状态；"
@@ -608,7 +683,7 @@ async function handlePreToolUseExclusive(
       const stopFence = await adoptConcurrentStopFence(options.userDataPath, runtime);
       if (stopFence && !monitorMode) return stopFence;
       if (stopFence) monitorWarnings.push("检测到并发 Stop 围栏；监测模式继续写入并保留完成状态证据。");
-      setPendingWrite(runtime, input, intent, proposedEdits);
+      setPendingWrite(runtime, input, intent, invocationId, proposedEdits, ignoredPaths);
       await runtime.stateStore.save(runtime.state);
       return allowOutput(
         monitorContext(
@@ -617,22 +692,19 @@ async function handlePreToolUseExclusive(
         ),
       );
     }
-    const hasRepositoryLease = runtime.state.leases.some((lease) =>
-      lease.coordinationState !== "blocked"
-      && Date.parse(lease.expiresAt) > Date.now()
-      && lease.paths.some((leasePath) => leasePath === "."),
-    );
     if (hasRepositoryLease) {
       const stopFence = await adoptConcurrentStopFence(options.userDataPath, runtime);
       if (stopFence && !monitorMode) return stopFence;
       if (stopFence) monitorWarnings.push("检测到并发 Stop 围栏；监测模式继续写入并保留完成状态证据。");
+      setPendingWrite(runtime, input, intent, invocationId, proposedEdits, ignoredPaths);
+      await runtime.stateStore.save(runtime.state);
       return allowOutput(monitorContext("Agent Hub 已确认当前会话持有整个仓库的写入范围。", monitorWarnings));
     }
     if (monitorMode) {
       if (runtime.state.leaseAttributionComplete === false) {
         monitorWarnings.push("本地缺少远端会话的完整租约归因，工具结束后将按 Git 增量尽量补登记。");
       }
-      setPendingWrite(runtime, input, intent, proposedEdits);
+      setPendingWrite(runtime, input, intent, invocationId, proposedEdits, ignoredPaths);
       await runtime.stateStore.save(runtime.state);
       return allowOutput(monitorContext(
         "Agent Hub 无法预先确定输出路径；监测模式允许写入，并将在工具结束后扫描实际变化。",
@@ -666,6 +738,11 @@ async function handlePreToolUseExclusive(
       activityEpoch: runtime.state.activityEpoch ?? 0,
       paths,
       proposedEdits,
+      invocationId,
+      toolName: input.tool_name ?? "unknown",
+      stage: "pre",
+      pathDiagnostics: intent.pathDiagnostics,
+      ignoredPaths,
     });
   } catch (error) {
     let preparationError = error;
@@ -697,6 +774,11 @@ async function handlePreToolUseExclusive(
           activityEpoch: runtime.state.activityEpoch,
           paths,
           proposedEdits,
+          invocationId,
+          toolName: input.tool_name ?? "unknown",
+          stage: "pre",
+          pathDiagnostics: intent.pathDiagnostics,
+          ignoredPaths,
         });
         recoveredActivityEpoch = true;
       } catch (retryError) {
@@ -708,7 +790,7 @@ async function handlePreToolUseExclusive(
         if (retryError instanceof AgentHubHttpError && retryError.code === "stale_activity_epoch") {
           if (monitorMode) {
             monitorWarnings.push("服务端仍报告旧 activity epoch；监测模式允许写入并保留待补登记状态。");
-            setPendingWrite(runtime, input, intent, proposedEdits);
+            setPendingWrite(runtime, input, intent, invocationId, proposedEdits, ignoredPaths);
             await runtime.stateStore.save(runtime.state);
             return allowOutput(monitorContext(undefined, monitorWarnings));
           }
@@ -725,7 +807,7 @@ async function handlePreToolUseExclusive(
       if (monitorMode) {
         monitorWarnings.push(`${preparationError.message} 监测模式不会因分支或冻结状态阻止写入。`);
         appendMonitorDiagnostic(runtime.state, "quarantine", preparationError.message, paths);
-        setPendingWrite(runtime, input, intent, proposedEdits);
+        setPendingWrite(runtime, input, intent, invocationId, proposedEdits, ignoredPaths);
         await runtime.stateStore.save(runtime.state);
         return allowOutput(monitorContext(undefined, monitorWarnings));
       }
@@ -740,7 +822,7 @@ async function handlePreToolUseExclusive(
     if (!recoveredActivityEpoch && activityRecoveryAttempted) {
       if (monitorMode) {
         monitorWarnings.push("过期 activity epoch 的权威恢复未完成；本次写入将继续并等待后续补登记。");
-        setPendingWrite(runtime, input, intent, proposedEdits);
+        setPendingWrite(runtime, input, intent, invocationId, proposedEdits, ignoredPaths);
         await runtime.stateStore.save(runtime.state);
         return allowOutput(monitorContext(undefined, monitorWarnings));
       }
@@ -761,7 +843,7 @@ async function handlePreToolUseExclusive(
     ) {
       if (monitorMode) {
         monitorWarnings.push("房间暂时无法确认旧等待或阻塞租约；监测模式按故障放行。");
-        setPendingWrite(runtime, input, intent, proposedEdits);
+        setPendingWrite(runtime, input, intent, invocationId, proposedEdits, ignoredPaths);
         await runtime.stateStore.save(runtime.state);
         return allowOutput(monitorContext(undefined, monitorWarnings));
       }
@@ -773,27 +855,20 @@ async function handlePreToolUseExclusive(
     if (!recoveredActivityEpoch) {
       if (!monitorMode) throw preparationError;
       monitorWarnings.push(`写入前风险登记失败：${humanError(preparationError)}。`);
-      setPendingWrite(runtime, input, intent, proposedEdits);
+      setPendingWrite(runtime, input, intent, invocationId, proposedEdits, ignoredPaths);
       await runtime.stateStore.save(runtime.state);
       return allowOutput(monitorContext(undefined, monitorWarnings));
     }
   }
   if (!prepared) throw new Error("Agent Hub prepare did not return a result.");
   updateRenewedLeases(runtime.state, prepared.renewedLeases ?? []);
-  if (prepared.claim?.acquired && prepared.claim.lease) {
-    const claimedPaths = prepared.claim.lease.paths?.length ? prepared.claim.lease.paths : paths;
-    upsertLease(runtime.state, {
-      id: prepared.claim.lease.id,
-      paths: claimedPaths,
-      expiresAt: prepared.claim.lease.expiresAt,
-    });
-  }
+  adoptPreparedManagedLease(runtime.state, prepared, paths);
   const stopFenceAfterPrepare = await adoptConcurrentStopFence(options.userDataPath, runtime);
   if (stopFenceAfterPrepare && !monitorMode) return stopFenceAfterPrepare;
   if (stopFenceAfterPrepare) monitorWarnings.push("风险检查后收到并发 Stop 围栏；监测模式继续写入。");
   if (prepared.check.allowed) {
     clearResolvedPassiveWriteBlock(runtime.state, paths);
-    setPendingWrite(runtime, input, intent, proposedEdits);
+    setPendingWrite(runtime, input, intent, invocationId, proposedEdits, ignoredPaths);
     await runtime.stateStore.save(runtime.state);
     const claimed = prepared.claim?.acquired
       ? `Agent Hub 已自动领取写入范围：${paths.join("、")}。`
@@ -978,7 +1053,22 @@ async function handlePostToolUseExclusive(
   if (modeTransition.changed) await runtime.stateStore.save(runtime.state);
   const monitorMode = !policy.blockingProtectionEnabled;
   const monitorWarnings = [...modeTransition.warnings];
-  const pending = runtime.state.pendingWrite;
+  const storedPending = runtime.state.pendingWrite;
+  const pendingMatches = Boolean(
+    storedPending
+    && intent.proposalHash
+    && storedPending.proposalHash === intent.proposalHash
+    && storedPending.toolName === (input.tool_name ?? "unknown"),
+  );
+  const pending = pendingMatches ? storedPending : undefined;
+  const invocationId = pending?.invocationId ?? randomUUID();
+  const pathDiagnostics = unique([
+    ...(pending?.pathDiagnostics ?? []),
+    ...intent.pathDiagnostics,
+    ...(storedPending && !pendingMatches
+      ? ["PostToolUse did not match the pending PreToolUse proposal; a new invocation ID was assigned."]
+      : []),
+  ]);
   const baseline = pending
     ? {
         changedPaths: pending.baselineChangedPaths,
@@ -988,11 +1078,13 @@ async function handlePostToolUseExclusive(
         changedPaths: runtime.state.observedChangedPaths,
         changedPathFingerprints: runtime.state.observedChangedFingerprints,
       };
-  const repositoryTargets = pending?.proposedEdits.map((edit) => edit.path) ?? normalizeCandidates(
+  const normalizedPostCandidates = normalizeCandidatesWithIgnored(
     runtime.git.repositoryRoot,
     mapRepositoryCwd(runtime.connection.repositoryPath, runtime.git.repositoryRoot, input.cwd),
     intent.pathCandidates,
   );
+  const repositoryTargets = pending?.proposedEdits.map((edit) => edit.path)
+    ?? normalizedPostCandidates.paths;
   const targetedInspection = !(pending?.attributedSideEffects ?? intent.attributedSideEffects)
     && repositoryTargets.length > 0;
   runtime.git = targetedInspection
@@ -1015,6 +1107,11 @@ async function handlePostToolUseExclusive(
       { paths: changes.external, detectedAt: new Date().toISOString() },
     ].slice(-20);
   }
+  const ignoredPaths = unique([
+    ...(pending?.ignoredPaths ?? []),
+    ...normalizedPostCandidates.ignoredPaths,
+    ...changes.external,
+  ]);
   const accumulatedAttributedPaths = unique([
     ...(runtime.state.attributedChangedPaths ?? []),
     ...newlyObserved,
@@ -1051,6 +1148,28 @@ async function handlePostToolUseExclusive(
     if (writeBlockReason) return postToolUseStopOutput(writeBlockReason);
   }
   if (newlyObserved.length === 0) {
+    const observed = await runtime.client.post<PrepareEditsResponse>("/api/edits/prepare", {
+      sessionId: runtime.state.hubSessionId,
+      title: `Codex 归因范围 ${shortSessionId(input.session_id)}`,
+      intent: `由 ${input.tool_name ?? "写入工具"} 产生的空增量`,
+      branch: runtime.git.branch,
+      baseCommit: runtime.state.baseCommit,
+      turnId: runtime.state.currentTurnId,
+      activityEpoch: runtime.state.activityEpoch ?? 0,
+      paths: [],
+      proposedEdits: [],
+      invocationId,
+      toolName: input.tool_name ?? "unknown",
+      stage: "post",
+      pathDiagnostics,
+      ignoredPaths,
+      actualPaths: [],
+    }).catch(() => undefined);
+    if (observed) {
+      updateRenewedLeases(runtime.state, observed.renewedLeases ?? []);
+      adoptPreparedManagedLease(runtime.state, observed, []);
+      await runtime.stateStore.save(runtime.state);
+    }
     const context = monitorContext(undefined, monitorWarnings);
     return context ? contextOutput(context) : undefined;
   }
@@ -1084,17 +1203,17 @@ async function handlePostToolUseExclusive(
     activityEpoch: runtime.state.activityEpoch ?? 0,
     paths: newlyObserved,
     proposedEdits,
+    invocationId,
+    toolName: input.tool_name ?? "unknown",
+    stage: "post",
+    pathDiagnostics,
+    ignoredPaths,
+    actualPaths: newlyObserved,
   });
   const check = prepared.check;
   updateRenewedLeases(runtime.state, prepared.renewedLeases ?? []);
-  if (prepared.claim?.acquired && prepared.claim.lease) {
-    upsertLease(runtime.state, {
-      id: prepared.claim.lease.id,
-      paths: prepared.claim.lease.paths?.length ? prepared.claim.lease.paths : newlyObserved,
-      expiresAt: prepared.claim.lease.expiresAt,
-    });
-    await runtime.stateStore.save(runtime.state);
-  }
+  adoptPreparedManagedLease(runtime.state, prepared, newlyObserved);
+  await runtime.stateStore.save(runtime.state);
   await uploadLightweightScan(runtime, "PostToolUse", newlyObserved);
   if (check.allowed) {
     const warnings = formatWarnings(check.warnings);
@@ -1193,7 +1312,6 @@ async function handleStop(
     // 先写保守 fence job：即使 PreToolUse 长时间持锁，Stop 也能在宿主预算内留下不可误释放的本地证据。
     const fenced = await ensureStopCompletionJob(queue, snapshot, input, true);
     let job: TurnCompletionJob | undefined = fenced.job;
-    let connectionId: string | undefined;
     try {
       await stateStore.runExclusive(input.session_id, async () => {
         const state = await stateStore.load(input.session_id);
@@ -1258,53 +1376,13 @@ async function handleStop(
         };
         state.currentTurnId = job.turnId;
         await stateStore.save(state);
-        connectionId = state.connectionId;
       }, { timeoutMs: STOP_STATE_LOCK_TIMEOUT_MS });
     } catch (error) {
       if (!(error instanceof CodexHookStateLockTimeoutError)) throw error;
       // fence job 已经包含 truncated 标记；锁持有者结束前不得再以陈旧 state 写入。
       return;
     }
-
-    if (!job || !connectionId) return;
-    try {
-      // 持久化后再次读取 gate；marker 会让 pause/shutdown 等到这里退出后再决定清理或保留任务。
-      await assertHookIntegrationActive(options, connectionId);
-      const record = await resolveConnectionRecordById(
-        options.userDataPath,
-        connectionId,
-        options.protector,
-      );
-      if (!record) return;
-      const resolved = await hydrateConnectionRecord(record);
-      const client = new AgentHubClient({
-        serverUrl: resolved.connection.serverUrl,
-        memberToken: resolved.memberToken,
-        fetchImpl: createHookGatedFetch(options, connectionId),
-        timeoutMs: 500,
-      });
-      await queue.runExclusive(job.operationId, async () => {
-        const pending = await processTurnCompletionJob(job!, {
-          userDataPath: options.userDataPath,
-          client,
-          gitExecutable: options.gitExecutable,
-          gitTimeoutMs: 350,
-        });
-        if (pending) {
-          const latest = await stateStore.load(job!.codexSessionId);
-          // 只有同一 Hub generation 已经推进到更高 epoch 时，旧 Stop 才真正失效。
-          // SessionEnd 删除旧 state 或立即复开新 generation 时，旧租约仍需要自己的 job 继续检查提交，不能只等 TTL。
-          if (
-            latest
-            && matchesTurnCompletionJob(job!, latest)
-            && (latest.activityEpoch ?? 0) > job!.activityEpoch
-          ) await queue.remove(job!.operationId);
-          else await queue.recordRetry(job!, pending.error);
-        } else await queue.remove(job!.operationId);
-      });
-    } catch {
-      // 15 秒后台 worker 继续使用同一 operationId 重试；Stop 始终允许 Codex 结束本回合。
-    }
+    // Stop 的宿主预算只负责 durable job + fence；网络、Git 与释放都由后台 worker 幂等重试。
   });
 }
 
@@ -1957,14 +2035,19 @@ function setPendingWrite(
   runtime: HookRuntime,
   input: CodexHookInput,
   intent: AttributedWriteIntent,
+  invocationId: string,
   proposedEdits: HookProposedEditState[],
+  ignoredPaths: string[],
 ): void {
   if (!intent.proposalHash) return;
   runtime.state.pendingWrite = {
     proposalHash: intent.proposalHash,
     toolName: input.tool_name ?? "unknown",
+    invocationId,
     proposedEdits,
     attributedSideEffects: intent.attributedSideEffects,
+    pathDiagnostics: intent.pathDiagnostics,
+    ignoredPaths,
     baselineChangedPaths: [...runtime.git.changedPaths],
     baselineChangedFingerprints: { ...runtime.git.changedPathFingerprints },
     recordedAt: new Date().toISOString(),
@@ -2000,6 +2083,39 @@ function updateRenewedLeases(
     existing.paths = renewed.paths?.length ? unique(renewed.paths) : existing.paths;
     existing.expiresAt = renewed.expiresAt;
   }
+}
+
+function adoptPreparedManagedLease(
+  state: CodexHookSessionState,
+  prepared: PrepareEditsResponse,
+  fallbackPaths: string[],
+): void {
+  const canonical = prepared.managedLease
+    ?? (prepared.claim?.acquired && isAgentLeaseResponse(prepared.claim.lease)
+      ? prepared.claim.lease
+      : undefined);
+  if (!canonical) return;
+  const existing = state.leases.find((lease) => lease.id === canonical.id);
+  const adopted: HookLeaseState = {
+    id: canonical.id,
+    paths: canonical.paths?.length ? unique(canonical.paths) : unique(fallbackPaths),
+    expiresAt: canonical.expiresAt,
+    coordinationState: existing?.coordinationState,
+  };
+  // v0.2.7 的 managedLease 是服务端 canonical 事实；采用后丢弃本地重复 Agent 租约引用。
+  state.leases = prepared.managedLease ? [adopted] : [
+    ...state.leases.filter((lease) => lease.id !== adopted.id),
+    adopted,
+  ];
+  if (prepared.managedLease) state.leaseAttributionComplete = true;
+}
+
+function isAgentLeaseResponse(lease: LeaseResponse["lease"]): lease is NonNullable<LeaseResponse["lease"]> {
+  if (!lease) return false;
+  if (lease.managedBy !== undefined) {
+    return lease.managedBy === "agent" && (lease.kind === undefined || lease.kind === "automatic");
+  }
+  return lease.kind === "automatic";
 }
 
 function synchronizeBlockedLeaseState(
@@ -2084,12 +2200,31 @@ function clearResolvedPassiveWriteBlock(state: CodexHookSessionState, checkedPat
   if (recheckedEntireRequest) state.passiveWriteBlock = undefined;
 }
 
-function normalizeCandidates(repositoryRoot: string, cwd: string, candidates: string[]): string[] {
-  return unique(
-    candidates
-      .map((candidate) => toRepositoryRelativePath(repositoryRoot, cwd, candidate))
-      .filter((candidate): candidate is string => Boolean(candidate)),
-  );
+function normalizeCandidatesWithIgnored(
+  repositoryRoot: string,
+  cwd: string,
+  candidates: string[],
+): { paths: string[]; ignoredPaths: string[] } {
+  const paths: string[] = [];
+  const ignoredPaths: string[] = [];
+  for (const candidate of candidates) {
+    const normalized = toRepositoryRelativePath(repositoryRoot, cwd, candidate);
+    if (normalized) paths.push(normalized);
+    else ignoredPaths.push(candidate);
+  }
+  return { paths: unique(paths), ignoredPaths: unique(ignoredPaths) };
+}
+
+function isTemporaryCleanupPath(candidate: string): boolean {
+  const normalized = pathKey(candidate);
+  return /(?:^|\/)(?:\.tmp|tmp|temp|\.cache|logs?|test-results?|test-output)(?:\/|$)/i.test(normalized)
+    || /(?:^|\/)(?:agent-hub|codex)[^/]*\.(?:log|tmp)$/i.test(normalized)
+    || /\.(?:log|tmp)$/i.test(normalized);
+}
+
+function formatPathDiagnostics(diagnostics: string[]): string {
+  const summary = diagnostics.slice(0, 3).join("；");
+  return diagnostics.length > 3 ? `${summary}；另有 ${diagnostics.length - 3} 项` : summary;
 }
 
 function mapRepositoryCwd(

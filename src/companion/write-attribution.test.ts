@@ -66,6 +66,111 @@ describe("Agent write attribution", () => {
     });
     expect(intent.pathCandidates).toEqual(["src/config.json"]);
     expect(intent.pathCandidates).not.toEqual(expect.arrayContaining(["$junction", "$workDir", "Junction", "-LiteralPath"]));
+    expect(intent.pathDiagnostics).toEqual(expect.arrayContaining([
+      expect.stringContaining("$junction"),
+    ]));
+  });
+
+  it("resolves provable PowerShell variables and Join-Path without executing the command", () => {
+    const intent = extractAttributedWriteIntent("Bash", {
+      command: [
+        "$root = 'C:\\project'",
+        "$relative = 'src/config.json'",
+        "$target = Join-Path -Path $root -ChildPath $relative",
+        "Set-Content -LiteralPath $target -Value '{}'",
+      ].join("; "),
+    });
+
+    expect(intent.pathCandidates).toEqual(["C:\\project\\src/config.json"]);
+    expect(intent.targets).toEqual([
+      expect.objectContaining({ pathCandidate: "C:\\project\\src/config.json", operation: "update" }),
+    ]);
+    expect(intent.pathDiagnostics).toEqual([]);
+  });
+
+  it("keeps dynamic PowerShell expressions as diagnostics instead of pseudo paths", () => {
+    const intent = extractAttributedWriteIntent("Bash", {
+      command: [
+        "$target = Join-Path $env:TEMP 'agent-hub-test.log'",
+        "Remove-Item -LiteralPath $target -ErrorAction SilentlyContinue",
+      ].join("; "),
+    });
+
+    expect(intent).toMatchObject({ writes: true, pathCandidates: [] });
+    expect(intent.pathDiagnostics.join(" ")).toContain("not a provable local constant");
+    expect(intent.pathDiagnostics.join(" ")).not.toContain("SilentlyContinue path");
+    expect(intent.pathCandidates).not.toEqual(expect.arrayContaining([
+      "(Join-Path)",
+      "SilentlyContinue",
+      "Directory",
+      "Junction",
+    ]));
+  });
+
+  it("does not treat later or conditional PowerShell assignments as proven constants", () => {
+    const assignedLater = extractAttributedWriteIntent("Bash", {
+      command: "Set-Content -LiteralPath $target -Value '{}'; $target = 'src/later.json'",
+    });
+    expect(assignedLater.pathCandidates).toEqual([]);
+    expect(assignedLater.pathDiagnostics.join(" ")).toContain("not a provable local constant");
+
+    const conditional = extractAttributedWriteIntent("Bash", {
+      command: "if ($enabled) { $target = 'src/branch.json' }; Set-Content -LiteralPath $target -Value '{}'",
+    });
+    expect(conditional.pathCandidates).toEqual([]);
+    expect(conditional.pathDiagnostics.join(" ")).toContain("not a provable local constant");
+  });
+
+  it("does not let PowerShell switches consume positional paths", () => {
+    const setContent = extractAttributedWriteIntent("Bash", {
+      command: "Set-Content -Force 'src/config.json' '{}'",
+    });
+    expect(setContent.pathCandidates).toEqual(["src/config.json"]);
+
+    const remove = extractAttributedWriteIntent("Bash", {
+      command: "Remove-Item -Recurse -Force 'temp/build'",
+    });
+    expect(remove.targets).toEqual([
+      expect.objectContaining({ pathCandidate: "temp/build", operation: "delete" }),
+    ]);
+  });
+
+  it("uses command semantics for PowerShell move and copy destinations", () => {
+    const move = extractAttributedWriteIntent("Bash", {
+      command: "Move-Item -LiteralPath 'src/old.ts' -Destination 'src/new.ts'",
+    });
+    expect(move.targets).toEqual([
+      expect.objectContaining({ pathCandidate: "src/old.ts", operation: "move" }),
+      expect.objectContaining({ pathCandidate: "src/new.ts", operation: "move" }),
+    ]);
+
+    const copy = extractAttributedWriteIntent("Bash", {
+      command: "Copy-Item -LiteralPath 'fixtures/source.json' -Destination 'artifacts/result.json'",
+    });
+    expect(copy.pathCandidates).toEqual(["artifacts/result.json"]);
+  });
+
+  it("resolves Rename-Item NewName relative to the source parent", () => {
+    const rename = extractAttributedWriteIntent("Bash", {
+      command: "Rename-Item 'src/old.ts' 'new.ts'",
+    });
+    expect(rename.targets.map((target) => ({
+      ...target,
+      pathCandidate: target.pathCandidate.replaceAll("\\", "/"),
+    }))).toEqual([
+      expect.objectContaining({ pathCandidate: "src/old.ts", operation: "move" }),
+      expect.objectContaining({ pathCandidate: "src/new.ts", operation: "move" }),
+    ]);
+    expect(rename.pathCandidates).not.toContain("new.ts");
+  });
+
+  it("treats PowerShell null redirection as a sink rather than an unresolved file", () => {
+    const intent = extractAttributedWriteIntent("Bash", {
+      command: "Set-Content -LiteralPath 'src/config.json' -Value '{}' 2>$null",
+    });
+
+    expect(intent.pathCandidates).toEqual(["src/config.json"]);
+    expect(intent.pathDiagnostics).toEqual([]);
   });
 
   it("attributes only the explicit target and classifies unrelated changes as external", () => {

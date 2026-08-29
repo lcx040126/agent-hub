@@ -29,13 +29,14 @@ describe("signed desktop update manifest", () => {
     });
   });
 
-  it("keeps the v0.2.6 manifest compatible with an in-place v0.2.5 upgrade", () => {
+  it("keeps the v0.2.7 manifest compatible with an in-place v0.2.6 upgrade", () => {
     expect(packageMetadata).toMatchObject({
-      version: "0.2.6",
+      version: "0.2.7",
       agentHub: {
         protocolVersion: 2,
-        schemaVersion: 5,
+        schemaVersion: 6,
         minimumSourceProtocolVersion: 1,
+        minimumSourceSchemaVersion: 2,
       },
     });
     const value = manifest();
@@ -50,15 +51,16 @@ describe("signed desktop update manifest", () => {
 
     expect(verifyDesktopUpdateManifest(signed.bytes, signed.signature, {
       publicKeyPem,
-      currentVersion: "0.2.5",
-      currentProtocolVersion: 1,
+      currentVersion: "0.2.6",
+      currentProtocolVersion: 2,
       currentSchemaVersion: 5,
     })).toMatchObject({
       manifest: {
-        version: "0.2.6",
+        version: "0.2.7",
         protocolVersion: 2,
-        schemaVersion: 5,
+        schemaVersion: 6,
         minimumSourceProtocolVersion: 1,
+        minimumSourceSchemaVersion: 2,
       },
     });
   });

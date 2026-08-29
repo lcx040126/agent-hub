@@ -247,6 +247,9 @@ export class TurnCompletionQueueStore {
         revision: current.revision + 1,
         // 处理快照可能依据服务端租约延长 TTL；只允许延长，不能覆盖并发 enqueue 的更新。
         expiresAt: laterIso(current.expiresAt, job.expiresAt),
+        // v0.2.7 stop 可恢复 MCP 先领取的 canonical managed lease；权威清单可补全旧本地快照。
+        leaseIds: job.leaseAttributionComplete ? unique(job.leaseIds) : current.leaseIds,
+        leaseAttributionComplete: current.leaseAttributionComplete || job.leaseAttributionComplete,
         attempts: current.attempts + 1,
         nextAttemptAt: laterIso(
           current.nextAttemptAt,

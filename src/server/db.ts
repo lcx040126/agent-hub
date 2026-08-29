@@ -5,7 +5,7 @@ import { createDefaultRiskPolicy } from "./risk-policy.js";
 
 const DEFAULT_RISK_RULES_JSON = JSON.stringify(createDefaultRiskPolicy().rules);
 const DEFAULT_RISK_RULES_SQL = DEFAULT_RISK_RULES_JSON.replaceAll("'", "''");
-const DATABASE_SCHEMA_VERSION = 5;
+const DATABASE_SCHEMA_VERSION = 6;
 
 export interface AgentHubDatabaseOptions {
   path?: string;
@@ -121,6 +121,8 @@ export class AgentHubDatabase {
         base_commit TEXT,
         mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
         kind TEXT NOT NULL DEFAULT 'standard' CHECK (kind IN ('automatic', 'standard', 'exclusive')),
+        managed_by TEXT NOT NULL DEFAULT 'manual' CHECK (managed_by IN ('manual', 'agent')),
+        created_via TEXT NOT NULL DEFAULT 'legacy' CHECK (created_via IN ('ui', 'mcp', 'hook', 'legacy')),
         status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'cancelled', 'expired')),
         decision TEXT NOT NULL CHECK (decision IN ('allow', 'warn', 'deny')),
         override_reason TEXT,
@@ -500,6 +502,16 @@ export class AgentHubDatabase {
         "ALTER TABLE leases ADD COLUMN coordination_state TEXT NOT NULL DEFAULT 'working' CHECK (coordination_state IN ('working', 'waiting', 'blocked', 'awaiting_commit'))",
       );
     }
+    if (!leaseColumns.some((column) => column.name === "managed_by")) {
+      this.connection.exec(
+        "ALTER TABLE leases ADD COLUMN managed_by TEXT NOT NULL DEFAULT 'manual' CHECK (managed_by IN ('manual', 'agent'))",
+      );
+    }
+    if (!leaseColumns.some((column) => column.name === "created_via")) {
+      this.connection.exec(
+        "ALTER TABLE leases ADD COLUMN created_via TEXT NOT NULL DEFAULT 'legacy' CHECK (created_via IN ('ui', 'mcp', 'hook', 'legacy'))",
+      );
+    }
     // schema 5 中断或手工补列后也要可重试：旧 automatic_phase 仍是迁移时的权威来源。
     this.connection.exec(`
       UPDATE leases
@@ -507,6 +519,167 @@ export class AgentHubDatabase {
       WHERE kind = 'automatic'
         AND automatic_phase = 'awaiting_commit'
         AND coordination_state = 'working'
+    `);
+    // 旧 automatic 的生命周期含义明确；普通/独占范围则必须保守地保留为人工管理。
+    this.connection.exec(`
+      UPDATE leases SET managed_by = 'agent' WHERE kind = 'automatic';
+      UPDATE leases SET managed_by = 'manual' WHERE kind IN ('standard', 'exclusive');
+    `);
+
+    // v0.2.6 的 MCP 入口曾把 Agent 领取保存为 standard。
+    // 只有明确的 MCP session 和对应领取审计同时成立时才迁移；Hook 的通用审计不足以证明调用来源。
+    const legacyStandardRows = this.connection.prepare(`
+      SELECT l.id, s.metadata_json, a.metadata_json AS activity_metadata_json
+      FROM leases l
+      JOIN work_sessions s ON s.id = l.session_id
+      JOIN activities a ON a.room_id = l.room_id
+        AND a.actor_member_id = l.member_id
+        AND a.entity_type = 'lease'
+        AND a.entity_id = l.id
+        AND a.type = 'lease.acquired'
+      WHERE l.kind = 'standard'
+        AND l.managed_by = 'manual'
+        AND l.created_via = 'legacy'
+      ORDER BY l.id, a.created_at, a.id
+    `).all() as Array<{
+      id: string;
+      metadata_json: string;
+      activity_metadata_json: string;
+    }>;
+    const promoteLegacyMcpLease = this.connection.prepare(`
+      UPDATE leases
+      SET kind = 'automatic', managed_by = 'agent', created_via = 'mcp'
+      WHERE id = ? AND kind = 'standard' AND managed_by = 'manual' AND created_via = 'legacy'
+    `);
+    const promotedLegacyLeaseIds = new Set<string>();
+    for (const row of legacyStandardRows) {
+      if (promotedLegacyLeaseIds.has(row.id)) continue;
+      const sessionMetadata = parseJsonObject(row.metadata_json);
+      const activityMetadata = parseJsonObject(row.activity_metadata_json);
+      if (sessionMetadata?.source !== "mcp" || activityMetadata?.kind !== "standard") continue;
+      promoteLegacyMcpLease.run(row.id);
+      promotedLegacyLeaseIds.add(row.id);
+    }
+
+    type ActiveAgentLeaseRow = {
+      id: string;
+      room_id: string;
+      member_id: string;
+      session_id: string;
+      mode: "read" | "write";
+      decision: "allow" | "warn" | "deny";
+      expires_at: string;
+      created_at: string;
+      updated_at: string;
+      automatic_phase: "working" | "awaiting_commit";
+      coordination_state: "working" | "waiting" | "blocked" | "awaiting_commit";
+      completion_summary: string | null;
+    };
+    const activeAgentLeases = this.connection.prepare(`
+      SELECT id, room_id, member_id, session_id, mode, decision, expires_at,
+        created_at, updated_at, automatic_phase, coordination_state, completion_summary
+      FROM leases
+      WHERE status = 'active' AND managed_by = 'agent' AND session_id IS NOT NULL
+      ORDER BY room_id, member_id, session_id, created_at, id
+    `).all() as ActiveAgentLeaseRow[];
+    const canonicalAgentLeases = new Map<string, ActiveAgentLeaseRow>();
+    const mergeLeasePaths = this.connection.prepare(`
+      INSERT INTO lease_paths (lease_id, path, path_key, risk, risk_reason)
+      SELECT ?, path, path_key, risk, risk_reason
+      FROM lease_paths
+      WHERE lease_id = ?
+      ON CONFLICT (lease_id, path_key) DO UPDATE SET
+        risk = CASE WHEN excluded.risk = 'high' THEN 'high' ELSE lease_paths.risk END,
+        risk_reason = CASE
+          WHEN excluded.risk = 'high' AND excluded.risk_reason IS NOT NULL THEN excluded.risk_reason
+          ELSE lease_paths.risk_reason
+        END
+    `);
+    const updateCanonicalAgentLease = this.connection.prepare(`
+      UPDATE leases SET
+        mode = ?, decision = ?, expires_at = ?, updated_at = ?,
+        automatic_phase = ?, coordination_state = ?,
+        completion_summary = COALESCE(completion_summary, ?)
+      WHERE id = ?
+    `);
+    const cancelMergedAgentLease = this.connection.prepare(`
+      UPDATE leases SET
+        status = 'cancelled', completed_at = COALESCE(completed_at, updated_at),
+        outcome = COALESCE(outcome, 'merged'),
+        completion_summary = CASE
+          WHEN completion_summary IS NULL OR completion_summary = '' THEN ?
+          ELSE completion_summary || char(10) || ?
+        END
+      WHERE id = ?
+    `);
+    const cancelMergedLeaseReleaseRequests = this.connection.prepare(`
+      UPDATE release_requests
+      SET status = 'cancelled', resolved_at = COALESCE(resolved_at, ?)
+      WHERE status = 'pending' AND (requester_lease_id = ? OR conflicting_lease_id = ?)
+    `);
+    for (const duplicate of activeAgentLeases) {
+      const key = `${duplicate.room_id}\u0000${duplicate.member_id}\u0000${duplicate.session_id}`;
+      const canonical = canonicalAgentLeases.get(key);
+      if (!canonical) {
+        canonicalAgentLeases.set(key, duplicate);
+        continue;
+      }
+
+      mergeLeasePaths.run(canonical.id, duplicate.id);
+      canonical.mode = canonical.mode === "write" || duplicate.mode === "write" ? "write" : "read";
+      canonical.decision = stricterLeaseDecision(canonical.decision, duplicate.decision);
+      canonical.expires_at = laterIsoTimestamp(canonical.expires_at, duplicate.expires_at);
+      canonical.updated_at = laterIsoTimestamp(canonical.updated_at, duplicate.updated_at);
+      canonical.automatic_phase = canonical.automatic_phase === "awaiting_commit"
+        || duplicate.automatic_phase === "awaiting_commit"
+        ? "awaiting_commit"
+        : "working";
+      canonical.coordination_state = stricterCoordinationState(
+        canonical.coordination_state,
+        duplicate.coordination_state,
+      );
+      if (canonical.coordination_state === "blocked" || canonical.coordination_state === "awaiting_commit") {
+        canonical.automatic_phase = "awaiting_commit";
+      }
+      canonical.completion_summary ??= duplicate.completion_summary;
+      updateCanonicalAgentLease.run(
+        canonical.mode,
+        canonical.decision,
+        canonical.expires_at,
+        canonical.updated_at,
+        canonical.automatic_phase,
+        canonical.coordination_state,
+        canonical.completion_summary,
+        canonical.id,
+      );
+      const mergeSummary = `Merged into Agent lease ${canonical.id} during schema 6 migration.`;
+      cancelMergedAgentLease.run(mergeSummary, mergeSummary, duplicate.id);
+      cancelMergedLeaseReleaseRequests.run(duplicate.updated_at, duplicate.id, duplicate.id);
+    }
+
+    // SQLite 无法在旧表上补充跨列 CHECK；触发器让升级库和新库保持同一管理类型约束。
+    this.connection.exec(`
+      CREATE TRIGGER IF NOT EXISTS leases_management_kind_insert
+      BEFORE INSERT ON leases
+      WHEN NOT (
+        (NEW.managed_by = 'agent' AND NEW.kind = 'automatic')
+        OR (NEW.managed_by = 'manual' AND NEW.kind IN ('standard', 'exclusive'))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'lease management must match lease kind');
+      END;
+      CREATE TRIGGER IF NOT EXISTS leases_management_kind_update
+      BEFORE UPDATE OF managed_by, kind ON leases
+      WHEN NOT (
+        (NEW.managed_by = 'agent' AND NEW.kind = 'automatic')
+        OR (NEW.managed_by = 'manual' AND NEW.kind IN ('standard', 'exclusive'))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'lease management must match lease kind');
+      END;
+      CREATE UNIQUE INDEX IF NOT EXISTS leases_active_agent_session_idx
+      ON leases(room_id, member_id, session_id)
+      WHERE status = 'active' AND managed_by = 'agent' AND session_id IS NOT NULL;
     `);
     this.connection.exec("CREATE INDEX IF NOT EXISTS leases_session_idx ON leases(session_id)");
 
@@ -649,4 +822,35 @@ function codexSessionIdFromMetadata(value: string): string | null {
   } catch {
     return null;
   }
+}
+
+function parseJsonObject(value: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function laterIsoTimestamp(left: string, right: string): string {
+  return left >= right ? left : right;
+}
+
+function stricterLeaseDecision(
+  left: "allow" | "warn" | "deny",
+  right: "allow" | "warn" | "deny",
+): "allow" | "warn" | "deny" {
+  const rank = { allow: 0, warn: 1, deny: 2 } as const;
+  return rank[left] >= rank[right] ? left : right;
+}
+
+function stricterCoordinationState(
+  left: "working" | "waiting" | "blocked" | "awaiting_commit",
+  right: "working" | "waiting" | "blocked" | "awaiting_commit",
+): "working" | "waiting" | "blocked" | "awaiting_commit" {
+  const rank = { working: 0, waiting: 1, awaiting_commit: 2, blocked: 3 } as const;
+  return rank[left] >= rank[right] ? left : right;
 }

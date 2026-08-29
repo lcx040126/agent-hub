@@ -46,6 +46,7 @@ export type RoomSettings = {
 
 export type Lease = {
   id: string;
+  sessionId?: string;
   title: string;
   objective?: string;
   memberId?: string;
@@ -56,6 +57,8 @@ export type Lease = {
   highRiskPaths: string[];
   mode: "write" | "read";
   kind: "automatic" | "standard" | "exclusive";
+  managedBy: "manual" | "agent";
+  createdVia: "ui" | "mcp" | "hook" | "legacy";
   phase?: "working" | "waiting" | "blocked" | "awaiting_commit";
   status: string;
   createdAt?: string;
@@ -106,6 +109,9 @@ export type ActivityItem = {
 export type AgentSession = {
   id: string;
   memberId: string;
+  codexSessionId?: string;
+  currentTurnId?: string;
+  activityEpoch?: number;
   clientName?: string;
   agentName?: string;
   task?: string;
@@ -117,6 +123,36 @@ export type AgentSession = {
   clientVersion?: string;
   protocolVersion?: number;
   schemaVersion?: number;
+};
+
+export type LeaseScopeEventMetadata = {
+  invocationId?: string;
+  source?: "ui" | "mcp" | "hook" | "legacy";
+  toolName?: string;
+  stage?: "pre" | "post";
+  turnId?: string;
+  requestedPaths: string[];
+  coveredPaths: string[];
+  addedPaths: string[];
+  ignoredPaths: string[];
+  actualPaths: string[];
+  pathDiagnostics: string[];
+};
+
+export type LeaseScopeEvent = {
+  id: string;
+  type: string;
+  actorName?: string;
+  memberName?: string;
+  title: string;
+  summary?: string;
+  metadata: LeaseScopeEventMetadata;
+  createdAt?: string;
+};
+
+export type LeaseScopeEventPage = {
+  items: LeaseScopeEvent[];
+  nextBefore?: string;
 };
 
 export type ReleaseRequest = {
@@ -337,7 +373,6 @@ export type CreateLeaseInput = {
   paths: string[];
   ttlMinutes: number;
   kind?: "standard" | "exclusive";
-  autoClaim?: boolean;
 };
 
 export type CloseLeaseInput = {
@@ -367,6 +402,7 @@ export type CreateRecordInput = {
 export type LeaseDecision = {
   acquired: boolean;
   lease?: Lease;
+  coverage: LeaseCoverage[];
   conflicts: Conflict[];
   decision: "allow" | "warn" | "deny" | "wait";
   releaseRequests: ReleaseRequest[];
@@ -378,6 +414,13 @@ export type LeaseDecision = {
     expiresAt: string;
     paths: string[];
   };
+};
+
+export type LeaseCoverage = {
+  leaseId: string;
+  managedBy: "manual" | "agent";
+  paths: string[];
+  action: "covered" | "added";
 };
 
 const SESSION_POINTER_KEY = "agent-hub.session.public.v3";
@@ -495,8 +538,14 @@ function normalizeLease(value: unknown): Lease {
   const normalizedPaths = pathValues(lease.paths);
   const detailedPaths = pathValues(lease.pathDetails);
   const phase = asString(lease.phase);
+  const kind = ["automatic", "standard", "exclusive"].includes(asString(lease.kind))
+    ? asString(lease.kind) as Lease["kind"]
+    : "standard";
+  const managedBy = asString(lease.managedBy, asString(lease.managed_by));
+  const createdVia = asString(lease.createdVia, asString(lease.created_via));
   return {
     id: asString(lease.id),
+    sessionId: asString(lease.sessionId, asString(lease.session_id)) || undefined,
     title: asString(lease.title, "未命名工作"),
     objective: asString(lease.objective, asString(lease.intent, asString(lease.description))) || undefined,
     memberId: asString(lease.memberId, asString(member.id)) || undefined,
@@ -510,9 +559,14 @@ function normalizeLease(value: unknown): Lease {
       ...asStringArray(lease.highRiskPaths),
     ])],
     mode: lease.mode === "read" ? "read" : "write",
-    kind: ["automatic", "standard", "exclusive"].includes(asString(lease.kind))
-      ? asString(lease.kind) as Lease["kind"]
-      : "standard",
+    kind,
+    // schema 5 及更早的响应没有来源字段；automatic 是唯一可安全识别的 Agent 托管信号。
+    managedBy: ["manual", "agent"].includes(managedBy)
+      ? managedBy as Lease["managedBy"]
+      : kind === "automatic" ? "agent" : "manual",
+    createdVia: ["ui", "mcp", "hook", "legacy"].includes(createdVia)
+      ? createdVia as Lease["createdVia"]
+      : "legacy",
     phase: ["working", "waiting", "blocked", "awaiting_commit"].includes(phase)
       ? phase as Lease["phase"]
       : "working",
@@ -715,6 +769,13 @@ function normalizeAgentSession(value: unknown): AgentSession {
   return {
     id: asString(session.id),
     memberId: asString(session.memberId),
+    codexSessionId: asString(session.codexSessionId, asString(session.codex_session_id)) || undefined,
+    currentTurnId: asString(session.currentTurnId, asString(session.current_turn_id)) || undefined,
+    activityEpoch: typeof session.activityEpoch === "number" && Number.isFinite(session.activityEpoch)
+      ? session.activityEpoch
+      : typeof session.activity_epoch === "number" && Number.isFinite(session.activity_epoch)
+        ? session.activity_epoch
+        : undefined,
     clientName: asString(session.clientName) || undefined,
     agentName: asString(session.agentName) || undefined,
     task: asString(session.task) || undefined,
@@ -726,6 +787,53 @@ function normalizeAgentSession(value: unknown): AgentSession {
     clientVersion: asString(session.clientVersion) || undefined,
     protocolVersion: typeof session.protocolVersion === "number" ? session.protocolVersion : undefined,
     schemaVersion: typeof session.schemaVersion === "number" ? session.schemaVersion : undefined,
+  };
+}
+
+function normalizeLeaseScopeEvent(value: unknown): LeaseScopeEvent {
+  const event = asObject(value);
+  const metadata = asObject(event.metadata);
+  const source = asString(metadata.source);
+  const stage = asString(metadata.stage);
+  return {
+    id: asString(event.id),
+    type: asString(event.type),
+    actorName: asString(event.actorName) || undefined,
+    memberName: asString(event.memberName) || undefined,
+    title: asString(event.title, asString(event.summary, "范围调用记录")),
+    summary: asString(event.summary) || undefined,
+    metadata: {
+      invocationId: asString(metadata.invocationId) || undefined,
+      source: ["ui", "mcp", "hook", "legacy"].includes(source)
+        ? source as LeaseScopeEventMetadata["source"]
+        : undefined,
+      toolName: asString(metadata.toolName) || undefined,
+      stage: ["pre", "post"].includes(stage) ? stage as LeaseScopeEventMetadata["stage"] : undefined,
+      turnId: asString(metadata.turnId) || undefined,
+      requestedPaths: asStringArray(metadata.requestedPaths),
+      coveredPaths: asStringArray(metadata.coveredPaths),
+      addedPaths: asStringArray(metadata.addedPaths),
+      ignoredPaths: asStringArray(metadata.ignoredPaths),
+      actualPaths: asStringArray(metadata.actualPaths),
+      pathDiagnostics: asStringArray(metadata.pathDiagnostics),
+    },
+    createdAt: asString(event.createdAt) || undefined,
+  };
+}
+
+function normalizeLeaseCoverage(value: unknown): LeaseCoverage | undefined {
+  const coverage = asObject(value);
+  const leaseId = asString(coverage.leaseId);
+  const managedBy = asString(coverage.managedBy);
+  const action = asString(coverage.action);
+  if (!leaseId || !["manual", "agent"].includes(managedBy) || !["covered", "added"].includes(action)) {
+    return undefined;
+  }
+  return {
+    leaseId,
+    managedBy: managedBy as LeaseCoverage["managedBy"],
+    paths: asStringArray(coverage.paths),
+    action: action as LeaseCoverage["action"],
   };
 }
 
@@ -1256,6 +1364,27 @@ export async function getDashboard(access: RequestAccess, roomToken?: string): P
   };
 }
 
+export async function getLeaseScopeEvents(
+  access: RequestAccess,
+  leaseId: string,
+  options: { limit?: number; before?: string } = {},
+): Promise<LeaseScopeEventPage> {
+  const requestedLimit = typeof options.limit === "number" && Number.isFinite(options.limit)
+    ? options.limit
+    : 50;
+  const limit = Math.min(100, Math.max(1, Math.trunc(requestedLimit)));
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (options.before) query.set("before", options.before);
+  const payload = asObject(await requestFirst(
+    [{ path: `/api/leases/${encodeURIComponent(leaseId)}/scope-events?${query.toString()}` }],
+    access,
+  ));
+  return {
+    items: firstArray(payload.items).map(normalizeLeaseScopeEvent),
+    nextBefore: asString(payload.nextBefore) || undefined,
+  };
+}
+
 export async function createLease(access: RequestAccess, input: CreateLeaseInput): Promise<LeaseDecision> {
   const body = JSON.stringify({
     title: input.title,
@@ -1265,8 +1394,8 @@ export async function createLease(access: RequestAccess, input: CreateLeaseInput
     paths: input.paths,
     mode: "write",
     ttlMinutes: input.ttlMinutes,
-    kind: input.kind,
-    autoClaim: input.autoClaim,
+    // 这个客户端入口只创建人工租约。Agent 领取分别由 MCP 和 Hook 的专用入口负责。
+    kind: input.kind ?? "standard",
   });
   const payload = asObject(
     await requestFirst(
@@ -1286,6 +1415,10 @@ export async function createLease(access: RequestAccess, input: CreateLeaseInput
   return {
     acquired,
     lease: payload.lease ? normalizeLease(payload.lease) : undefined,
+    coverage: firstArray(payload.coverage).flatMap((item) => {
+      const coverage = normalizeLeaseCoverage(item);
+      return coverage ? [coverage] : [];
+    }),
     conflicts,
     decision: ["allow", "warn", "deny", "wait"].includes(rawDecision)
       ? (rawDecision as LeaseDecision["decision"])

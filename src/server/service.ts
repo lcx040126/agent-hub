@@ -26,8 +26,11 @@ import {
   type Lease,
   type LeaseClaimResult,
   type LeaseConflict,
+  type LeaseCoverage,
   type LeaseKind,
+  type LeaseManagement,
   type LeaseMode,
+  type LeaseSource,
   type ListReleaseRequestsInput,
   type ListActivityInput,
   type LocalScan,
@@ -186,6 +189,12 @@ export interface PrepareEditsInput extends CheckEditsInput {
   operationId?: string;
   turnId?: string;
   activityEpoch?: number;
+  invocationId?: string;
+  toolName?: string;
+  stage?: "pre" | "post";
+  ignoredPaths?: string[];
+  actualPaths?: string[];
+  pathDiagnostics?: string[];
 }
 
 export interface MarkWriteBlockedInput {
@@ -209,6 +218,12 @@ export interface SessionActivityOperationResult {
   previousResult?: Exclude<SessionActivityOperationResultKind, "already_applied">;
   releasedLeaseIds: string[];
   awaitingAutomaticLeases?: Array<{ id: string; expiresAt: string }>;
+  managedLeases?: Array<{ id: string; paths: string[]; expiresAt: string }>;
+}
+
+export interface LeaseScopeEventsResult {
+  items: Activity[];
+  nextBefore?: string;
 }
 
 export interface SessionActivityOperationInput {
@@ -279,6 +294,9 @@ export interface DashboardData {
     | "clientVersion"
     | "protocolVersion"
     | "schemaVersion"
+    | "codexSessionId"
+    | "currentTurnId"
+    | "activityEpoch"
   >>;
   localScans: Array<Pick<LocalScan, "id" | "sessionId" | "memberId" | "scannedAt">>;
   settings: RoomSettings;
@@ -969,7 +987,7 @@ export class AgentHubService {
             END,
             decision = CASE WHEN decision = 'deny' THEN 'warn' ELSE decision END,
             updated_at = ?
-          WHERE room_id = ? AND status = 'active' AND kind = 'automatic'
+          WHERE room_id = ? AND status = 'active' AND managed_by = 'agent'
             AND coordination_state IN ('blocked', 'waiting')
         `).run(now, auth.room.id);
         this.database.connection.prepare(`
@@ -1142,7 +1160,7 @@ export class AgentHubService {
   exportContext(memberToken: string): ContextExport {
     const auth = this.authenticateMemberToken(memberToken);
     this.requireAdmin(auth);
-    return {
+    const exported: ContextExport = {
       format: "agent-hub-context",
       version: 1,
       room: { id: auth.room.id, name: auth.room.name, projectName: auth.room.projectName },
@@ -1153,6 +1171,12 @@ export class AgentHubService {
       handoffs: this.listHandoffs(auth.room.id).map(({ id, roomId, fromMemberId, toMemberId, leaseId, ...entry }) => ({ ...entry, originalId: id })),
       records: this.listRecords(auth.room.id).map(({ id, roomId, memberId, ...entry }) => ({ ...entry, originalId: id })),
     };
+    // 上下文导出可能包含用户或旧客户端写入的自由文本；在统一出口按房间会话事实脱敏，
+    // 避免 Codex/Hub/Turn/finalization 完整标识从 evidence、summary 或 originalId 间接泄露。
+    return redactContextExportSessionIdentifiers(
+      exported,
+      this.sessionIdentifiersForContextExport(auth.room.id),
+    );
   }
 
   importContext(input: ImportContextInput): { imported: number; rejected: number } {
@@ -1227,7 +1251,43 @@ export class AgentHubService {
     const branch = optionalString(input.branch, "Branch", 255);
     const baseCommit = optionalString(input.baseCommit, "Base commit", 255);
     const mode = normalizeLeaseMode(input.mode);
-    const kind = normalizeLeaseKind(input.kind, input.autoClaim);
+    const requestedKind = normalizeLeaseKind(input.kind, input.autoClaim);
+    const managedBy: LeaseManagement = input.managedBy
+      ?? (input.autoClaim || requestedKind === "automatic" ? "agent" : "manual");
+    const createdVia: LeaseSource = input.createdVia
+      ?? (managedBy === "agent" ? (input.autoClaim ? "hook" : "legacy") : "ui");
+    const kind: LeaseKind = managedBy === "agent" ? "automatic" : requestedKind;
+    if (managedBy === "agent" && input.kind !== undefined && input.kind !== "automatic") {
+      throw new AgentHubError(
+        "invalid_lease_management",
+        "An Agent-managed lease must use automatic coordination.",
+      );
+    }
+    if (managedBy === "manual" && kind === "automatic") {
+      throw new AgentHubError(
+        "invalid_lease_management",
+        "A manual lease must use standard or exclusive coordination.",
+      );
+    }
+    if (managedBy === "agent" && createdVia === "ui") {
+      throw new AgentHubError(
+        "invalid_lease_source",
+        "An Agent-managed lease cannot be created by the manual UI route.",
+      );
+    }
+    if (managedBy === "manual" && (createdVia === "mcp" || createdVia === "hook")) {
+      throw new AgentHubError(
+        "invalid_lease_source",
+        "MCP and Hook lease claims must use Agent-managed coordination.",
+      );
+    }
+    if (managedBy === "agent" && !sessionId && createdVia !== "legacy") {
+      throw new AgentHubError(
+        "agent_session_required",
+        "An Agent-managed lease requires an active Hub session.",
+        409,
+      );
+    }
     if (kind === "exclusive" && mode !== "write") {
       throw new AgentHubError("invalid_lease_kind", "A manual exclusive lease must use write mode.");
     }
@@ -1246,15 +1306,26 @@ export class AgentHubService {
     }
     const createdAt = this.timestamp();
     const expiresAt = new Date(this.now().getTime() + durationMinutes * 60_000).toISOString();
+    const invocationId = optionalString(input.invocationId, "Invocation id", 200)
+      ?? (managedBy === "agent" ? randomUUID() : null);
+    const toolName = optionalString(input.toolName, "Tool name", 200);
+    if (input.stage !== undefined && input.stage !== "pre" && input.stage !== "post") {
+      throw new AgentHubError("invalid_scope_stage", "Scope audit stage must be pre or post.");
+    }
+    const stage = input.stage ?? "pre";
+    const ignoredPaths = stringArray(input.ignoredPaths ?? [], "Ignored paths", 500, 2000);
+    const actualPaths = stringArray(input.actualPaths ?? [], "Actual paths", 500, 2000);
+    const pathDiagnostics = stringArray(input.pathDiagnostics ?? [], "Path diagnostics", 100, 2000);
 
     return this.database.transaction(() => {
       this.expireLeases(auth.room.id, false);
-      const blockedSessionLease = settings.blockingProtectionEnabled && kind === "automatic" && sessionId
-        ? this.listLeases(auth.room.id, true).find((lease) =>
-            lease.sessionId === sessionId
-            && lease.memberId === auth.member.id
-            && lease.kind === "automatic"
-            && lease.phase === "blocked")
+      const activeLeases = this.listLeases(auth.room.id, true);
+      const blockedSessionLease = settings.blockingProtectionEnabled && managedBy === "agent" && sessionId
+        ? activeLeases.find((lease) =>
+             lease.sessionId === sessionId
+             && lease.memberId === auth.member.id
+            && lease.managedBy === "agent"
+             && lease.phase === "blocked")
         : undefined;
       if (blockedSessionLease) {
         throw new AgentHubError(
@@ -1264,12 +1335,137 @@ export class AgentHubService {
           { leaseId: blockedSessionLease.id, expiresAt: blockedSessionLease.expiresAt },
         );
       }
-      const coordinationWait = settings.blockingProtectionEnabled && kind === "automatic" && mode === "write"
+
+      const manualCoverage = new Map<string, { lease: Lease; paths: string[] }>();
+      const agentPaths = managedBy === "agent"
+        ? paths.filter((path) => {
+            const covering = activeLeases
+              .filter((lease) =>
+                lease.memberId === auth.member.id
+                && lease.managedBy === "manual"
+                // 人工只读范围不能充当 Agent 写入围栏；读取请求则可复用任一人工范围。
+                && (mode === "read" || lease.mode === "write")
+                && lease.paths.some((scope) => pathScopeCovers(scope.path, path.path)))
+              .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+            for (const lease of covering) {
+              const entry = manualCoverage.get(lease.id) ?? { lease, paths: [] };
+              entry.paths.push(path.path);
+              manualCoverage.set(lease.id, entry);
+            }
+            return covering.length === 0;
+          })
+        : paths;
+      const canonicalAgentLease = managedBy === "agent" && sessionId
+        ? activeLeases
+            .filter((lease) =>
+              lease.memberId === auth.member.id
+              && lease.sessionId === sessionId
+              && lease.managedBy === "agent")
+            .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))[0]
+        : undefined;
+      if (canonicalAgentLease && canonicalAgentLease.phase !== "working") {
+        throw new AgentHubError(
+          "session_write_blocked",
+          "This Agent session is awaiting completion and cannot expand its managed scope.",
+          409,
+          { leaseId: canonicalAgentLease.id, expiresAt: canonicalAgentLease.expiresAt },
+        );
+      }
+      // 旧客户端没有 Hub Session，只能复用已经完整覆盖本次请求的 Agent 租约。
+      // 这保留重试幂等性，但绝不能把无 Session 的新路径扩展进另一项任务。
+      const legacyCoveredAgentLease = managedBy === "agent" && createdVia === "legacy" && !sessionId
+        ? activeLeases
+            .filter((lease) =>
+              lease.memberId === auth.member.id
+              && lease.managedBy === "agent"
+              && lease.phase === "working"
+              && paths.every((requestedPath) => lease.paths.some(
+                (scope) => pathScopeCovers(scope.path, requestedPath.path),
+              )))
+            .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))[0]
+        : undefined;
+      const reusableLease = managedBy === "agent"
+        ? canonicalAgentLease ?? legacyCoveredAgentLease
+        : activeLeases.find((lease) =>
+            lease.memberId === auth.member.id
+            && lease.sessionId === sessionId
+            && lease.mode === mode
+            && lease.kind === kind
+            && lease.managedBy === "manual"
+            && paths.every((requestedPath) => lease.paths.some(
+              (scope) => pathScopeCovers(scope.path, requestedPath.path),
+            )),
+          );
+      const previouslyCoveredAgentPaths = reusableLease?.managedBy === "agent"
+        ? agentPaths.filter((requestedPath) => reusableLease.paths.some(
+            (scope) => pathScopeCovers(scope.path, requestedPath.path),
+          ))
+        : [];
+      const recognizedCoverage: LeaseCoverage[] = [
+        ...[...manualCoverage.values()].map(({ lease, paths: coveredPaths }) => ({
+          leaseId: lease.id,
+          managedBy: lease.managedBy,
+          paths: uniqueStrings(coveredPaths),
+          action: "covered" as const,
+        })),
+        ...(reusableLease?.managedBy === "agent" && previouslyCoveredAgentPaths.length > 0
+          ? [{
+              leaseId: reusableLease.id,
+              managedBy: reusableLease.managedBy,
+              paths: previouslyCoveredAgentPaths.map((path) => path.path),
+              action: "covered" as const,
+            }]
+          : []),
+      ];
+      const unacquiredScopeMetadata = {
+        invocationId,
+        source: createdVia,
+        toolName,
+        stage,
+        turnId: input.turnId ?? null,
+        requestedPaths: paths.map((path) => path.path),
+        coveredPaths: uniqueStrings(recognizedCoverage.flatMap((entry) => entry.paths)),
+        addedPaths: [],
+        ignoredPaths,
+        actualPaths,
+        pathDiagnostics,
+      };
+      // 未取得范围时仍需保留完整调用证据，但不能把本次调用归到阻塞方租约。
+      const recordUnacquiredScopeAudit = () => {
+        if (!invocationId) return;
+        if (reusableLease?.managedBy === "agent") {
+          this.insertLeaseScopeActivity(
+            auth,
+            reusableLease.id,
+            "lease.scope_observed",
+            createdAt,
+            unacquiredScopeMetadata,
+          );
+          return;
+        }
+        if (sessionId) {
+          this.insertActivity({
+            roomId: auth.room.id,
+            actorMemberId: auth.member.id,
+            actorName: auth.member.displayName,
+            type: "lease.scope_observed",
+            entityType: "session",
+            entityId: sessionId,
+            summary: `${auth.member.displayName} observed a scope that was not acquired.`,
+            metadata: unacquiredScopeMetadata,
+            createdAt,
+          });
+        }
+      };
+      const coordinationWait = settings.blockingProtectionEnabled
+        && managedBy === "agent"
+        && mode === "write"
+        && agentPaths.length > 0
         ? this.coordinateAutomaticLeaseClaim(
             auth.room.id,
             auth.member.id,
             sessionId,
-            paths.map((path) => path.path),
+            agentPaths.map((path) => path.path),
             createdAt,
           )
         : null;
@@ -1283,31 +1479,26 @@ export class AgentHubService {
           entityId: coordinationWait.leaseId,
           summary: `${auth.member.displayName}'s automatic lease is waiting for another active session lease.`,
           metadata: {
+            ...unacquiredScopeMetadata,
             title,
             kind,
             paths: paths.map((path) => path.path),
             waitingFor: coordinationWait,
+            managedBy,
+            createdVia,
           },
           createdAt,
         });
+        recordUnacquiredScopeAudit();
         return {
           acquired: false,
           decision: "wait",
           conflicts: [],
           releaseRequests: [],
+          coverage: recognizedCoverage,
           waitingFor: coordinationWait,
         } as LeaseClaimResult;
       }
-      const reusableLease = this.listLeases(auth.room.id, true).find((lease) =>
-        lease.memberId === auth.member.id
-        && lease.sessionId === sessionId
-        && lease.mode === mode
-        && lease.kind === kind
-        && (lease.kind !== "automatic" || lease.phase === "working")
-        && paths.every((requestedPath) => lease.paths.some(
-          (scope) => pathScopeCovers(scope.path, requestedPath.path),
-        )),
-      );
       const conflicts = mode === "write"
         ? this.findLeaseConflicts(
             auth.room.id,
@@ -1316,7 +1507,10 @@ export class AgentHubService {
             kind,
             paths,
             settings,
-            reusableLease ? [reusableLease.id] : [],
+            [
+              ...(reusableLease ? [reusableLease.id] : []),
+              ...manualCoverage.keys(),
+            ],
           )
         : [];
       // severity 只决定黄/红展示；只有 decision=deny 才能拒绝登记。
@@ -1324,43 +1518,80 @@ export class AgentHubService {
       const hasWarning = conflicts.some((conflict) => conflict.decision === "warn");
       const decision = hasDenied ? "deny" : hasWarning ? "warn" : "allow";
       const canAcquire = !hasDenied;
-      const leaseId = canAcquire ? reusableLease?.id ?? randomUUID() : null;
-      const effectiveExpiresAt = reusableLease && !shouldHeartbeatRenew(reusableLease.kind)
+      const createsAgentLease = managedBy === "agent" && !reusableLease && agentPaths.length > 0;
+      const manualResultLease = managedBy === "agent" && !reusableLease && agentPaths.length === 0
+        ? [...manualCoverage.values()]
+            .map((entry) => entry.lease)
+            .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))[0]
+        : undefined;
+      const leaseId = canAcquire
+        ? reusableLease?.id ?? (createsAgentLease || managedBy === "manual" ? randomUUID() : manualResultLease?.id ?? null)
+        : null;
+      const effectiveExpiresAt = manualResultLease?.expiresAt ?? (reusableLease && !shouldHeartbeatRenew(reusableLease.kind)
         ? reusableLease.expiresAt
-        : expiresAt;
+        : reusableLease && reusableLease.expiresAt > expiresAt
+          ? reusableLease.expiresAt
+          : expiresAt);
+      const addedAgentPaths = managedBy === "agent"
+        ? agentPaths.filter((requestedPath) => !reusableLease?.paths.some(
+            (scope) => pathScopeCovers(scope.path, requestedPath.path),
+          ))
+        : [];
 
       if (leaseId && !reusableLease) {
-        this.database.connection
-          .prepare(`
-            INSERT INTO leases (
-              id, room_id, member_id, session_id, title, intent, branch, base_commit, mode, kind, status,
-              decision, override_reason, expires_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
-          `)
-          .run(
-            leaseId,
-            auth.room.id,
-            auth.member.id,
-            sessionId,
-            title,
-            objective,
-            branch,
-            baseCommit,
-            mode,
-            kind,
-            decision,
-            overrideReason,
-            expiresAt,
-            createdAt,
-            createdAt,
-          );
-        const insertPath = this.database.connection.prepare(`
-          INSERT INTO lease_paths (lease_id, path, path_key, risk, risk_reason)
-          VALUES (?, ?, ?, ?, ?)
-        `);
-        for (const path of paths) {
-          insertPath.run(leaseId, path.path, pathComparisonKey(path.path), path.risk, path.riskReason);
+        if (managedBy === "manual" || createsAgentLease) {
+          this.database.connection
+            .prepare(`
+              INSERT INTO leases (
+                id, room_id, member_id, session_id, title, intent, branch, base_commit, mode, kind,
+                managed_by, created_via, status, decision, override_reason, expires_at, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+            `)
+            .run(
+              leaseId,
+              auth.room.id,
+              auth.member.id,
+              sessionId,
+              title,
+              objective,
+              branch,
+              baseCommit,
+              mode,
+              kind,
+              managedBy,
+              createdVia,
+              decision,
+              overrideReason,
+              expiresAt,
+              createdAt,
+              createdAt,
+            );
+          this.replaceLeasePaths(leaseId, managedBy === "agent" ? agentPaths : paths);
         }
+      } else if (leaseId && reusableLease && reusableLease.managedBy === "agent") {
+        const shouldUpdateAgentTitle = createdVia === "mcp" || reusableLease.createdVia !== "mcp";
+        const compactedPaths = compactCoordinationPaths([
+          ...reusableLease.paths,
+          ...agentPaths,
+        ]);
+        this.database.connection.prepare(`
+          UPDATE leases SET
+            title = ?, intent = ?, branch = COALESCE(?, branch), base_commit = COALESCE(?, base_commit),
+            mode = CASE WHEN mode = 'write' OR ? = 'write' THEN 'write' ELSE 'read' END,
+            expires_at = ?, updated_at = ?, decision = ?
+          WHERE id = ? AND status = 'active' AND managed_by = 'agent'
+        `).run(
+          shouldUpdateAgentTitle ? title : reusableLease.title,
+          shouldUpdateAgentTitle ? objective : reusableLease.objective ?? "",
+          branch,
+          baseCommit,
+          mode,
+          effectiveExpiresAt,
+          createdAt,
+          decision,
+          leaseId,
+        );
+        this.replaceLeasePaths(leaseId, compactedPaths);
       } else if (leaseId && reusableLease && shouldHeartbeatRenew(reusableLease.kind)) {
         this.database.connection.prepare(`
           UPDATE leases SET expires_at = ?, updated_at = ?, decision = ? WHERE id = ?
@@ -1393,7 +1624,7 @@ export class AgentHubService {
       const releaseRequests = hasDenied
         ? this.ensureReleaseRequests(auth, {
             sessionId,
-            requesterLeaseId: null,
+            requesterLeaseId: reusableLease?.id ?? null,
             title,
             objective,
             branch,
@@ -1420,6 +1651,7 @@ export class AgentHubService {
               ? `${auth.member.displayName}'s lease was denied by a blocking overlap.`
               : `${auth.member.displayName}'s lease could not be acquired.`,
           metadata: {
+            ...unacquiredScopeMetadata,
             title,
             kind,
             decision,
@@ -1428,34 +1660,89 @@ export class AgentHubService {
           },
           createdAt,
         });
-        return { acquired: false, decision, conflicts, releaseRequests } as LeaseClaimResult;
+        recordUnacquiredScopeAudit();
+        return { acquired: false, decision, conflicts, releaseRequests, coverage: recognizedCoverage } as LeaseClaimResult;
       }
+
+      const coverage = [
+        ...recognizedCoverage,
+        ...(managedBy === "agent" && addedAgentPaths.length > 0 && leaseId
+          ? [{
+              leaseId,
+              managedBy: "agent" as const,
+              paths: addedAgentPaths.map((path) => path.path),
+              action: "added" as const,
+            }]
+          : []),
+      ];
 
       this.insertActivity({
         roomId: auth.room.id,
         actorMemberId: auth.member.id,
         actorName: auth.member.displayName,
-          type: reusableLease ? "lease.reused" : "lease.acquired",
+        type: reusableLease || manualResultLease ? "lease.reused" : "lease.acquired",
         entityType: "lease",
         entityId: leaseId,
-        summary: reusableLease
+        summary: reusableLease || manualResultLease
           ? `${auth.member.displayName} reused an existing ${kind} lease for ${title}.`
           : `${auth.member.displayName} registered ${mode} work: ${title}.`,
         metadata: {
           paths: paths.map((path) => path.path),
           decision,
           kind,
+          managedBy,
+          createdVia,
           expiresAt: effectiveExpiresAt,
           hasOverride: Boolean(overrideReason),
         },
         createdAt,
       });
+      if (managedBy === "agent" && invocationId) {
+        for (const entry of manualCoverage.values()) {
+          this.insertLeaseScopeActivity(auth, entry.lease.id, "lease.scope_covered", createdAt, {
+            invocationId,
+            source: createdVia,
+            toolName,
+            stage,
+            turnId: input.turnId ?? null,
+            requestedPaths: paths.map((path) => path.path),
+            coveredPaths: uniqueStrings(entry.paths),
+            addedPaths: [],
+            ignoredPaths,
+            actualPaths,
+            pathDiagnostics,
+          });
+        }
+        const managedLeaseId = reusableLease?.managedBy === "agent" || createsAgentLease ? leaseId : null;
+        if (managedLeaseId) {
+          this.insertLeaseScopeActivity(
+            auth,
+            managedLeaseId,
+            addedAgentPaths.length > 0 ? "lease.scope_expanded" : "lease.scope_observed",
+            createdAt,
+            {
+              invocationId,
+              source: createdVia,
+              toolName,
+              stage,
+              turnId: input.turnId ?? null,
+              requestedPaths: paths.map((path) => path.path),
+              coveredPaths: previouslyCoveredAgentPaths.map((path) => path.path),
+              addedPaths: addedAgentPaths.map((path) => path.path),
+              ignoredPaths,
+              actualPaths,
+              pathDiagnostics,
+            },
+          );
+        }
+      }
       return {
         acquired: true,
         decision,
         lease: this.requireLeaseById(leaseId),
         conflicts,
         releaseRequests,
+        coverage,
       } as LeaseClaimResult;
     });
   }
@@ -1476,7 +1763,7 @@ export class AgentHubService {
       }
       if (
         settings.blockingProtectionEnabled
-        && lease.kind === "automatic"
+        && lease.managedBy === "agent"
         && lease.phase === "blocked"
       ) {
         throw new AgentHubError(
@@ -1844,14 +2131,14 @@ export class AgentHubService {
     const blockedOwnedLeases = leases.filter((lease) =>
       lease.memberId === auth.member.id
       && lease.sessionId === sessionId
-      && lease.kind === "automatic"
+      && lease.managedBy === "agent"
       && lease.phase === "blocked");
     const ownedLeases = leases.filter(
       (lease) =>
         lease.memberId === auth.member.id &&
         lease.mode === "write" &&
-        lease.sessionId === sessionId &&
-        (monitorOnly || lease.kind !== "automatic" || lease.phase === "working") &&
+        (lease.managedBy === "manual" || lease.sessionId === sessionId) &&
+        (monitorOnly || lease.managedBy !== "agent" || lease.phase === "working") &&
         (!input.leaseId || lease.id === input.leaseId),
     );
     if (!monitorOnly && input.leaseId && ownedLeases.length === 0) {
@@ -1991,6 +2278,7 @@ export class AgentHubService {
     claim?: LeaseClaimResult;
     renewedLeases: Lease[];
     activity?: SessionActivityOperationResult;
+    managedLease?: Lease;
   } {
     return this.database.transaction(() => {
       const auth = this.authenticateMemberToken(input.memberToken);
@@ -2060,6 +2348,7 @@ export class AgentHubService {
         }
       }
       let renewedLeases: Lease[] = [];
+      let managedLease: Lease | undefined;
       if (input.sessionId) {
         try {
           this.syncSessionBranch({
@@ -2073,14 +2362,108 @@ export class AgentHubService {
           warn(`Branch tracking could not be refreshed; monitor-only mode allowed writing: ${errorMessage(error)}`);
         }
         try {
-          renewedLeases = this.heartbeatSession({
+          const heartbeat = this.heartbeatSession({
             memberToken: input.memberToken,
             sessionId: input.sessionId,
-          }).renewedLeases;
+          });
+          renewedLeases = heartbeat.renewedLeases;
+          managedLease = heartbeat.managedLease;
         } catch (error) {
           if (!monitorOnly) throw error;
           warn(`The session heartbeat could not renew its leases; monitor-only mode allowed writing: ${errorMessage(error)}`);
         }
+      }
+      const scopeAuditMetadata = {
+        invocationId: input.invocationId ?? null,
+        source: "hook",
+        toolName: input.toolName ?? null,
+        stage: input.stage ?? "pre",
+        turnId: input.turnId ?? null,
+        requestedPaths: input.paths,
+        coveredPaths: [],
+        addedPaths: [],
+        ignoredPaths: input.ignoredPaths ?? [],
+        actualPaths: input.actualPaths ?? [],
+        pathDiagnostics: input.pathDiagnostics ?? [],
+      };
+      const recordEmptyScopeAudit = () => {
+        if (!input.invocationId) return;
+        const createdAt = this.timestamp();
+        if (managedLease) {
+          this.insertLeaseScopeActivity(
+            auth,
+            managedLease.id,
+            "lease.scope_observed",
+            createdAt,
+            scopeAuditMetadata,
+          );
+          return;
+        }
+        if (input.sessionId) {
+          this.insertActivity({
+            roomId: auth.room.id,
+            actorMemberId: auth.member.id,
+            actorName: auth.member.displayName,
+            type: "lease.scope_observed",
+            entityType: "session",
+            entityId: input.sessionId,
+            summary: `${auth.member.displayName} recorded a Hook scope audit without a repository path.`,
+            metadata: scopeAuditMetadata,
+            createdAt,
+          });
+        }
+      };
+      const auditOnlyEmptyScope = input.paths.length === 0 && (
+        input.stage === "post"
+        || (
+          input.stage === "pre"
+          && (input.ignoredPaths?.length ?? 0) > 0
+          && (input.pathDiagnostics?.length ?? 0) === 0
+        )
+      );
+      if (auditOnlyEmptyScope) {
+        recordEmptyScopeAudit();
+        return {
+          check: {
+            allowed: true,
+            blockers: [],
+            warnings: diagnosticWarnings,
+            coveredPaths: [],
+            uncoveredPaths: [],
+            historicalImpacts: [],
+            releaseRequests: [],
+          },
+          renewedLeases,
+          activity,
+          managedLease,
+        };
+      }
+      const unprovableEmptyScope = input.paths.length === 0
+        && input.stage === "pre"
+        && (input.pathDiagnostics?.length ?? 0) > 0;
+      if (unprovableEmptyScope) {
+        const issue: EditIssue = {
+          code: "uncovered_path",
+          path: ".",
+          message: monitorOnly
+            ? "The write target could not be proven; monitor-only mode allows writing and records the unresolved path evidence."
+            : "The write target could not be proven to be covered by an active scope.",
+        };
+        recordEmptyScopeAudit();
+        return {
+          check: {
+            allowed: monitorOnly,
+            blockers: monitorOnly ? [] : [issue],
+            warnings: monitorOnly ? [...diagnosticWarnings, issue] : diagnosticWarnings,
+            coveredPaths: [],
+            uncoveredPaths: ["."],
+            historicalImpacts: [],
+            releaseRequests: [],
+          },
+          renewedLeases,
+          activity,
+          managedLease,
+        };
       }
       let check = this.checkEdits(input);
       check.warnings.unshift(...diagnosticWarnings);
@@ -2089,10 +2472,30 @@ export class AgentHubService {
         && check.blockers.every((blocker) => blocker.code === "uncovered_path");
       const shouldAutoClaim = monitorOnly
         ? check.blockers.length === 0
-          && check.uncoveredPaths.length > 0
+          && input.paths.length > 0
           && canNormalizeCoordinationPaths(input.paths, true)
-        : onlyUncovered;
-      if (!shouldAutoClaim) return { check, renewedLeases, activity };
+        : input.paths.length > 0
+          && (onlyUncovered || check.allowed)
+          && canNormalizeCoordinationPaths(input.paths, false);
+      if (!shouldAutoClaim) return { check, renewedLeases, activity, managedLease };
+      if (monitorOnly && managedLease && managedLease.phase !== "working") {
+        const previousDiagnosticCount = diagnosticWarnings.length;
+        warn("The Agent-managed task is awaiting completion; monitor-only mode allows writing but will not expand or renew its scope.");
+        check.warnings.unshift(...diagnosticWarnings.slice(previousDiagnosticCount));
+        if (input.invocationId) {
+          this.insertLeaseScopeActivity(
+            auth,
+            managedLease.id,
+            "lease.scope_observed",
+            this.timestamp(),
+            {
+              ...scopeAuditMetadata,
+              coveredPaths: check.coveredPaths,
+            },
+          );
+        }
+        return { check, renewedLeases, activity, managedLease };
+      }
       const claim = this.claimLease({
         memberToken: input.memberToken,
         sessionId: input.sessionId,
@@ -2100,15 +2503,29 @@ export class AgentHubService {
         objective: input.objective,
         branch: input.branch,
         baseCommit: input.baseCommit,
-        paths: check.uncoveredPaths.length > 0 ? check.uncoveredPaths : input.paths,
+        paths: input.paths,
         mode: "write",
         autoClaim: true,
+        managedBy: "agent",
+        createdVia: "hook",
+        invocationId: input.invocationId,
+        toolName: input.toolName,
+        stage: input.stage,
+        turnId: input.turnId,
+        ignoredPaths: input.ignoredPaths,
+        actualPaths: input.actualPaths,
+        pathDiagnostics: input.pathDiagnostics,
       });
       if (claim.acquired) {
+        managedLease = claim.lease.managedBy === "agent"
+          ? claim.lease
+          : input.sessionId
+            ? this.activeManagedLeaseForSession(auth.room.id, auth.member.id, input.sessionId)
+            : undefined;
         check = this.checkEdits(input);
         check.warnings.unshift(...diagnosticWarnings);
       }
-      return { check, claim, renewedLeases, activity };
+      return { check, claim, renewedLeases, activity, managedLease };
     });
   }
 
@@ -2126,7 +2543,7 @@ export class AgentHubService {
             END,
             decision = CASE WHEN decision = 'deny' THEN 'warn' ELSE decision END,
             updated_at = ?
-          WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+          WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
             AND coordination_state IN ('blocked', 'waiting')
         `).run(this.timestamp(), session.id);
         this.auditRecord(
@@ -2146,7 +2563,7 @@ export class AgentHubService {
       this.expireLeases(auth.room.id, false);
       const leases = this.database.connection.prepare(`
         SELECT id, title, coordination_state FROM leases
-        WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+        WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
       `).all(session.id) as Row[];
       const releasedLeaseIds: string[] = [];
       const blockedLeaseIds: string[] = [];
@@ -2568,6 +2985,60 @@ export class AgentHubService {
     return (rows as Row[]).map(mapActivity);
   }
 
+  listLeaseScopeEvents(
+    memberToken: string,
+    leaseIdValue: string,
+    limitValue?: number,
+    beforeValue?: string,
+  ): LeaseScopeEventsResult {
+    const auth = this.authenticateMemberToken(memberToken);
+    const leaseId = requiredString(leaseIdValue, "Lease id", 100);
+    this.requireRoomLease(leaseId, auth.room.id);
+    const limit = Math.max(1, Math.min(
+      Number.isFinite(limitValue) ? Math.trunc(limitValue as number) : 50,
+      100,
+    ));
+    const before = optionalString(beforeValue, "Scope event cursor", 100);
+    let rows: Row[];
+    if (before) {
+      const cursor = this.database.connection.prepare(`
+        SELECT created_at, id FROM activities
+        WHERE room_id = ? AND entity_type = 'lease' AND entity_id = ? AND id = ?
+          AND type IN ('lease.scope_observed', 'lease.scope_expanded', 'lease.scope_covered')
+      `).get(auth.room.id, leaseId, before) as Row | undefined;
+      if (!cursor) {
+        throw new AgentHubError("scope_event_cursor_not_found", "The scope event cursor is not valid for this lease.", 404);
+      }
+      rows = this.database.connection.prepare(`
+        SELECT * FROM activities
+        WHERE room_id = ? AND entity_type = 'lease' AND entity_id = ?
+          AND type IN ('lease.scope_observed', 'lease.scope_expanded', 'lease.scope_covered')
+          AND (created_at < ? OR (created_at = ? AND id < ?))
+        ORDER BY created_at DESC, id DESC LIMIT ?
+      `).all(
+        auth.room.id,
+        leaseId,
+        asString(cursor.created_at),
+        asString(cursor.created_at),
+        asString(cursor.id),
+        limit + 1,
+      ) as Row[];
+    } else {
+      rows = this.database.connection.prepare(`
+        SELECT * FROM activities
+        WHERE room_id = ? AND entity_type = 'lease' AND entity_id = ?
+          AND type IN ('lease.scope_observed', 'lease.scope_expanded', 'lease.scope_covered')
+        ORDER BY created_at DESC, id DESC LIMIT ?
+      `).all(auth.room.id, leaseId, limit + 1) as Row[];
+    }
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(mapActivity);
+    return {
+      items,
+      nextBefore: hasMore ? items.at(-1)?.id : undefined,
+    };
+  }
+
   openSession(input: OpenSessionInput): WorkSession {
     const auth = this.authenticateMemberToken(input.memberToken);
     const metadata = objectValue(input.metadata, "Session metadata");
@@ -2684,7 +3155,7 @@ export class AgentHubService {
           if (advancesActivity) {
             this.database.connection.prepare(`
               UPDATE leases SET automatic_phase = 'working', coordination_state = 'working', updated_at = ?
-              WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+              WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
                 AND coordination_state = 'awaiting_commit'
             `).run(openedAt, existingSession.id);
           }
@@ -2758,6 +3229,7 @@ export class AgentHubService {
   heartbeatSession(input: HeartbeatSessionInput): {
     session: WorkSession;
     renewedLeases: Lease[];
+    managedLease?: Lease;
   } {
     const auth = this.authenticateMemberToken(input.memberToken);
     const session = this.requireOwnedSession(input.sessionId, auth);
@@ -2794,6 +3266,7 @@ export class AgentHubService {
     if (!monitorOnly && (session.status !== "active" || session.turnStoppedAt)) {
       throw new AgentHubError("session_not_active", "The work session is not active.", 409);
     }
+    const canRenewAgentLeases = session.status === "active" && session.turnStoppedAt === null;
     const clientVersion = optionalString(input.clientVersion, "Client version", 80);
     const reportedProtocolVersion = optionalVersionNumber(input.protocolVersion, "Protocol version");
     const reportedSchemaVersion = optionalVersionNumber(input.schemaVersion, "Schema version");
@@ -2824,7 +3297,7 @@ export class AgentHubService {
         WHERE id = ?
       `).run(heartbeatAt, clientVersion, protocolVersion, schemaVersion, auth.member.id);
       const leases = this.database.connection.prepare(`
-        SELECT id, kind, automatic_phase, coordination_state FROM leases
+        SELECT id, kind, managed_by, automatic_phase, coordination_state FROM leases
         WHERE member_id = ? AND status = 'active'
           AND (session_id = ? OR (session_id IS NULL AND kind = 'standard'))
       `).all(auth.member.id, session.id) as Row[];
@@ -2833,8 +3306,12 @@ export class AgentHubService {
       );
       for (const lease of leases) {
         const kind = asString(lease.kind) as LeaseKind;
+        const managedBy = asString(lease.managed_by ?? (kind === "automatic" ? "agent" : "manual"));
         if (!shouldHeartbeatRenew(kind)) continue;
-        if (kind === "automatic" && asString(lease.coordination_state ?? lease.automatic_phase) !== "working") continue;
+        if (managedBy === "agent" && (
+          !canRenewAgentLeases
+          || asString(lease.coordination_state ?? lease.automatic_phase) !== "working"
+        )) continue;
         renew.run(expiresAt, heartbeatAt, asString(lease.id));
         renewedLeaseIds.push(asString(lease.id));
       }
@@ -2842,6 +3319,7 @@ export class AgentHubService {
     return {
       session: this.requireSessionById(session.id),
       renewedLeases: renewedLeaseIds.map((id) => this.requireLeaseById(id)),
+      managedLease: this.activeManagedLeaseForSession(auth.room.id, auth.member.id, session.id),
     };
   }
 
@@ -2865,7 +3343,7 @@ export class AgentHubService {
     const reason = `Branch changed from ${session.branch ?? "(unknown)"} to ${branch ?? "(detached)"}; re-baselining is required.`;
     this.database.transaction(() => {
       this.database.connection.prepare("UPDATE work_sessions SET branch = ?, base_commit = ?, frozen_reason = ?, last_seen_at = ? WHERE id = ?").run(branch, baseCommit, reason, now, session.id);
-      const leases = this.database.connection.prepare("SELECT id, title FROM leases WHERE session_id = ? AND status = 'active' AND kind <> 'exclusive'").all(session.id) as Row[];
+      const leases = this.database.connection.prepare("SELECT id, title FROM leases WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'").all(session.id) as Row[];
       for (const lease of leases) {
         this.database.connection.prepare("UPDATE leases SET status = 'cancelled', completed_at = ?, updated_at = ?, completion_summary = ? WHERE id = ?").run(now, now, reason, asString(lease.id));
       }
@@ -3031,7 +3509,7 @@ export class AgentHubService {
       `).run(turnId, activityEpoch, stoppedAt, stoppedAt, session.id);
       this.database.connection.prepare(`
         UPDATE leases SET automatic_phase = 'awaiting_commit', coordination_state = 'awaiting_commit', updated_at = ?
-        WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+        WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
           AND coordination_state = 'working'
       `).run(stoppedAt, session.id);
       this.auditRecord(auth, "session.turn_stopped", "session", session.id, "Stopped a Codex turn while Git completion is checked.", {
@@ -3053,16 +3531,22 @@ export class AgentHubService {
     });
     const awaitingAutomaticLeases = this.database.connection.prepare(`
       SELECT id, expires_at FROM leases
-      WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+      WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
         AND coordination_state IN ('awaiting_commit', 'blocked') AND expires_at > ?
       ORDER BY created_at, id
     `).all(input.sessionId, stoppedAt) as Row[];
+    const managedLease = this.activeManagedLeaseForSession(auth.room.id, auth.member.id, input.sessionId);
     return {
       ...result,
       awaitingAutomaticLeases: awaitingAutomaticLeases.map((lease) => ({
         id: asString(lease.id),
         expiresAt: asString(lease.expires_at),
       })),
+      managedLeases: managedLease ? [{
+        id: managedLease.id,
+        paths: managedLease.paths.map((path) => path.path),
+        expiresAt: managedLease.expiresAt,
+      }] : [],
     };
   }
 
@@ -3107,7 +3591,7 @@ export class AgentHubService {
       `).run(turnId, activityEpoch, resumedAt, session.id);
       this.database.connection.prepare(`
         UPDATE leases SET automatic_phase = 'working', coordination_state = 'working', updated_at = ?
-        WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+        WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
           AND coordination_state = 'awaiting_commit'
       `).run(resumedAt, session.id);
       this.auditRecord(auth, "session.turn_resumed", "session", session.id, "Resumed Codex work with a new activity fence.", {
@@ -3219,7 +3703,7 @@ export class AgentHubService {
 
       const candidates = this.database.connection.prepare(`
         SELECT id, title FROM leases
-        WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+        WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
           AND coordination_state IN ('awaiting_commit', 'blocked')
         ORDER BY created_at, id
       `).all(session.id) as Row[];
@@ -3235,7 +3719,7 @@ export class AgentHubService {
       const release = this.database.connection.prepare(`
         UPDATE leases SET
           status = 'cancelled', completed_at = ?, updated_at = ?, completion_summary = ?
-        WHERE id = ? AND status = 'active' AND kind = 'automatic'
+        WHERE id = ? AND status = 'active' AND managed_by = 'agent'
           AND coordination_state IN ('awaiting_commit', 'blocked')
       `);
       const releasedLeaseIds: string[] = [];
@@ -3322,7 +3806,7 @@ export class AgentHubService {
       // SessionEnd 可能抢在异步 Stop 前到达；automatic 必须保留到 Git completion 或原 TTL。
       const protectedAutomaticLeases = this.database.connection.prepare(`
         SELECT id FROM leases
-        WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+        WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
       `).all(session.id) as Row[];
       this.database.connection.prepare(`
         UPDATE release_requests SET status = 'cancelled', resolved_at = ?
@@ -3366,18 +3850,21 @@ export class AgentHubService {
     const evidenceError = optionalString(input.evidenceError, "Finalization evidence error", 4000);
     this.database.transaction(() => {
       if (evidenceError) {
+        const finalizationRiskId = `finalization-risk:${createHash("sha256")
+          .update(finalizationId, "utf8")
+          .digest("hex")}`;
         this.database.connection.prepare(`
           INSERT OR IGNORE INTO records (
             id, room_id, member_id, kind, title, summary, paths_json, status,
             evidence_json, commit_hash, created_at
           ) VALUES (?, ?, ?, 'risk', ?, ?, '[]', 'open', ?, NULL, ?)
         `).run(
-          `finalization-risk:${finalizationId}`,
+          finalizationRiskId,
           auth.room.id,
           auth.member.id,
           "会话结束证据未完整生成",
           evidenceError,
-          json([`Agent Hub session ${session.id}`, `Finalization ${finalizationId}`]),
+          json(["Background finalization retained Agent-managed leases until Git evidence or TTL resolves them."]),
           closedAt,
         );
       }
@@ -3414,7 +3901,7 @@ export class AgentHubService {
         .prepare(`
           SELECT id, title
           FROM leases
-          WHERE session_id = ? AND status = 'active' AND kind = 'automatic'
+          WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
             AND coordination_state = 'working'
         `)
         .all(session.id) as Row[];
@@ -3898,6 +4385,14 @@ export class AgentHubService {
           WHERE id = ? AND member_id = ? AND room_id = ? AND status = 'active'
         `).get(requesterLeaseId, requesterMemberId, asString(row.room_id)) as Row | undefined
       : undefined;
+    if (!targetLease && requestedKind === "automatic" && requesterSessionId) {
+      targetLease = this.database.connection.prepare(`
+        SELECT id FROM leases
+        WHERE room_id = ? AND member_id = ? AND session_id = ?
+          AND status = 'active' AND managed_by = 'agent'
+        ORDER BY created_at, id LIMIT 1
+      `).get(asString(row.room_id), requesterMemberId, requesterSessionId) as Row | undefined;
+    }
     if (!targetLease) {
       targetLease = this.database.connection.prepare(`
         SELECT l.id FROM release_requests rr
@@ -3924,8 +4419,9 @@ export class AgentHubService {
       this.database.connection.prepare(`
         INSERT INTO leases (
           id, room_id, member_id, session_id, title, intent, branch, base_commit,
-          mode, kind, status, decision, override_reason, expires_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'allow', ?, ?, ?, ?)
+          mode, kind, managed_by, created_via, status, decision, override_reason,
+          expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'legacy', 'active', 'allow', ?, ?, ?, ?)
       `).run(
         leaseId,
         asString(row.room_id),
@@ -3937,6 +4433,7 @@ export class AgentHubService {
         nullableString(row.requested_base_commit),
         asString(row.requested_mode),
         requestedKind,
+        requestedKind === "automatic" ? "agent" : "manual",
         `Transferred by approved release request ${asString(row.id)}.`,
         expiresAt,
         transferredAt,
@@ -4120,7 +4617,7 @@ export class AgentHubService {
       JOIN members m ON m.id = l.member_id
       JOIN lease_paths lp ON lp.lease_id = l.id
       LEFT JOIN work_sessions ws ON ws.id = l.session_id
-      WHERE l.room_id = ? AND l.member_id = ? AND l.kind = 'automatic'
+      WHERE l.room_id = ? AND l.member_id = ? AND l.managed_by = 'agent'
         AND l.mode = 'write' AND l.status = 'active' AND l.expires_at > ?
       ORDER BY l.created_at, l.id
     `).all(roomId, memberId, now) as Row[];
@@ -4319,6 +4816,21 @@ export class AgentHubService {
     return rows.map((row) => this.mapLease(row));
   }
 
+  private activeManagedLeaseForSession(
+    roomId: string,
+    memberId: string,
+    sessionId: string,
+  ): Lease | undefined {
+    const row = this.database.connection.prepare(`
+      SELECT l.*, m.name AS member_name
+      FROM leases l JOIN members m ON m.id = l.member_id
+      WHERE l.room_id = ? AND l.member_id = ? AND l.session_id = ?
+        AND l.status = 'active' AND l.managed_by = 'agent'
+      ORDER BY l.created_at, l.id LIMIT 1
+    `).get(roomId, memberId, sessionId) as Row | undefined;
+    return row ? this.mapLease(row) : undefined;
+  }
+
   private listContextEntries(roomId: string): ContextEntry[] {
     const rows = this.database.connection
       .prepare(`
@@ -4390,10 +4902,17 @@ export class AgentHubService {
     const rows = this.database.connection.prepare(`
       SELECT id, member_id, client_name, agent_name, task, branch, base_commit,
         status, frozen_reason, finalizing_at, last_seen_at, turn_stopped_at,
-        client_version, protocol_version, schema_version
-      FROM work_sessions
-      WHERE room_id = ? AND status <> 'closed'
-      ORDER BY opened_at DESC LIMIT 500
+        client_version, protocol_version, schema_version,
+        codex_session_id, current_turn_id, activity_epoch
+      FROM work_sessions ws
+      WHERE ws.room_id = ? AND (
+        ws.status <> 'closed'
+        OR EXISTS (
+          SELECT 1 FROM leases l
+          WHERE l.session_id = ws.id AND l.status = 'active' AND l.managed_by = 'agent'
+        )
+      )
+      ORDER BY ws.opened_at DESC LIMIT 500
     `).all(roomId) as Row[];
     return rows.map((row) => ({
       id: asString(row.id),
@@ -4403,7 +4922,7 @@ export class AgentHubService {
       task: nullableString(row.task),
       branch: nullableString(row.branch),
       baseCommit: nullableString(row.base_commit),
-      status: row.finalizing_at
+      status: asString(row.status) === "active" && row.finalizing_at
         ? "finalizing"
         : row.frozen_reason
           ? "frozen"
@@ -4413,7 +4932,23 @@ export class AgentHubService {
       clientVersion: nullableString(row.client_version),
       protocolVersion: nullableNumber(row.protocol_version),
       schemaVersion: nullableNumber(row.schema_version),
+      codexSessionId: nullableString(row.codex_session_id),
+      currentTurnId: nullableString(row.current_turn_id),
+      activityEpoch: Number(row.activity_epoch ?? 0),
     }));
+  }
+
+  private sessionIdentifiersForContextExport(roomId: string): string[] {
+    const rows = this.database.connection.prepare(`
+      SELECT id, codex_session_id, current_turn_id, finalization_id
+      FROM work_sessions WHERE room_id = ?
+    `).all(roomId) as Row[];
+    return uniqueStrings(rows.flatMap((row) => [
+      nullableString(row.id),
+      nullableString(row.codex_session_id),
+      nullableString(row.current_turn_id),
+      nullableString(row.finalization_id),
+    ].filter((value): value is string => value !== null)));
   }
 
   private listLocalScans(roomId: string): LocalScan[] {
@@ -4593,6 +5128,44 @@ export class AgentHubService {
         json(activity.metadata),
         activity.createdAt,
       );
+  }
+
+  private insertLeaseScopeActivity(
+    auth: AuthenticatedMember,
+    leaseId: string,
+    type: "lease.scope_observed" | "lease.scope_expanded" | "lease.scope_covered",
+    createdAt: string,
+    metadata: Record<string, unknown>,
+  ): void {
+    this.insertActivity({
+      roomId: auth.room.id,
+      actorMemberId: auth.member.id,
+      actorName: auth.member.displayName,
+      type,
+      entityType: "lease",
+      entityId: leaseId,
+      summary: type === "lease.scope_expanded"
+        ? `${auth.member.displayName} expanded an Agent-managed task scope.`
+        : type === "lease.scope_covered"
+          ? `${auth.member.displayName} attributed a task path to an existing manual scope.`
+          : `${auth.member.displayName} observed an existing Agent-managed task scope.`,
+      metadata,
+      createdAt,
+    });
+  }
+
+  private replaceLeasePaths(
+    leaseId: string,
+    paths: Array<{ path: string; risk: "normal" | "high"; riskReason: string | null }>,
+  ): void {
+    this.database.connection.prepare("DELETE FROM lease_paths WHERE lease_id = ?").run(leaseId);
+    const insert = this.database.connection.prepare(`
+      INSERT INTO lease_paths (lease_id, path, path_key, risk, risk_reason)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    for (const path of compactCoordinationPaths(paths)) {
+      insert.run(leaseId, path.path, pathComparisonKey(path.path), path.risk, path.riskReason);
+    }
   }
 
   private requireRoomById(id: string): Room {
@@ -5111,6 +5684,8 @@ export class AgentHubService {
       baseCommit: nullableString(row.base_commit),
       mode: asString(row.mode) as LeaseMode,
       kind: asString(row.kind ?? "standard") as LeaseKind,
+      managedBy: asString(row.managed_by ?? (asString(row.kind) === "automatic" ? "agent" : "manual")) as LeaseManagement,
+      createdVia: asString(row.created_via ?? "legacy") as LeaseSource,
       phase: asString(row.kind ?? "standard") === "automatic"
         ? asString(row.coordination_state ?? row.automatic_phase ?? "working") as AutomaticLeasePhase
         : undefined,
@@ -5257,6 +5832,34 @@ function mapRecord(row: Row): ProjectRecord {
     commitHash: nullableString(row.commit_hash),
     createdAt: asString(row.created_at),
   };
+}
+
+function redactContextExportSessionIdentifiers(
+  exported: ContextExport,
+  identifiers: string[],
+): ContextExport {
+  const orderedIdentifiers = [...identifiers]
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length);
+  const redact = (value: unknown): unknown => {
+    if (typeof value === "string") {
+      let result = value;
+      for (const identifier of orderedIdentifiers) {
+        if (result === identifier) {
+          result = "[redacted-session-id]";
+        } else if (identifier.length >= 8) {
+          result = result.replaceAll(identifier, "[redacted-session-id]");
+        }
+      }
+      return result;
+    }
+    if (Array.isArray(value)) return value.map(redact);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, redact(entry)]),
+    );
+  };
+  return redact(exported) as ContextExport;
 }
 
 function mapActivity(row: Row): Activity {
@@ -5758,6 +6361,23 @@ function normalizeCoordinationPathList(
     }
   }
   return [...normalized.values()];
+}
+
+function compactCoordinationPaths<T extends { path: string }>(paths: T[]): T[] {
+  const byKey = new Map<string, T>();
+  for (const path of paths) byKey.set(pathComparisonKey(path.path), path);
+  const ordered = [...byKey.values()].sort((left, right) => {
+    const leftKey = pathComparisonKey(left.path);
+    const rightKey = pathComparisonKey(right.path);
+    return leftKey.split("/").length - rightKey.split("/").length
+      || leftKey.localeCompare(rightKey, "en-US");
+  });
+  const compacted: T[] = [];
+  for (const candidate of ordered) {
+    if (compacted.some((scope) => pathScopeCovers(scope.path, candidate.path))) continue;
+    compacted.push(candidate);
+  }
+  return compacted;
 }
 
 function canNormalizeCoordinationPaths(paths: string[], allowLargeMonitorSet: boolean): boolean {

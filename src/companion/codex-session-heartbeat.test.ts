@@ -91,6 +91,43 @@ describe("Codex session heartbeat scheduler", () => {
     expect(completion.expiresAt).toBe(renewedExpiry);
   });
 
+  it("adopts the canonical managed lease when MCP acquired it before Hook state", async () => {
+    const userDataPath = await temporaryUserData();
+    const stateStore = new CodexHookStateStore(userDataPath);
+    const state = hookState();
+    state.leases = [];
+    state.leaseAttributionComplete = false;
+    await stateStore.save(state);
+    const beforeHeartbeat = (await stateStore.load(state.codexSessionId))!;
+    const scheduler = startCodexSessionHeartbeatScheduler({
+      userDataPath,
+      store: connectionLookup(),
+      fetchImpl: vi.fn(async () => jsonResponse(200, {
+        session: { id: state.hubSessionId },
+        renewedLeases: [],
+        managedLease: {
+          id: "mcp-managed-lease",
+          paths: ["src/mcp.ts", "src/hook.ts"],
+          expiresAt: "2026-08-27T00:20:00.000Z",
+        },
+      })) as typeof fetch,
+      intervalMs: 60_000,
+    });
+
+    await scheduler.scanNow();
+    await scheduler.stop();
+
+    await expect(stateStore.load(state.codexSessionId)).resolves.toMatchObject({
+      updatedAt: beforeHeartbeat.updatedAt,
+      leaseAttributionComplete: true,
+      leases: [{
+        id: "mcp-managed-lease",
+        paths: ["src/mcp.ts", "src/hook.ts"],
+        expiresAt: "2026-08-27T00:20:00.000Z",
+      }],
+    });
+  });
+
   it("does not heartbeat while a write-blocked transition is pending", async () => {
     const userDataPath = await temporaryUserData();
     const state = hookState();

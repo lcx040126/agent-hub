@@ -89,6 +89,30 @@ export async function inspectGitWorkingPathsFromIdentity(
   return buildWorkingState(identity, unstaged, staged, untracked);
 }
 
+/**
+ * 返回至少覆盖一个 HEAD 跟踪文件的请求范围。Git 查询失败时保守地视为全部已跟踪，
+ * 避免把真实源码删除误判成可忽略的临时清理。
+ */
+export async function trackedRepositoryScopes(
+  identity: GitIdentity,
+  repositoryPaths: string[],
+  options: GitWorkingStateOptions = {},
+): Promise<Set<string>> {
+  const requested = [...new Set(repositoryPaths.map((value) => value.trim()).filter(Boolean))];
+  if (requested.length === 0) return new Set();
+  const output = await safeGit(
+    options.gitExecutable ?? "git",
+    identity.repositoryRoot,
+    ["ls-files", "-z", "--", ...requested],
+  );
+  if (output === null) return new Set(requested.map(pathKey));
+  const tracked = uniqueNullSeparated([output]).map(pathKey);
+  return new Set(requested.filter((scope) => {
+    const key = pathKey(scope).replace(/\/$/, "");
+    return tracked.some((candidate) => candidate === key || candidate.startsWith(`${key}/`));
+  }).map(pathKey));
+}
+
 async function buildWorkingState(
   identity: GitIdentity,
   unstaged: string | null,

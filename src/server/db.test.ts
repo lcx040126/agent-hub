@@ -9,7 +9,7 @@ import { AgentHubService } from "./service.js";
 
 const temporaryDirectories: string[] = [];
 
-type HistoricalSchemaVersion = 2 | 3 | 4;
+type HistoricalSchemaVersion = 2 | 3 | 4 | 5;
 
 function createHistoricalDatabaseFixture(
   databasePath: string,
@@ -36,8 +36,10 @@ function createHistoricalDatabaseFixture(
         schema_version INTEGER`;
   const leaseKindColumn = schemaVersion === 2 ? "" : `,
         kind TEXT NOT NULL DEFAULT 'standard' CHECK (kind IN ('automatic', 'standard', 'exclusive'))`;
-  const automaticPhaseColumn = schemaVersion === 4 ? `,
+  const automaticPhaseColumn = schemaVersion >= 4 ? `,
         automatic_phase TEXT NOT NULL DEFAULT 'working' CHECK (automatic_phase IN ('working', 'awaiting_commit'))` : "";
+  const coordinationStateColumn = schemaVersion >= 5 ? `,
+        coordination_state TEXT NOT NULL DEFAULT 'working' CHECK (coordination_state IN ('working', 'waiting', 'blocked', 'awaiting_commit'))` : "";
   const sessionColumns = schemaVersion === 2 ? "" : `,
         branch_epoch INTEGER NOT NULL DEFAULT 1,
         frozen_reason TEXT`;
@@ -45,7 +47,7 @@ function createHistoricalDatabaseFixture(
         client_version TEXT,
         protocol_version INTEGER,
         schema_version INTEGER`;
-  const sessionLifecycleColumns = schemaVersion === 4 ? `,
+  const sessionLifecycleColumns = schemaVersion >= 4 ? `,
         finalization_id TEXT,
         finalizing_at TEXT,
         finalization_error TEXT,
@@ -53,7 +55,7 @@ function createHistoricalDatabaseFixture(
         current_turn_id TEXT,
         activity_epoch INTEGER NOT NULL DEFAULT 0,
         turn_stopped_at TEXT` : "";
-  const hasScanFinalizationColumn = schemaVersion === 4 || options.finalizationColumn === true;
+  const hasScanFinalizationColumn = schemaVersion >= 4 || options.finalizationColumn === true;
   const scanFinalizationColumn = hasScanFinalizationColumn ? ",\n        finalization_id TEXT" : "";
   const fixturePrefix = `schema${schemaVersion}`;
 
@@ -118,7 +120,7 @@ function createHistoricalDatabaseFixture(
       commit_hash TEXT,
       validations_json TEXT NOT NULL DEFAULT '[]',
       remaining_risks_json TEXT NOT NULL DEFAULT '[]',
-      handoff TEXT${automaticPhaseColumn}
+      handoff TEXT${automaticPhaseColumn}${coordinationStateColumn}
     );
     CREATE TABLE lease_paths (
       lease_id TEXT NOT NULL REFERENCES leases(id) ON DELETE CASCADE,
@@ -170,14 +172,14 @@ function createHistoricalDatabaseFixture(
     INSERT INTO leases (
       id, room_id, member_id, session_id, title, intent, branch, base_commit,
       mode, ${schemaVersion === 2 ? "" : "kind, "}status, decision, expires_at,
-      created_at, updated_at, changed_paths_json${schemaVersion === 4 ? ", automatic_phase" : ""}
+      created_at, updated_at, changed_paths_json${schemaVersion >= 4 ? ", automatic_phase" : ""}${schemaVersion >= 5 ? ", coordination_state" : ""}
     ) VALUES (
       '${fixturePrefix}-lease', '${fixturePrefix}-room', '${fixturePrefix}-member',
       '${fixturePrefix}-session', 'Historical lease', 'Preserve historical lease',
       'main', 'base-${schemaVersion}', 'write', ${schemaVersion === 2 ? "" : "'automatic', "}
       'active', 'allow', '2099-01-01T00:00:00.000Z',
       '2026-08-20T08:15:00.000Z', '2026-08-20T09:00:00.000Z',
-      '["src/historical-${schemaVersion}.ts"]'${schemaVersion === 4 ? ", 'awaiting_commit'" : ""}
+      '["src/historical-${schemaVersion}.ts"]'${schemaVersion >= 4 ? ", 'awaiting_commit'" : ""}${schemaVersion >= 5 ? ", 'awaiting_commit'" : ""}
     );
     INSERT INTO lease_paths (lease_id, path, path_key, risk, risk_reason) VALUES (
       '${fixturePrefix}-lease', 'src/historical-${schemaVersion}.ts',
@@ -192,7 +194,7 @@ function createHistoricalDatabaseFixture(
       '${fixturePrefix}-member', 'C:/historical/repo', 'main', 'C:/historical/repo',
       'base-${schemaVersion}', '["src/historical-${schemaVersion}.ts"]',
       '["AGENTS.md"]', '["historical-system"]', '{"preserved":true}',
-      '2026-08-20T09:00:00.000Z'${hasScanFinalizationColumn ? `, '${options.finalizationColumn ? "manual-repair-finalization" : "schema4-finalization"}'` : ""}
+      '2026-08-20T09:00:00.000Z'${hasScanFinalizationColumn ? `, '${options.finalizationColumn ? "manual-repair-finalization" : `schema${schemaVersion}-finalization`}'` : ""}
     );
     PRAGMA user_version = ${schemaVersion};
   `);
@@ -205,7 +207,7 @@ function expectHistoricalFixturePreserved(
   expectedFinalizationId: string | null = null,
 ): void {
   const fixturePrefix = `schema${schemaVersion}`;
-  expect(database.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+  expect(database.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
   expect(database.connection.prepare(`
     SELECT id, name, repository FROM rooms WHERE id = ?
   `).get(`${fixturePrefix}-room`)).toEqual({
@@ -237,10 +239,12 @@ function expectHistoricalFixturePreserved(
     changed_paths_json: `["src/historical-${schemaVersion}.ts"]`,
   });
   expect(database.connection.prepare(`
-    SELECT automatic_phase, coordination_state FROM leases WHERE id = ?
+    SELECT automatic_phase, coordination_state, managed_by, created_via FROM leases WHERE id = ?
   `).get(`${fixturePrefix}-lease`)).toEqual({
-    automatic_phase: schemaVersion === 4 ? "awaiting_commit" : "working",
-    coordination_state: schemaVersion === 4 ? "awaiting_commit" : "working",
+    automatic_phase: schemaVersion >= 4 ? "awaiting_commit" : "working",
+    coordination_state: schemaVersion >= 4 ? "awaiting_commit" : "working",
+    managed_by: schemaVersion === 2 ? "manual" : "agent",
+    created_via: "legacy",
   });
   expect(database.connection.prepare(`
     SELECT id, session_id, changed_paths_json, metadata_json, finalization_id
@@ -250,15 +254,41 @@ function expectHistoricalFixturePreserved(
     session_id: `${fixturePrefix}-session`,
     changed_paths_json: `["src/historical-${schemaVersion}.ts"]`,
     metadata_json: '{"preserved":true}',
-    finalization_id: expectedFinalizationId ?? (schemaVersion === 4 ? "schema4-finalization" : null),
+    finalization_id: expectedFinalizationId ?? (schemaVersion >= 4 ? `schema${schemaVersion}-finalization` : null),
   });
   expect(database.connection.prepare(`
     SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'scans_finalization_idx'
   `).get()).toEqual({ name: "scans_finalization_idx" });
+  expectAgentLeaseSchema(database);
   expect(database.connection.prepare("PRAGMA integrity_check").all()).toEqual([
     { integrity_check: "ok" },
   ]);
   expect(database.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+}
+
+function expectAgentLeaseSchema(database: AgentHubDatabase): void {
+  const columns = database.connection.prepare("PRAGMA table_info(leases)").all() as Array<{ name: string }>;
+  expect(columns.filter((column) => column.name === "managed_by")).toHaveLength(1);
+  expect(columns.filter((column) => column.name === "created_via")).toHaveLength(1);
+
+  const index = (database.connection.prepare("PRAGMA index_list('leases')").all() as Array<{
+    name: string;
+    unique: number;
+    partial: number;
+  }>).find((candidate) => candidate.name === "leases_active_agent_session_idx");
+  expect(index).toMatchObject({ unique: 1, partial: 1 });
+  expect(database.connection.prepare(`PRAGMA index_info('leases_active_agent_session_idx')`).all())
+    .toEqual([
+      expect.objectContaining({ name: "room_id" }),
+      expect.objectContaining({ name: "member_id" }),
+      expect.objectContaining({ name: "session_id" }),
+    ]);
+  const definition = database.connection.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'leases_active_agent_session_idx'
+  `).get() as { sql: string };
+  expect(definition.sql.replace(/\s+/g, " ").toLowerCase()).toContain(
+    "where status = 'active' and managed_by = 'agent' and session_id is not null",
+  );
 }
 
 afterEach(() => {
@@ -288,10 +318,10 @@ describe("Agent Hub database migrations", () => {
     temporaryDirectories.push(directory);
     const databasePath = join(directory, "agent-hub.sqlite");
     const future = new DatabaseSync(databasePath);
-    future.exec("PRAGMA user_version = 6");
+    future.exec("PRAGMA user_version = 7");
     future.close();
     expect(() => new AgentHubDatabase({ path: databasePath })).toThrow(
-      /newer than supported schema 5/,
+      /newer than supported schema 6/,
     );
   });
 
@@ -341,6 +371,269 @@ describe("Agent Hub database migrations", () => {
     reopened.close();
   });
 
+  it("migrates the released v0.2.5-v0.2.6 schema 5 layout without losing coordination state", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-hub-released-schema5-db-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "agent-hub.sqlite");
+    createHistoricalDatabaseFixture(databasePath, 5);
+
+    const migrated = new AgentHubDatabase({ path: databasePath });
+    expectHistoricalFixturePreserved(migrated, 5);
+    migrated.close();
+
+    const reopened = new AgentHubDatabase({ path: databasePath });
+    expectHistoricalFixturePreserved(reopened, 5);
+    reopened.close();
+  });
+
+  it("only promotes an audited MCP-session claim out of legacy standard leases", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-hub-schema5-lease-source-db-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "agent-hub.sqlite");
+    createHistoricalDatabaseFixture(databasePath, 5);
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      CREATE TABLE activities (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        actor_member_id TEXT REFERENCES members(id) ON DELETE SET NULL,
+        actor_name TEXT,
+        type TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT,
+        summary TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO work_sessions (
+        id, room_id, member_id, status, metadata_json, opened_at, last_seen_at
+      ) VALUES
+        (
+          'proven-mcp-session', 'schema5-room', 'schema5-member', 'active',
+          '{"source":"mcp"}', '2026-08-20T09:10:00.000Z', '2026-08-20T09:20:00.000Z'
+        ),
+        (
+          'unproven-mcp-session', 'schema5-room', 'schema5-member', 'active',
+          '{"source":"mcp"}', '2026-08-20T09:30:00.000Z', '2026-08-20T09:40:00.000Z'
+        ),
+        (
+          'audited-hook-session', 'schema5-room', 'schema5-member', 'active',
+          '{"source":"codex-hook"}', '2026-08-20T09:50:00.000Z', '2026-08-20T10:00:00.000Z'
+        );
+      INSERT INTO leases (
+        id, room_id, member_id, session_id, title, intent, mode, kind, status,
+        decision, expires_at, created_at, updated_at
+      ) VALUES
+        (
+          'proven-mcp-lease', 'schema5-room', 'schema5-member', 'proven-mcp-session',
+          'Proven MCP claim', '', 'write', 'standard', 'active', 'allow',
+          '2099-01-01T00:00:00.000Z', '2026-08-20T09:11:00.000Z', '2026-08-20T09:11:00.000Z'
+        ),
+        (
+          'unproven-mcp-lease', 'schema5-room', 'schema5-member', 'unproven-mcp-session',
+          'Unproven MCP claim', '', 'write', 'standard', 'active', 'allow',
+          '2099-01-01T00:00:00.000Z', '2026-08-20T09:31:00.000Z', '2026-08-20T09:31:00.000Z'
+        ),
+        (
+          'audited-hook-lease', 'schema5-room', 'schema5-member', 'audited-hook-session',
+          'Audited Hook claim', '', 'write', 'standard', 'active', 'allow',
+          '2099-01-01T00:00:00.000Z', '2026-08-20T09:51:00.000Z', '2026-08-20T09:51:00.000Z'
+        );
+      INSERT INTO activities (
+        id, room_id, actor_member_id, actor_name, type, entity_type,
+        entity_id, summary, metadata_json, created_at
+      ) VALUES
+        (
+          'proven-mcp-audit', 'schema5-room', 'schema5-member', 'Alice',
+          'lease.acquired', 'lease', 'proven-mcp-lease', 'Acquired through MCP.',
+          '{"kind":"standard"}', '2026-08-20T09:11:00.000Z'
+        ),
+        (
+          'generic-hook-audit', 'schema5-room', 'schema5-member', 'Alice',
+          'lease.acquired', 'lease', 'audited-hook-lease', 'Generic lease acquisition.',
+          '{"kind":"standard"}', '2026-08-20T09:51:00.000Z'
+        );
+    `);
+    legacy.close();
+
+    const migrated = new AgentHubDatabase({ path: databasePath });
+    expect(migrated.connection.prepare(`
+      SELECT id, kind, managed_by, created_via
+      FROM leases
+      WHERE id IN ('proven-mcp-lease', 'unproven-mcp-lease', 'audited-hook-lease')
+      ORDER BY id
+    `).all()).toEqual([
+      { id: "audited-hook-lease", kind: "standard", managed_by: "manual", created_via: "legacy" },
+      { id: "proven-mcp-lease", kind: "automatic", managed_by: "agent", created_via: "mcp" },
+      { id: "unproven-mcp-lease", kind: "standard", managed_by: "manual", created_via: "legacy" },
+    ]);
+    expectAgentLeaseSchema(migrated);
+    migrated.close();
+  });
+
+  it("merges duplicate active Agent leases before enforcing one lease per Hub session", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-hub-schema5-agent-merge-db-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "agent-hub.sqlite");
+    createHistoricalDatabaseFixture(databasePath, 5);
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      CREATE TABLE release_requests (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        requester_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        requester_session_id TEXT REFERENCES work_sessions(id) ON DELETE SET NULL,
+        requester_lease_id TEXT REFERENCES leases(id) ON DELETE SET NULL,
+        conflicting_lease_id TEXT NOT NULL REFERENCES leases(id) ON DELETE CASCADE,
+        request_title TEXT NOT NULL,
+        request_objective TEXT,
+        requested_kind TEXT NOT NULL CHECK (requested_kind IN ('automatic', 'standard', 'exclusive')),
+        requested_mode TEXT NOT NULL CHECK (requested_mode IN ('read', 'write')),
+        requested_branch TEXT,
+        requested_base_commit TEXT,
+        requested_ttl_minutes INTEGER,
+        requested_paths_json TEXT NOT NULL,
+        overlap_paths_json TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        transfer_key TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
+        rejection_reason TEXT,
+        transferred_lease_id TEXT REFERENCES leases(id) ON DELETE SET NULL,
+        decision_member_id TEXT REFERENCES members(id) ON DELETE SET NULL,
+        occurrence_count INTEGER NOT NULL DEFAULT 1,
+        requested_at TEXT NOT NULL,
+        last_requested_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
+      UPDATE leases SET
+        mode = 'write', decision = 'deny', expires_at = '2099-02-01T00:00:00.000Z',
+        automatic_phase = 'awaiting_commit', coordination_state = 'blocked',
+        completion_summary = 'Preserve the blocking evidence.'
+      WHERE id = 'schema5-lease';
+      INSERT INTO leases (
+        id, room_id, member_id, session_id, title, intent, mode, kind, status,
+        decision, expires_at, created_at, updated_at, automatic_phase, coordination_state
+      ) VALUES (
+        'schema5-canonical-agent', 'schema5-room', 'schema5-member', 'schema5-session',
+        'Earliest Agent lease', '', 'read', 'automatic', 'active', 'allow',
+        '2099-01-15T00:00:00.000Z', '2026-08-20T08:00:00.000Z',
+        '2026-08-20T08:00:00.000Z', 'working', 'working'
+      );
+      INSERT INTO lease_paths (lease_id, path, path_key, risk, risk_reason) VALUES
+        ('schema5-canonical-agent', 'src/shared.ts', 'src/shared.ts', 'normal', NULL),
+        ('schema5-lease', 'src/shared.ts', 'src/shared.ts', 'high', 'Shared path became high risk.');
+      INSERT INTO release_requests (
+        id, room_id, requester_member_id, requester_session_id, requester_lease_id,
+        conflicting_lease_id, request_title, requested_kind, requested_mode,
+        requested_paths_json, overlap_paths_json, reason, transfer_key, dedupe_key,
+        status, requested_at, last_requested_at
+      ) VALUES
+        (
+          'requester-loser', 'schema5-room', 'schema5-member', 'schema5-session',
+          'schema5-lease', 'schema5-canonical-agent', 'Requester loser', 'automatic', 'write',
+          '[]', '[]', 'Pending against duplicate.', 'transfer-requester', 'dedupe-requester',
+          'pending', '2026-08-20T08:30:00.000Z', '2026-08-20T08:30:00.000Z'
+        ),
+        (
+          'conflicting-loser', 'schema5-room', 'schema5-member', 'schema5-session',
+          'schema5-canonical-agent', 'schema5-lease', 'Conflicting loser', 'automatic', 'write',
+          '[]', '[]', 'Pending against duplicate.', 'transfer-conflict', 'dedupe-conflict',
+          'pending', '2026-08-20T08:31:00.000Z', '2026-08-20T08:31:00.000Z'
+        ),
+        (
+          'unrelated-request', 'schema5-room', 'schema5-member', 'schema5-session',
+          'schema5-canonical-agent', 'schema5-canonical-agent', 'Unrelated request', 'automatic', 'write',
+          '[]', '[]', 'Must remain pending.', 'transfer-unrelated', 'dedupe-unrelated',
+          'pending', '2026-08-20T08:32:00.000Z', '2026-08-20T08:32:00.000Z'
+        );
+    `);
+    legacy.close();
+
+    const migrated = new AgentHubDatabase({ path: databasePath });
+    expect(migrated.connection.prepare(`
+      SELECT id, mode, decision, status, managed_by, created_via, expires_at,
+        automatic_phase, coordination_state, completion_summary
+      FROM leases WHERE id = 'schema5-canonical-agent'
+    `).get()).toEqual({
+      id: "schema5-canonical-agent",
+      mode: "write",
+      decision: "deny",
+      status: "active",
+      managed_by: "agent",
+      created_via: "legacy",
+      expires_at: "2099-02-01T00:00:00.000Z",
+      automatic_phase: "awaiting_commit",
+      coordination_state: "blocked",
+      completion_summary: "Preserve the blocking evidence.",
+    });
+    expect(migrated.connection.prepare(`
+      SELECT id, status, outcome, completion_summary FROM leases WHERE id = 'schema5-lease'
+    `).get()).toEqual({
+      id: "schema5-lease",
+      status: "cancelled",
+      outcome: "merged",
+      completion_summary: expect.stringContaining("Merged into Agent lease schema5-canonical-agent"),
+    });
+    expect(migrated.connection.prepare(`
+      SELECT path, risk, risk_reason
+      FROM lease_paths WHERE lease_id = 'schema5-canonical-agent'
+      ORDER BY path_key
+    `).all()).toEqual([
+      { path: "src/historical-5.ts", risk: "normal", risk_reason: null },
+      { path: "src/shared.ts", risk: "high", risk_reason: "Shared path became high risk." },
+    ]);
+    expect(migrated.connection.prepare(`
+      SELECT id, status, resolved_at FROM release_requests ORDER BY id
+    `).all()).toEqual([
+      { id: "conflicting-loser", status: "cancelled", resolved_at: "2026-08-20T09:00:00.000Z" },
+      { id: "requester-loser", status: "cancelled", resolved_at: "2026-08-20T09:00:00.000Z" },
+      { id: "unrelated-request", status: "pending", resolved_at: null },
+    ]);
+    expect(() => migrated.connection.prepare(`
+      INSERT INTO leases (
+        id, room_id, member_id, session_id, title, intent, mode, kind, managed_by,
+        created_via, status, decision, expires_at, created_at, updated_at
+      ) VALUES (
+        'forbidden-duplicate-agent', 'schema5-room', 'schema5-member', 'schema5-session',
+        'Duplicate Agent', '', 'write', 'automatic', 'agent', 'hook', 'active', 'allow',
+        '2099-03-01T00:00:00.000Z', '2026-08-20T11:00:00.000Z', '2026-08-20T11:00:00.000Z'
+      )
+    `).run()).toThrow(/UNIQUE constraint failed/);
+    expect(() => migrated.connection.prepare(`
+      INSERT INTO leases (
+        id, room_id, member_id, title, intent, mode, kind, managed_by,
+        created_via, status, decision, expires_at, created_at, updated_at
+      ) VALUES (
+        'invalid-managed-kind', 'schema5-room', 'schema5-member',
+        'Invalid management', '', 'write', 'automatic', 'manual', 'legacy',
+        'active', 'allow', '2099-03-01T00:00:00.000Z',
+        '2026-08-20T11:00:00.000Z', '2026-08-20T11:00:00.000Z'
+      )
+    `).run()).toThrow(/lease management must match lease kind/);
+    expect(migrated.connection.prepare(`
+      INSERT INTO leases (
+        id, room_id, member_id, session_id, title, intent, mode, kind, managed_by,
+        created_via, status, decision, expires_at, created_at, updated_at
+      ) VALUES (
+        'parallel-manual-lease', 'schema5-room', 'schema5-member', 'schema5-session',
+        'Manual scope', '', 'write', 'standard', 'manual', 'ui', 'active', 'allow',
+        '2099-03-01T00:00:00.000Z', '2026-08-20T11:00:00.000Z', '2026-08-20T11:00:00.000Z'
+      )
+    `).run().changes).toBe(1);
+    expectAgentLeaseSchema(migrated);
+    expect(migrated.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    migrated.close();
+
+    const reopened = new AgentHubDatabase({ path: databasePath });
+    expect(reopened.connection.prepare(`
+      SELECT COUNT(*) AS count FROM leases
+      WHERE room_id = 'schema5-room' AND member_id = 'schema5-member'
+        AND session_id = 'schema5-session' AND status = 'active' AND managed_by = 'agent'
+    `).get()).toEqual({ count: 1 });
+    reopened.close();
+  });
+
   it("repairs an interrupted schema 5 coordination-state backfill idempotently", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-hub-partial-schema5-db-"));
     temporaryDirectories.push(directory);
@@ -360,6 +653,29 @@ describe("Agent Hub database migrations", () => {
 
     const reopened = new AgentHubDatabase({ path: databasePath });
     expectHistoricalFixturePreserved(reopened, 4);
+    reopened.close();
+  });
+
+  it("resumes an interrupted schema 6 management-source migration idempotently", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-hub-partial-schema6-db-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "agent-hub.sqlite");
+    createHistoricalDatabaseFixture(databasePath, 5);
+    const partial = new DatabaseSync(databasePath);
+    partial.exec(`
+      ALTER TABLE leases ADD COLUMN managed_by TEXT NOT NULL DEFAULT 'manual'
+        CHECK (managed_by IN ('manual', 'agent'));
+      UPDATE leases SET managed_by = 'agent' WHERE kind = 'automatic';
+      PRAGMA user_version = 5;
+    `);
+    partial.close();
+
+    const repaired = new AgentHubDatabase({ path: databasePath });
+    expectHistoricalFixturePreserved(repaired, 5);
+    repaired.close();
+
+    const reopened = new AgentHubDatabase({ path: databasePath });
+    expectHistoricalFixturePreserved(reopened, 5);
     reopened.close();
   });
 
@@ -406,13 +722,13 @@ describe("Agent Hub database migrations", () => {
     migrated.close();
   });
 
-  it("initializes a new schema 5 database and reopens it idempotently", () => {
-    const directory = mkdtempSync(join(tmpdir(), "agent-hub-new-schema5-db-"));
+  it("initializes a new schema 6 database and reopens it idempotently", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-hub-new-schema6-db-"));
     temporaryDirectories.push(directory);
     const databasePath = join(directory, "agent-hub.sqlite");
 
     const created = new AgentHubDatabase({ path: databasePath });
-    expect(created.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+    expect(created.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
     expect(created.connection.prepare("PRAGMA integrity_check").all()).toEqual([
       { integrity_check: "ok" },
     ]);
@@ -420,7 +736,7 @@ describe("Agent Hub database migrations", () => {
     created.close();
 
     const reopened = new AgentHubDatabase({ path: databasePath });
-    expect(reopened.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+    expect(reopened.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
     expect(reopened.connection.prepare(`
       SELECT COUNT(*) AS count FROM pragma_table_info('local_scans')
       WHERE name = 'finalization_id'
@@ -428,6 +744,7 @@ describe("Agent Hub database migrations", () => {
     expect(reopened.connection.prepare(`
       SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'scans_finalization_idx'
     `).get()).toEqual({ name: "scans_finalization_idx" });
+    expectAgentLeaseSchema(reopened);
     expect(reopened.connection.prepare("PRAGMA integrity_check").all()).toEqual([
       { integrity_check: "ok" },
     ]);
@@ -654,7 +971,7 @@ describe("Agent Hub database migrations", () => {
       WHERE room_id = 'schema3-room' AND member_id = 'schema3-member'
         AND codex_session_id = 'codex-schema3-duplicate' AND closed_at IS NULL
     `).get()).toEqual({ count: 1 });
-    expect(migrated.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+    expect(migrated.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
     expect(migrated.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     expect(migrated.connection.prepare(`
       SELECT id, finalization_id FROM local_scans WHERE id = 'schema3-scan'
@@ -901,8 +1218,8 @@ describe("Agent Hub database migrations", () => {
       SELECT id, session_id, status, automatic_phase, coordination_state, expires_at FROM leases ORDER BY id
     `).all()).toEqual([
       { id: "canonical-auto", session_id: "session-finalizing", status: "active", automatic_phase: "working", coordination_state: "working", expires_at: "2026-08-27T12:00:00.000Z" },
-      { id: "duplicate-auto", session_id: "session-newer", status: "active", automatic_phase: "working", coordination_state: "working", expires_at: "2026-08-27T12:00:00.000Z" },
-      { id: "duplicate-finalizing-awaiting", session_id: "session-newer", status: "active", automatic_phase: "awaiting_commit", coordination_state: "awaiting_commit", expires_at: "2026-08-27T12:00:00.000Z" },
+      { id: "duplicate-auto", session_id: "session-newer", status: "active", automatic_phase: "awaiting_commit", coordination_state: "awaiting_commit", expires_at: "2026-08-27T12:00:00.000Z" },
+      { id: "duplicate-finalizing-awaiting", session_id: "session-newer", status: "cancelled", automatic_phase: "awaiting_commit", coordination_state: "awaiting_commit", expires_at: "2026-08-27T12:00:00.000Z" },
       { id: "duplicate-standard", session_id: "session-newer", status: "active", automatic_phase: "working", coordination_state: "working", expires_at: "2026-08-27T12:00:00.000Z" },
       { id: "preserved-active-awaiting", session_id: "session-active-older", status: "active", automatic_phase: "awaiting_commit", coordination_state: "awaiting_commit", expires_at: "2026-08-27T12:00:00.000Z" },
     ]);
@@ -915,7 +1232,7 @@ describe("Agent Hub database migrations", () => {
       name: "sessions_codex_identity_idx",
       sql: expect.stringContaining("finalizing_at IS NULL"),
     });
-    expect(migrated.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+    expect(migrated.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
     expect(migrated.connection.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     migrated.close();
 
@@ -941,7 +1258,7 @@ describe("Agent Hub database migrations", () => {
     `).get()).toEqual({ session_id: "session-active-older", status: "active" });
     expect(reopened.connection.prepare(`
       SELECT session_id, status, automatic_phase, coordination_state, expires_at
-      FROM leases WHERE id = 'duplicate-finalizing-awaiting'
+      FROM leases WHERE id = 'duplicate-auto'
     `).get()).toEqual({
       session_id: "session-newer",
       status: "active",
@@ -960,13 +1277,13 @@ describe("Agent Hub database migrations", () => {
       turnId: "turn-finalizing-loser",
       activityEpoch: 7,
       outcome: "committed",
-      leaseIds: ["duplicate-finalizing-awaiting"],
+      leaseIds: ["duplicate-auto"],
       attributedPaths: ["src/finalizing-loser.ts"],
       baseCommit: "base-finalizing",
       headCommit: "head-finalizing",
     })).toMatchObject({
       result: "released",
-      releasedLeaseIds: ["duplicate-finalizing-awaiting"],
+      releasedLeaseIds: ["duplicate-auto"],
     });
     expect(service.completeSessionActivity({
       memberToken,
@@ -985,9 +1302,10 @@ describe("Agent Hub database migrations", () => {
     });
     expect(reopened.connection.prepare(`
       SELECT id, status FROM leases
-      WHERE id IN ('duplicate-finalizing-awaiting', 'preserved-active-awaiting')
+      WHERE id IN ('duplicate-auto', 'duplicate-finalizing-awaiting', 'preserved-active-awaiting')
       ORDER BY id
     `).all()).toEqual([
+      { id: "duplicate-auto", status: "cancelled" },
       { id: "duplicate-finalizing-awaiting", status: "cancelled" },
       { id: "preserved-active-awaiting", status: "cancelled" },
     ]);
@@ -1098,10 +1416,18 @@ describe("Agent Hub database migrations", () => {
     expect(columns.filter((column) => column.name === "kind")).toHaveLength(1);
     expect(columns.filter((column) => column.name === "automatic_phase")).toHaveLength(1);
     expect(columns.filter((column) => column.name === "coordination_state")).toHaveLength(1);
+    expect(columns.filter((column) => column.name === "managed_by")).toHaveLength(1);
+    expect(columns.filter((column) => column.name === "created_via")).toHaveLength(1);
     expect(database.connection
-      .prepare("SELECT id, session_id, kind FROM leases WHERE id = 'legacy-lease'")
-      .get()).toEqual({ id: "legacy-lease", session_id: null, kind: "standard" });
-    expect(database.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+      .prepare("SELECT id, session_id, kind, managed_by, created_via FROM leases WHERE id = 'legacy-lease'")
+      .get()).toEqual({
+        id: "legacy-lease",
+        session_id: null,
+        kind: "standard",
+        managed_by: "manual",
+        created_via: "legacy",
+      });
+    expect(database.connection.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
     expect(database.connection.prepare(`
       SELECT blocking_protection_enabled, automatic_lease_ttl_minutes,
         maximum_exclusive_lease_minutes, risk_policy_version

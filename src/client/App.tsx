@@ -52,6 +52,7 @@ import {
   deleteSavedConnection,
   downloadDesktopUpdate,
   getDashboard,
+  getLeaseScopeEvents,
   getDesktopUpdateStatus,
   installDesktopUpdate,
   manageMember,
@@ -82,6 +83,7 @@ import {
   type DesktopUpdateStatus,
   type DeleteRoomConnectionResult,
   type Lease,
+  type LeaseScopeEvent,
   type ProjectRecord,
   type RecordKind,
   type ReleaseRequest,
@@ -1319,8 +1321,194 @@ function MemberStrip({ dashboard }: { dashboard: Dashboard }) {
   );
 }
 
+export function shortIdentifier(value?: string): string {
+  const normalized = value?.trim() ?? "";
+  if (normalized.length <= 12) return normalized;
+  return `${normalized.slice(0, 8)}…${normalized.slice(-4)}`;
+}
+
+function SessionIdentifier({
+  label,
+  value,
+  missingLabel,
+}: {
+  label: string;
+  value?: string;
+  missingLabel: "未关联" | "客户端未提供";
+}) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    if (!value) return;
+    const success = await copyText(value);
+    setCopied(success);
+    window.setTimeout(() => setCopied(false), 1800);
+  };
+  return (
+    <div className={`session-identifier ${value ? "" : "missing"}`}>
+      <span>{label}</span>
+      <div>
+        <code title={value}>{value ? shortIdentifier(value) : missingLabel}</code>
+        {value && (
+          <IconButton label={`复制${label}`} className="compact-copy" onClick={copy}>
+            {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+          </IconButton>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SessionIdentityStrip({
+  hubSessionId,
+  codexSessionId,
+  currentTurnId,
+  className = "",
+}: {
+  hubSessionId?: string;
+  codexSessionId?: string;
+  currentTurnId?: string;
+  className?: string;
+}) {
+  const clientMissingLabel = hubSessionId ? "客户端未提供" : "未关联";
+  return (
+    <div className={`work-session-identifiers ${className}`} aria-label="会话标识">
+      <SessionIdentifier label="Codex Session ID" value={codexSessionId} missingLabel={clientMissingLabel} />
+      <SessionIdentifier label="Hub Session ID" value={hubSessionId} missingLabel="未关联" />
+      <SessionIdentifier label="当前 Turn ID" value={currentTurnId} missingLabel={clientMissingLabel} />
+    </div>
+  );
+}
+
+function leaseSourceLabel(source: Lease["createdVia"]): string {
+  return { ui: "界面", mcp: "MCP", hook: "Hook", legacy: "旧版本" }[source];
+}
+
+function scopeEventLabel(event: LeaseScopeEvent): string {
+  if (event.type === "lease.scope_expanded") return "范围已扩展";
+  if (event.type === "lease.scope_covered") return "范围已覆盖";
+  if (event.type === "lease.scope_observed") return "识别到调用范围";
+  return event.title || "范围调用记录";
+}
+
+function ScopeEventPaths({ event }: { event: LeaseScopeEvent }) {
+  const groups = [
+    ["实际", event.metadata.actualPaths],
+    ["新增", event.metadata.addedPaths],
+    ["已覆盖", event.metadata.coveredPaths],
+    ["已忽略", event.metadata.ignoredPaths],
+    ["候选", event.metadata.requestedPaths],
+  ] as const;
+  return (
+    <div className="scope-event-paths">
+      {groups.filter(([, paths]) => paths.length > 0).map(([label, paths]) => (
+        <div key={label}>
+          <span>{label}</span>
+          <div className="scope-list compact">{paths.map((path) => <span key={`${label}-${path}`} title={path}>{path}</span>)}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function ScopeEventRow({ event }: { event: LeaseScopeEvent }) {
+  return (
+    <article className="scope-event-row">
+      <div className="scope-event-heading">
+        <strong>{scopeEventLabel(event)}</strong>
+        <time>{formatDate(event.createdAt)}</time>
+      </div>
+      <div className="scope-event-meta">
+        {event.metadata.source && <span>来源 {leaseSourceLabel(event.metadata.source)}</span>}
+        <span>{event.metadata.toolName || "工具未上报"}</span>
+        <span>{event.metadata.stage === "pre" ? "调用前" : event.metadata.stage === "post" ? "调用后" : "阶段未上报"}</span>
+        <code title={event.metadata.turnId}>{event.metadata.turnId ? `Turn ${shortIdentifier(event.metadata.turnId)}` : "Turn 未上报"}</code>
+        {event.metadata.invocationId && <code title={event.metadata.invocationId}>调用 {shortIdentifier(event.metadata.invocationId)}</code>}
+      </div>
+      <ScopeEventPaths event={event} />
+      {event.metadata.pathDiagnostics.length > 0 && (
+        <div className="scope-event-diagnostics" aria-label="路径诊断">
+          <span>诊断</span>
+          <div>{event.metadata.pathDiagnostics.map((diagnostic, index) => (
+            <p key={`${index}-${diagnostic}`}>{diagnostic}</p>
+          ))}</div>
+        </div>
+      )}
+    </article>
+  );
+}
+
+function LeaseSessionDetails({
+  lease,
+  agentSession,
+  access,
+}: {
+  lease: Lease;
+  agentSession?: Dashboard["sessions"][number];
+  access?: Session;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [events, setEvents] = useState<LeaseScopeEvent[]>([]);
+  const [nextBefore, setNextBefore] = useState<string>();
+  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string>();
+  const isAgentManaged = lease.managedBy === "agent";
+
+  const loadEvents = async (before?: string) => {
+    if (!access || loading) return;
+    setLoading(true);
+    setError(undefined);
+    try {
+      const page = await getLeaseScopeEvents(access, lease.id, { limit: 20, before });
+      setEvents((current) => {
+        const combined = before ? [...current, ...page.items] : page.items;
+        return [...new Map(combined.map((event) => [event.id, event])).values()];
+      });
+      setNextBefore(page.nextBefore);
+      setLoaded(true);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "调用历史加载失败。");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggle = () => {
+    const nextExpanded = !expanded;
+    setExpanded(nextExpanded);
+    if (nextExpanded && !loaded && !loading) void loadEvents();
+  };
+
+  const epoch = isAgentManaged ? agentSession?.activityEpoch : undefined;
+  const missingEpoch = isAgentManaged && lease.sessionId ? "客户端未提供" : "未关联";
+  return (
+    <div className={`work-session-detail ${expanded ? "expanded" : ""}`}>
+      <button type="button" className="work-detail-toggle" onClick={toggle} aria-expanded={expanded}>
+        <ChevronRight aria-hidden="true" />
+        <span>会话详情</span>
+      </button>
+      <div className="work-detail-body" hidden={!expanded}>
+        <div className="work-detail-facts">
+          <span><strong>activityEpoch</strong><code>{epoch === undefined ? missingEpoch : epoch}</code></span>
+          <span><strong>托管方式</strong>{isAgentManaged ? "Agent 托管" : "人工维护"}</span>
+          <span><strong>领取来源</strong>{leaseSourceLabel(lease.createdVia)}</span>
+        </div>
+        <div className="scope-event-history" aria-label="历史调用归因">
+          {events.map((event) => <ScopeEventRow event={event} key={event.id} />)}
+          {loading && <div className="scope-history-state"><LoaderCircle className="spin" aria-hidden="true" />正在加载</div>}
+          {!loading && loaded && events.length === 0 && <div className="scope-history-state">暂无调用记录</div>}
+          {error && <div className="scope-history-state error"><AlertTriangle aria-hidden="true" />{error}<button type="button" className="text-button" onClick={() => void loadEvents(nextBefore)}>重试</button></div>}
+          {!loading && !error && nextBefore && <button type="button" className="text-button scope-history-more" onClick={() => void loadEvents(nextBefore)}>加载更早记录</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function WorkItem({
   lease,
+  agentSession,
+  access,
   own,
   busy,
   now = Date.now(),
@@ -1328,6 +1516,8 @@ export function WorkItem({
   onClose,
 }: {
   lease: Lease;
+  agentSession?: Dashboard["sessions"][number];
+  access?: Session;
   own: boolean;
   busy: boolean;
   now?: number;
@@ -1337,13 +1527,14 @@ export function WorkItem({
   const awaitingCommit = isAwaitingCommitLease(lease);
   const blocked = isBlockedLease(lease);
   const waiting = lease.phase === "waiting";
+  const hubSessionId = lease.managedBy === "agent" ? lease.sessionId : undefined;
   return (
     <article className={`work-item ${own ? "own" : ""} ${awaitingCommit ? "awaiting-commit" : ""} ${blocked ? "blocked" : ""} ${waiting ? "waiting" : ""}`}>
       <div className="work-state" aria-hidden="true"><span /></div>
       <div className="work-main">
         <div className="work-title-row">
           <div>
-            <div className="work-owner"><span>{lease.memberName}</span>{own && <em>你的工作</em>}<em className={lease.kind === "exclusive" ? "exclusive" : ""}>{lease.kind === "exclusive" ? "手动独占" : lease.kind === "automatic" ? "自动领取" : "普通范围"}</em></div>
+            <div className="work-owner"><span>{lease.memberName}</span>{own && <em>你的工作</em>}<em className={lease.kind === "exclusive" ? "exclusive" : ""}>{lease.kind === "exclusive" ? "手动独占" : lease.managedBy === "agent" ? "Agent 托管" : "普通范围"}</em></div>
             <h3>{lease.title}</h3>
           </div>
           <span className="lease-time"><Clock3 aria-hidden="true" />{formatLeaseExpiryCountdown(lease.expiresAt, now)}</span>
@@ -1369,6 +1560,12 @@ export function WorkItem({
           <span><GitBranch aria-hidden="true" />{lease.branch || "分支未上报"}</span>
           <span>基于 {shortCommit(lease.baseCommit)}</span>
         </div>
+        <SessionIdentityStrip
+          hubSessionId={hubSessionId}
+          codexSessionId={hubSessionId ? agentSession?.codexSessionId : undefined}
+          currentTurnId={hubSessionId ? agentSession?.currentTurnId : undefined}
+        />
+        <LeaseSessionDetails lease={lease} agentSession={agentSession} access={access} />
       </div>
       {own && !awaitingCommit && !blocked && !waiting && (
         <div className="work-actions">
@@ -1494,6 +1691,7 @@ function RecentActivity({ dashboard }: { dashboard: Dashboard }) {
 
 export function WorkView({
   dashboard,
+  access,
   busyLeaseId,
   transientConflicts,
   now,
@@ -1502,6 +1700,7 @@ export function WorkView({
   onClose,
 }: {
   dashboard: Dashboard;
+  access?: Session;
   busyLeaseId?: string;
   transientConflicts: Conflict[];
   now: number;
@@ -1519,7 +1718,28 @@ export function WorkView({
   const otherWaitingLeases = waiting.filter((lease) => !isOwnLease(lease));
   const ownBlockedLeases = blocked.filter(isOwnLease);
   const otherBlockedLeases = blocked.filter((lease) => !isOwnLease(lease));
-  const activeSessions = dashboard.sessions.filter((session) => isRealtimeAgentSession(session, now));
+  const sessionsById = new Map(dashboard.sessions.map((session) => [session.id, session]));
+  const boundSessionIds = new Set(
+    [...working, ...waiting, ...blocked, ...awaitingCommit]
+      .filter((lease) => lease.managedBy === "agent")
+      .flatMap((lease) => lease.sessionId ? [lease.sessionId] : []),
+  );
+  // Hub Session ID 是任务与实时会话的唯一绑定键；已绑定行不再在卡片下方重复出现。
+  const activeSessions = dashboard.sessions.filter((session) =>
+    isRealtimeAgentSession(session, now) && !boundSessionIds.has(session.id));
+  const renderWorkItem = (lease: Lease, own: boolean, busy: boolean) => (
+    <WorkItem
+      key={lease.id}
+      lease={lease}
+      agentSession={lease.sessionId ? sessionsById.get(lease.sessionId) : undefined}
+      access={access}
+      own={own}
+      busy={busy}
+      now={now}
+      onRenew={onRenew}
+      onClose={onClose}
+    />
+  );
   const conflicts = [...transientConflicts, ...dashboard.conflicts];
   return (
     <>
@@ -1539,8 +1759,8 @@ export function WorkView({
             {working.length || activeSessions.length ? (
               <>
                 {working.length > 0 && <div className="work-list">
-                  {ownWorkingLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own busy={busyLeaseId === lease.id} now={now} onRenew={onRenew} onClose={onClose} />)}
-                  {otherWorkingLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own={false} busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
+                  {ownWorkingLeases.map((lease) => renderWorkItem(lease, true, busyLeaseId === lease.id))}
+                  {otherWorkingLeases.map((lease) => renderWorkItem(lease, false, false))}
                 </div>}
                 {activeSessions.length > 0 && (
                   <div className="session-list" aria-label="Agent 实时活动">
@@ -1554,7 +1774,13 @@ export function WorkView({
                             <strong>{member?.name ?? "团队成员"}</strong>
                             <p>{agentSession.task || "正在分析项目与同步工作范围"}</p>
                           </div>
-                          <small>{agentSession.agentName || agentSession.clientName || "本地组件"}{agentSession.branch ? ` · ${agentSession.branch}` : ""}</small>
+                          <small>{agentSession.agentName || agentSession.clientName || "本地组件"}{agentSession.branch ? ` · ${agentSession.branch}` : ""}{agentSession.activityEpoch === undefined ? "" : ` · Epoch ${agentSession.activityEpoch}`}</small>
+                          <SessionIdentityStrip
+                            className="standalone-session-identifiers"
+                            hubSessionId={agentSession.id}
+                            codexSessionId={agentSession.codexSessionId}
+                            currentTurnId={agentSession.currentTurnId}
+                          />
                         </div>
                       );
                     })}
@@ -1570,10 +1796,10 @@ export function WorkView({
             <section className="section-block awaiting-protection-section" aria-labelledby="coordination-title">
               <div className="section-heading"><div><span className="section-kicker">租约协调</span><h2 id="coordination-title">等待与阻塞</h2></div><span className="quiet-count">{waiting.length + blocked.length} 项</span></div>
               <div className="work-list">
-                {ownWaitingLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
-                {otherWaitingLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own={false} busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
-                {ownBlockedLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
-                {otherBlockedLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own={false} busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
+                {ownWaitingLeases.map((lease) => renderWorkItem(lease, true, false))}
+                {otherWaitingLeases.map((lease) => renderWorkItem(lease, false, false))}
+                {ownBlockedLeases.map((lease) => renderWorkItem(lease, true, false))}
+                {otherBlockedLeases.map((lease) => renderWorkItem(lease, false, false))}
               </div>
             </section>
           )}
@@ -1587,8 +1813,8 @@ export function WorkView({
                 <span className="quiet-count">{awaitingCommit.length} 项</span>
               </div>
               <div className="work-list">
-                {ownAwaitingLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
-                {otherAwaitingLeases.map((lease) => <WorkItem key={lease.id} lease={lease} own={false} busy={false} now={now} onRenew={onRenew} onClose={onClose} />)}
+                {ownAwaitingLeases.map((lease) => renderWorkItem(lease, true, false))}
+                {otherAwaitingLeases.map((lease) => renderWorkItem(lease, false, false))}
               </div>
             </section>
           )}
@@ -2271,7 +2497,7 @@ function DashboardApp({
           <StatusSummary dashboard={dashboard} syncState={syncState} now={leaseNow} conflicts={[...transientConflicts, ...dashboard.conflicts]} />
           <DesktopUpdateControl onNotice={(message, tone = "success") => setNotice({ message, tone })} />
           {error && <div className="inline-alert"><AlertTriangle aria-hidden="true" />{error}</div>}
-          {view === "work" && <WorkView dashboard={dashboard} busyLeaseId={busyLeaseId} transientConflicts={transientConflicts} now={leaseNow} onClaim={() => openModal({ type: "claim" })} onRenew={handleRenew} onClose={(lease) => openModal({ type: "close", lease })} />}
+          {view === "work" && <WorkView dashboard={dashboard} access={session} busyLeaseId={busyLeaseId} transientConflicts={transientConflicts} now={leaseNow} onClaim={() => openModal({ type: "claim" })} onRenew={handleRenew} onClose={(lease) => openModal({ type: "close", lease })} />}
           {view === "records" && <RecordsView dashboard={dashboard} onAdd={(recordKind) => openModal({ type: "record", recordKind })} />}
           {view === "management" && <ManagementView dashboard={dashboard} session={session} onRefresh={() => refresh(true)} onNotice={(message, tone = "success") => setNotice({ message, tone })} />}
           {view === "connection" && <ConnectionView dashboard={dashboard} session={session} syncState={syncState} now={leaseNow} deleting={deletingCurrentConnection} onRemoveLocal={onDeleteCurrentConnection} />}

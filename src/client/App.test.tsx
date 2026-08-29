@@ -22,6 +22,8 @@ import {
   monitorModeUpgradeGuidance,
   protectedSystemsForDashboard,
   roomSettingsErrorMessage,
+  ScopeEventRow,
+  shortIdentifier,
   splitVisibleLeases,
 } from "./App";
 import { ApiError, type Conflict, type Dashboard, type Lease, type SavedRoomConnection, type Session } from "./api";
@@ -39,6 +41,8 @@ function lease(overrides: Partial<Lease> = {}): Lease {
     highRiskPaths: [],
     mode: "write",
     kind: "automatic",
+    managedBy: "agent",
+    createdVia: "legacy",
     phase: "working",
     status: "active",
     expiresAt: "2026-08-27T08:10:00.000Z",
@@ -297,6 +301,149 @@ describe("lease protection presentation", () => {
       lastSeenAt: "2026-08-27T08:00:00.000Z",
       turnStoppedAt: "2026-08-27T08:00:00.000Z",
     }, LEASE_NOW)).toBe(false);
+  });
+
+  it("shortens long identifiers to the first eight and last four characters", () => {
+    expect(shortIdentifier("codex-session-abcdefgh")).toBe("codex-se…efgh");
+    expect(shortIdentifier("short-id")).toBe("short-id");
+    expect(shortIdentifier()).toBe("");
+  });
+
+  it("shows a scope event source and preserves long wrapping diagnostics", () => {
+    const diagnostic = "Join-Path could not be proven because every parameter depends on a runtime-only variable/with/an/intentionally/long/value.";
+    const markup = renderToStaticMarkup(<ScopeEventRow event={{
+      id: "scope-event-source",
+      type: "lease.scope_observed",
+      title: "Observed scope",
+      createdAt: "2026-08-29T02:00:00.000Z",
+      metadata: {
+        invocationId: "invocation-source",
+        source: "hook",
+        toolName: "Bash",
+        stage: "pre",
+        turnId: "turn-source",
+        requestedPaths: [],
+        coveredPaths: [],
+        addedPaths: [],
+        ignoredPaths: [],
+        actualPaths: [],
+        pathDiagnostics: [diagnostic],
+      },
+    }} />);
+
+    expect(markup).toContain("来源 Hook");
+    expect(markup).toContain('aria-label="路径诊断"');
+    expect(markup).toContain(diagnostic);
+    expect(markup).toContain('class="scope-event-diagnostics"');
+  });
+
+  it("shows linked session identifiers, copy actions, epoch, and acquisition source on work cards", () => {
+    const markup = renderToStaticMarkup(
+      <WorkItem
+        lease={lease({
+          sessionId: "hub-session-1234567890",
+          managedBy: "agent",
+          createdVia: "mcp",
+        })}
+        agentSession={{
+          id: "hub-session-1234567890",
+          memberId: "member-current",
+          codexSessionId: "codex-session-abcdefgh",
+          currentTurnId: "turn-1234567890",
+          activityEpoch: 7,
+          status: "active",
+        }}
+        own
+        busy={false}
+        now={LEASE_NOW}
+        onRenew={() => undefined}
+        onClose={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("codex-se…efgh");
+    expect(markup).toContain("hub-sess…7890");
+    expect(markup).toContain("turn-123…7890");
+    expect(markup).toContain('aria-label="复制Codex Session ID"');
+    expect(markup).toContain('aria-label="复制Hub Session ID"');
+    expect(markup).toContain('aria-label="复制当前 Turn ID"');
+    expect(markup).toContain("activityEpoch");
+    expect(markup).toContain(">7</code>");
+    expect(markup).toContain("MCP");
+  });
+
+  it("keeps manual work unassociated even when a legacy response contains a session id", () => {
+    const markup = renderToStaticMarkup(
+      <WorkItem
+        lease={lease({
+          sessionId: "legacy-session-id",
+          kind: "standard",
+          managedBy: "manual",
+          createdVia: "ui",
+        })}
+        agentSession={{
+          id: "legacy-session-id",
+          memberId: "member-current",
+          codexSessionId: "must-not-display",
+          currentTurnId: "must-not-display",
+          activityEpoch: 9,
+          status: "active",
+        }}
+        own
+        busy={false}
+        now={LEASE_NOW}
+        onRenew={() => undefined}
+        onClose={() => undefined}
+      />,
+    );
+
+    expect(markup.match(/未关联/g)?.length).toBeGreaterThanOrEqual(4);
+    expect(markup).not.toContain("must-not-display");
+    expect(markup).not.toContain('aria-label="复制Hub Session ID"');
+    expect(markup).toContain('aria-label="历史调用归因"');
+    expect(markup).not.toContain("人工任务没有 Agent 调用记录");
+  });
+
+  it("binds work cards by Hub Session ID and suppresses only the duplicate live row", () => {
+    const markup = renderToStaticMarkup(
+      <WorkView
+        dashboard={dashboard({
+          leases: [lease({ sessionId: "hub-bound-session", createdVia: "hook" })],
+          sessions: [
+            {
+              id: "hub-bound-session",
+              memberId: "member-current",
+              codexSessionId: "codex-bound-session",
+              currentTurnId: "turn-bound-session",
+              activityEpoch: 3,
+              status: "active",
+              lastSeenAt: "2026-08-27T08:00:00.000Z",
+              task: "不应重复显示的会话行",
+            },
+            {
+              id: "hub-standalone-session",
+              memberId: "member-current",
+              codexSessionId: "codex-standalone-session",
+              currentTurnId: "turn-standalone-session",
+              activityEpoch: 1,
+              status: "active",
+              lastSeenAt: "2026-08-27T08:00:00.000Z",
+              task: "保留的独立会话行",
+            },
+          ],
+        })}
+        transientConflicts={[]}
+        now={LEASE_NOW}
+        onClaim={() => undefined}
+        onRenew={() => undefined}
+        onClose={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("codex-bo…sion");
+    expect(markup).not.toContain("不应重复显示的会话行");
+    expect(markup).toContain("保留的独立会话行");
+    expect(markup).toContain("hub-stan…sion");
   });
 
   it("derives protected systems only from valid leases and ignores historical scans", () => {

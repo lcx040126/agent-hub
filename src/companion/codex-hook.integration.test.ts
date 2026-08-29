@@ -20,6 +20,7 @@ import {
 } from "../shared/version.js";
 import { handleCodexHook, runCodexHook, type CodexHookInput, type RunCodexHookOptions } from "./codex-hook.js";
 import { CodexHookStateStore } from "./hook-state.js";
+import { AgentHubClient } from "./hub-client.js";
 import { IntegrationOperationTracker } from "./integration-operations.js";
 import { PausePreparationQueue } from "./pause-preparation.js";
 import { startRuntimePresence, type RuntimePresenceHandle } from "./runtime-presence.js";
@@ -27,6 +28,7 @@ import { startCodexSessionHeartbeatScheduler } from "./codex-session-heartbeat.j
 import { SessionEndQueueStore } from "./session-end-queue.js";
 import { startSessionEndFinalizationWorker } from "./session-end-worker.js";
 import { TurnCompletionQueueStore } from "./turn-completion-queue.js";
+import { processTurnCompletionJob } from "./turn-completion-worker.js";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -86,6 +88,233 @@ describe("Codex hook integration", () => {
     expect(list).toHaveBeenCalledOnce();
     expect(fetchImpl).not.toHaveBeenCalled();
   }, 10_000);
+
+  it("pairs Pre/Post scope audit, adopts the canonical lease, and ignores temporary cleanup", async () => {
+    const fixture = await createConnectedHookFixture("scope-audit", "scope-audit-session");
+    const stateStore = new CodexHookStateStore(fixture.userDataPath);
+    await handleCodexHook(
+      fixture.options("SessionStart"),
+      fixture.input("SessionStart", { turn_id: "scope-audit-turn" }),
+    );
+    const prepareBodies: Array<Record<string, unknown>> = [];
+    const canonicalExpiry = new Date(Date.now() + 10 * 60_000).toISOString();
+    const fetchImpl = vi.fn<typeof fetch>(async (request, init) => {
+      const pathname = new URL(request instanceof Request ? request.url : String(request)).pathname;
+      if (pathname !== "/api/edits/prepare") return fetch(request, init);
+      const requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      prepareBodies.push(requestBody);
+      if (Array.isArray(requestBody.paths) && requestBody.paths.length === 0) {
+        return jsonResponse({
+          check: { allowed: true, blockers: [], warnings: [], coveredPaths: [], uncoveredPaths: [] },
+          renewedLeases: [],
+          managedLease: {
+            id: "canonical-managed-lease",
+            paths: ["src/value.ts"],
+            expiresAt: canonicalExpiry,
+          },
+        });
+      }
+      const response = await fetch(request, init);
+      const payload = await response.json() as Record<string, unknown>;
+      return jsonResponse({
+        ...payload,
+        managedLease: {
+          id: "canonical-managed-lease",
+          paths: ["src/value.ts"],
+          expiresAt: canonicalExpiry,
+        },
+      });
+    });
+    const patchCommand = "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch";
+
+    await expect(handleCodexHook(
+      fixture.options("PreToolUse", fetchImpl),
+      fixture.input("PreToolUse", {
+        turn_id: "scope-audit-turn",
+        tool_name: "apply_patch",
+        tool_input: { command: patchCommand },
+      }),
+    )).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    const preState = (await stateStore.load(fixture.sessionId))!;
+    expect(preState).toMatchObject({
+      leases: [{ id: "canonical-managed-lease", paths: ["src/value.ts"] }],
+      pendingWrite: { invocationId: expect.any(String) },
+    });
+
+    await writeFile(path.join(fixture.repository, "src", "value.ts"), "export const value = 2;\n", "utf8");
+    await handleCodexHook(
+      fixture.options("PostToolUse", fetchImpl),
+      fixture.input("PostToolUse", {
+        turn_id: "scope-audit-turn",
+        tool_name: "apply_patch",
+        tool_input: { command: patchCommand },
+      }),
+    );
+    expect(prepareBodies.slice(0, 2)).toEqual([
+      expect.objectContaining({
+        invocationId: preState.pendingWrite?.invocationId,
+        toolName: "apply_patch",
+        stage: "pre",
+      }),
+      expect.objectContaining({
+        invocationId: preState.pendingWrite?.invocationId,
+        toolName: "apply_patch",
+        stage: "post",
+        actualPaths: ["src/value.ts"],
+      }),
+    ]);
+
+    const temporaryLog = path.join(fixture.repository, ".tmp", "agent-hub-test.log");
+    await mkdir(path.dirname(temporaryLog), { recursive: true });
+    await writeFile(temporaryLog, "temporary\n", "utf8");
+    const outsideLog = path.join(path.dirname(fixture.repository), "outside-agent-hub-test.log");
+    const cleanupCommand = [
+      "Remove-Item -LiteralPath '.tmp/agent-hub-test.log' -ErrorAction SilentlyContinue",
+      `Remove-Item -LiteralPath '${outsideLog.replaceAll("'", "''")}' -ErrorAction SilentlyContinue`,
+    ].join("; ");
+    await expect(handleCodexHook(
+      fixture.options("PreToolUse", fetchImpl),
+      fixture.input("PreToolUse", {
+        turn_id: "scope-audit-turn",
+        tool_name: "Bash",
+        tool_input: { command: cleanupCommand },
+      }),
+    )).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    expect(prepareBodies.at(-1)).toMatchObject({
+      paths: [],
+      ignoredPaths: expect.arrayContaining([".tmp/agent-hub-test.log", outsideLog]),
+      pathDiagnostics: [],
+      stage: "pre",
+    });
+    expect((await stateStore.load(fixture.sessionId))?.leases).toEqual([
+      expect.objectContaining({ id: "canonical-managed-lease" }),
+    ]);
+  }, 20_000);
+
+  it("does not adopt a same-member manual lease when it fully covers a Hook write", async () => {
+    const fixture = await createConnectedHookFixture("manual-coverage", "manual-coverage-session");
+    const stateStore = new CodexHookStateStore(fixture.userDataPath);
+    await handleCodexHook(
+      fixture.options("SessionStart"),
+      fixture.input("SessionStart", { turn_id: "manual-coverage-turn" }),
+    );
+    const state = (await stateStore.load(fixture.sessionId))!;
+    const manual = fixture.service.claimLease({
+      memberToken: fixture.room.memberToken,
+      sessionId: state.hubSessionId,
+      title: "Manual TypeScript scope",
+      branch: "main",
+      baseCommit: (await outputGit(fixture.repository, ["rev-parse", "HEAD"])).trim(),
+      paths: ["src"],
+      mode: "write",
+      kind: "standard",
+      managedBy: "manual",
+      createdVia: "ui",
+    });
+    expect(manual).toMatchObject({
+      acquired: true,
+      lease: { kind: "standard", managedBy: "manual" },
+    });
+
+    await expect(handleCodexHook(
+      fixture.options("PreToolUse"),
+      fixture.input("PreToolUse", {
+        turn_id: "manual-coverage-turn",
+        tool_name: "apply_patch",
+        tool_input: {
+          command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch",
+        },
+      }),
+    )).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+
+    expect((await stateStore.load(fixture.sessionId))?.leases).toEqual([]);
+  }, 20_000);
+
+  it("removes a released repository lease before the next turn checks a dynamic write", async () => {
+    const fixture = await createConnectedHookFixture("released-repository", "released-repository-session");
+    fixture.service.updateRoomSettings({
+      memberToken: fixture.room.memberToken,
+      blockingProtectionEnabled: true,
+    });
+    const stateStore = new CodexHookStateStore(fixture.userDataPath);
+    await handleCodexHook(
+      fixture.options("SessionStart"),
+      fixture.input("SessionStart", { turn_id: "released-repository-old-turn" }),
+    );
+    const state = (await stateStore.load(fixture.sessionId))!;
+    const claim = fixture.service.claimLease({
+      memberToken: fixture.room.memberToken,
+      sessionId: state.hubSessionId,
+      title: "Repository-wide Agent scope",
+      branch: state.branch,
+      baseCommit: state.baseCommit,
+      paths: ["."],
+      mode: "write",
+      kind: "automatic",
+      managedBy: "agent",
+      createdVia: "mcp",
+    });
+    expect(claim).toMatchObject({
+      acquired: true,
+      lease: {
+        managedBy: "agent",
+        kind: "automatic",
+        paths: [expect.objectContaining({ path: "." })],
+      },
+    });
+    if (!claim.acquired) throw new Error("Expected the repository Agent lease to be acquired.");
+    state.leases = [{
+      id: claim.lease.id,
+      paths: ["."],
+      expiresAt: claim.lease.expiresAt,
+    }];
+    state.leaseAttributionComplete = true;
+    state.attributedChangedPaths = [];
+    state.attributedPathEvidence = [];
+    await stateStore.save(state);
+
+    await handleCodexHook(
+      fixture.options("Stop"),
+      fixture.input("Stop", { turn_id: "released-repository-old-turn" }),
+    );
+    const [job] = await new TurnCompletionQueueStore(fixture.userDataPath)
+      .listForSession(fixture.sessionId);
+    expect(job).toBeDefined();
+    await expect(processTurnCompletionJob(job!, {
+      userDataPath: fixture.userDataPath,
+      client: new AgentHubClient({
+        serverUrl: fixture.serverUrl,
+        memberToken: fixture.room.memberToken,
+      }),
+    })).resolves.toBeNull();
+    await expect(stateStore.load(fixture.sessionId)).resolves.toMatchObject({
+      leases: [],
+      leaseAttributionComplete: true,
+      pendingCompletion: { phase: "stopped" },
+    });
+
+    await expect(handleCodexHook(
+      fixture.options("PreToolUse"),
+      fixture.input("PreToolUse", {
+        turn_id: "released-repository-new-turn",
+        tool_name: "Bash",
+        tool_input: {
+          command: "Set-Content -LiteralPath $env:AGENT_HUB_DYNAMIC_TARGET -Value 'value'",
+        },
+      }),
+    )).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    await expect(stateStore.load(fixture.sessionId)).resolves.toMatchObject({
+      leases: [],
+      currentTurnId: "released-repository-new-turn",
+      pendingCompletion: undefined,
+    });
+  }, 30_000);
 
   it("recovers a higher stopped activity epoch when the server reuses a Codex session", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-hook-epoch-recovery-"));
@@ -155,7 +384,7 @@ describe("Codex hook integration", () => {
     });
   }, 10_000);
 
-  it("keeps a reused remote session fenced while its lease attribution is incomplete", async () => {
+  it("recovers canonical lease attribution for a reused remote session before writing", async () => {
     const fixture = await createConnectedHookFixture("reused-lease-fence", "reused-lease-fence-session");
     const stateStore = new CodexHookStateStore(fixture.userDataPath);
     const baseCommit = (await outputGit(fixture.repository, ["rev-parse", "HEAD"])).trim();
@@ -244,7 +473,8 @@ describe("Codex hook integration", () => {
     }));
     expect(verifiedWrite?.hookSpecificOutput).not.toMatchObject({ permissionDecision: "deny" });
     await expect(stateStore.load(fixture.sessionId)).resolves.toMatchObject({
-      leaseAttributionComplete: false,
+      leaseAttributionComplete: true,
+      leases: [{ id: remoteLease.lease.id }],
     });
     await handleCodexHook(options("PostToolUse"), fixture.input("PostToolUse", {
       turn_id: turnId,
@@ -261,8 +491,9 @@ describe("Codex hook integration", () => {
       },
     }));
     expect(offlineExplicitWrite).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "deny" },
+      hookSpecificOutput: { permissionDecision: "allow" },
     });
+    expect(JSON.stringify(offlineExplicitWrite)).toContain("暂时无法连接");
     failPrepare = false;
 
     failWriteBlockedSync = true;
@@ -276,7 +507,7 @@ describe("Codex hook integration", () => {
     expect(waitingWrite).toMatchObject({
       hookSpecificOutput: { permissionDecision: "deny" },
     });
-    expect(writeBlockedBodies.at(-1)).toMatchObject({ dirty: true, paths: ["src/holder.ts"] });
+    expect(writeBlockedBodies.at(-1)).toMatchObject({ dirty: false, paths: ["src/holder.ts"] });
     expect(fixture.service.getDashboard(fixture.room.memberToken).leases).toEqual(
       expect.arrayContaining([expect.objectContaining({
         id: remoteLease.lease.id,
@@ -286,29 +517,26 @@ describe("Codex hook integration", () => {
       })]),
     );
     await expect(stateStore.load(fixture.sessionId)).resolves.toMatchObject({
-      leases: [],
-      leaseAttributionComplete: false,
+      leases: [{ id: remoteLease.lease.id }],
+      leaseAttributionComplete: true,
       passiveWriteBlock: { requestedPaths: ["src/holder.ts"] },
-      writeBlockSyncPending: { dirty: true, paths: ["src/holder.ts"] },
+      writeBlockSyncPending: { dirty: false, paths: ["src/holder.ts"] },
     });
 
     failWriteBlockedSync = false;
-    await expect(handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
+    const unrelatedRetry = await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
       turn_id: turnId,
       tool_name: "apply_patch",
       tool_input: { command: verifiedCommand },
-    }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "deny" },
-    });
-    expect(fixture.service.getDashboard(fixture.room.memberToken).leases).toEqual(
-      expect.arrayContaining([expect.objectContaining({
-        id: remoteLease.lease.id,
-        status: "active",
-        phase: "blocked",
-      })]),
-    );
+    }));
+    expect(unrelatedRetry?.hookSpecificOutput).not.toMatchObject({ permissionDecision: "deny" });
+    const activeLeases = fixture.service.getDashboard(fixture.room.memberToken).leases;
+    expect(activeLeases.find((lease) => lease.id === remoteLease.lease.id)).toBeUndefined();
+    expect(activeLeases.filter((lease) => lease.sessionId === originalState.hubSessionId)).toEqual([
+      expect.objectContaining({ managedBy: "agent", status: "active" }),
+    ]);
     await expect(stateStore.load(fixture.sessionId)).resolves.toMatchObject({
-      leaseAttributionComplete: false,
+      leaseAttributionComplete: true,
       writeBlockSyncPending: undefined,
     });
   }, 30_000);
@@ -2088,7 +2316,7 @@ describe("Codex hook integration", () => {
     });
   }, 10_000);
 
-  it("lets a new PreToolUse epoch supersede an in-flight Stop without stale state overwrite", async () => {
+  it("lets a new PreToolUse epoch resume a durably queued Stop without stale state overwrite", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-stop-pre-race-"));
     temporaryDirectories.push(root);
     const repository = path.join(root, "repository");
@@ -2123,22 +2351,12 @@ describe("Codex hook integration", () => {
       openedAt: "2026-08-27T00:00:00.000Z",
       updatedAt: "2026-08-27T00:00:00.000Z",
     });
-    let signalStopEntered!: () => void;
-    let releaseStop!: () => void;
-    const stopEntered = new Promise<void>((resolve) => { signalStopEntered = resolve; });
-    const stopRelease = new Promise<void>((resolve) => { releaseStop = resolve; });
     const fetchImpl = vi.fn<typeof fetch>(async (request) => {
       const pathname = new URL(String(request)).pathname;
       if (pathname === "/api/room/settings") {
         return jsonResponse({ settings: { blockingProtectionEnabled: true } });
       }
-      if (pathname.endsWith("/stop")) {
-        signalStopEntered();
-        await stopRelease;
-        return jsonResponse({ result: "awaiting_commit" });
-      }
       if (pathname.endsWith("/resume")) {
-        releaseStop();
         return jsonResponse({ result: "resumed" });
       }
       if (pathname === "/api/edits/prepare") {
@@ -2156,13 +2374,16 @@ describe("Codex hook integration", () => {
       throw new Error(`Unexpected concurrent Hook request: ${pathname}`);
     });
     const sharedOptions = { userDataPath, protector, fetchImpl };
-    const stop = handleCodexHook({ ...sharedOptions, eventName: "Stop" }, {
+    const stop = await handleCodexHook({ ...sharedOptions, eventName: "Stop" }, {
       session_id: "stop-pre-race-session",
       cwd: repository,
       hook_event_name: "Stop",
       turn_id: "turn-old",
     });
-    await stopEntered;
+    expect(stop).toEqual({ continue: true });
+    await expect(new TurnCompletionQueueStore(userDataPath).listForSession(
+      "stop-pre-race-session",
+    )).resolves.toHaveLength(1);
 
     const pre = await handleCodexHook({ ...sharedOptions, eventName: "PreToolUse" }, {
       session_id: "stop-pre-race-session",
@@ -2172,7 +2393,6 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
     });
-    await expect(stop).resolves.toEqual({ continue: true });
     expect(pre?.hookSpecificOutput).not.toMatchObject({ permissionDecision: "deny" });
     await expect(stateStore.load("stop-pre-race-session")).resolves.toMatchObject({
       activityEpoch: 1,
@@ -2183,9 +2403,11 @@ describe("Codex hook integration", () => {
     await expect(new TurnCompletionQueueStore(userDataPath).listForSession(
       "stop-pre-race-session",
     )).resolves.toEqual([]);
+    expect(fetchImpl.mock.calls.some(([request]) =>
+      new URL(String(request)).pathname.endsWith("/stop"))).toBe(false);
   }, 10_000);
 
-  it("keeps an in-flight Stop job when SessionStart replaces its Hub generation", async () => {
+  it("keeps a durable Stop job when local state is replaced with another Hub generation", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "agent-hub-stop-generation-race-"));
     temporaryDirectories.push(root);
     const repository = path.join(root, "repository");
@@ -2221,25 +2443,14 @@ describe("Codex hook integration", () => {
       openedAt: "2026-08-27T00:00:00.000Z",
       updatedAt: "2026-08-27T00:00:00.000Z",
     });
-    let signalStopEntered!: () => void;
-    let releaseStop!: () => void;
-    const stopEntered = new Promise<void>((resolve) => { signalStopEntered = resolve; });
-    const stopRelease = new Promise<void>((resolve) => { releaseStop = resolve; });
-    const fetchImpl = vi.fn<typeof fetch>(async (request) => {
-      const pathname = new URL(String(request)).pathname;
-      if (!pathname.endsWith("/stop")) throw new Error(`Unexpected Stop generation request: ${pathname}`);
-      signalStopEntered();
-      await stopRelease;
-      // 缺少权威租约清单会让旧 job 保持 pending，供后台在原 Hub generation 上继续检查。
-      return jsonResponse({ result: "awaiting_commit" });
-    });
-    const stop = handleCodexHook({ userDataPath, protector, fetchImpl, eventName: "Stop" }, {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const stop = await handleCodexHook({ userDataPath, protector, fetchImpl, eventName: "Stop" }, {
       session_id: "stop-generation-race-session",
       cwd: repository,
       hook_event_name: "Stop",
       turn_id: "turn-old",
     });
-    await stopEntered;
+    expect(stop).toEqual({ continue: true });
 
     const queuedBeforeReopen = (await new TurnCompletionQueueStore(userDataPath).list())[0]!;
     const oldPendingState = (await stateStore.load("stop-generation-race-session"))!;
@@ -2254,9 +2465,7 @@ describe("Codex hook integration", () => {
         openedAt: "2026-08-27T00:00:01.000Z",
       });
     });
-    releaseStop();
 
-    await expect(stop).resolves.toEqual({ continue: true });
     await expect(stateStore.load("stop-generation-race-session")).resolves.toMatchObject({
       hubSessionId: "hub-stop-generation-reopened",
       finalizationId: "finalization-stop-generation-reopened",
@@ -2266,9 +2475,10 @@ describe("Codex hook integration", () => {
       expect.objectContaining({
         operationId: queuedBeforeReopen.operationId,
         hubSessionId: "hub-stop-generation-old",
-        attempts: 1,
+        attempts: 0,
       }),
     ]);
+    expect(fetchImpl).not.toHaveBeenCalled();
   }, 10_000);
 
   it("makes an in-flight PreToolUse adopt a later Stop fence before allowing the write", async () => {
@@ -3786,8 +3996,9 @@ async function createConnectedHookFixture(prefix: string, sessionId: string) {
   servers.push(server);
   await once(server, "listening");
   const port = (server.address() as AddressInfo).port;
+  const serverUrl = `http://127.0.0.1:${port}`;
   await new ConnectionStore(path.join(userDataPath, "connections.json"), protector).save({
-    serverUrl: `http://127.0.0.1:${port}`,
+    serverUrl,
     memberToken: room.memberToken,
     repositoryPath: repository,
     roomId: room.room.id,
@@ -3798,6 +4009,7 @@ async function createConnectedHookFixture(prefix: string, sessionId: string) {
   return {
     repository,
     userDataPath,
+    serverUrl,
     sessionId,
     service,
     room,

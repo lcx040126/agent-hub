@@ -7,7 +7,12 @@ import {
   AGENT_HUB_VERSION,
 } from "../shared/version.js";
 import { AgentHubClient, AgentHubHttpError } from "./hub-client.js";
-import { CodexHookStateStore, parseState, type CodexHookSessionState } from "./hook-state.js";
+import {
+  CodexHookStateStore,
+  parseState,
+  type CodexHookSessionState,
+  type HookLeaseState,
+} from "./hook-state.js";
 import {
   IntegrationOperationTracker,
   type ConnectionOperationTracker,
@@ -50,6 +55,8 @@ interface HeartbeatResponse {
     id: string;
     expiresAt: string;
   }>;
+  /** v0.2.7+ 返回该 session 当前唯一的 Agent 托管租约，用于恢复 MCP 先领取的 canonical lease。 */
+  managedLease?: HookLeaseState;
 }
 
 const DEFAULT_INTERVAL_MS = 2 * 60_000;
@@ -162,7 +169,10 @@ async function heartbeatAll(
           if (await mergeAndRemoveQueuedSessionEnd(sessionEndQueue, stateStore, currentState)) {
             return undefined;
           }
-          return heartbeat.renewedLeases ?? [];
+          return {
+            renewedLeases: heartbeat.renewedLeases ?? [],
+            managedLease: heartbeat.managedLease,
+          };
         });
       });
     } catch (error) {

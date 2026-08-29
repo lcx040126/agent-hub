@@ -39,11 +39,344 @@ describe("Agent Hub REST API", () => {
     });
   });
 
+  it("keeps complete session identities out of anonymous diagnostics and room context exports", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const codexSessionId = "codex-private-export-1234567890";
+    const currentTurnId = "turn-private-export-1234567890";
+    const activityEpoch = 987_654_321;
+    const finalizationId = "finalization-private-export-1234567890";
+    const opened = await auth(request(app).post("/api/sessions").send({
+      codexSessionId,
+      turnId: currentTurnId,
+      activityEpoch,
+      task: "Private identity export boundary",
+    }), owner.body.token);
+    const hubSessionId = opened.body.session.id as string;
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: hubSessionId,
+        codexSessionId,
+        currentTurnId,
+        activityEpoch,
+      }),
+    ]));
+
+    await auth(request(app).post("/api/records").send({
+      kind: "risk",
+      title: "Private session identifiers",
+      summary: `Hub ${hubSessionId}; Codex ${codexSessionId}; Turn ${currentTurnId}.`,
+      evidence: [`Finalization ${finalizationId}`],
+    }), owner.body.token);
+    await auth(request(app)
+      .post(`/api/sessions/${hubSessionId}/finalize/start`)
+      .send({ finalizationId }), owner.body.token);
+    await auth(request(app)
+      .post(`/api/sessions/${hubSessionId}/finalize/complete`)
+      .send({ finalizationId, evidenceError: "Local Git evidence remained unavailable." }), owner.body.token);
+
+    const anonymousHealth = await request(app).get("/api/health");
+    const anonymousExport = await request(app).get("/api/room/context/export");
+    const contextExport = await auth(
+      request(app).get("/api/room/context/export"),
+      owner.body.token,
+    );
+
+    expect(anonymousExport.status).toBe(401);
+    expect(contextExport.status).toBe(200);
+    expect(contextExport.body).not.toHaveProperty("sessions");
+    expect(contextExport.body).not.toHaveProperty("leases");
+    for (const payload of [anonymousHealth.body, anonymousExport.body, contextExport.body]) {
+      const serialized = JSON.stringify(payload);
+      expect(serialized).not.toContain(codexSessionId);
+      expect(serialized).not.toContain(currentTurnId);
+      expect(serialized).not.toContain(hubSessionId);
+      expect(serialized).not.toContain(finalizationId);
+      for (const privateField of [
+        "codexSessionId",
+        "codex_session_id",
+        "currentTurnId",
+        "current_turn_id",
+        "activityEpoch",
+        "activity_epoch",
+        "sessionId",
+        "session_id",
+        "finalizationId",
+        "finalization_id",
+      ]) {
+        expect(serialized).not.toContain(privateField);
+      }
+    }
+  });
+
+  it("fixes the UI-facing manual lease route to manual UI provenance", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+
+    const standard = await auth(request(app).post("/api/leases").send({
+      title: "Manual standard scope",
+      paths: ["src/manual-standard.ts"],
+      kind: "standard",
+      managedBy: "agent",
+      createdVia: "mcp",
+    }), owner.body.token);
+    const exclusive = await auth(request(app).post("/api/leases").send({
+      title: "Manual exclusive scope",
+      paths: ["ProjectSettings"],
+      kind: "exclusive",
+      ttlMinutes: 60,
+      managedBy: "agent",
+      createdVia: "hook",
+    }), owner.body.token);
+    const automatic = await auth(request(app).post("/api/leases").send({
+      title: "Spoofed automatic UI scope",
+      paths: ["src/spoofed-automatic.ts"],
+      kind: "automatic",
+      managedBy: "agent",
+      createdVia: "mcp",
+    }), owner.body.token);
+
+    expect(standard.status).toBe(201);
+    expect(standard.body.lease).toMatchObject({
+      kind: "standard",
+      managedBy: "manual",
+      createdVia: "ui",
+    });
+    expect(exclusive.status).toBe(201);
+    expect(exclusive.body.lease).toMatchObject({
+      kind: "exclusive",
+      managedBy: "manual",
+      createdVia: "ui",
+    });
+    expect(automatic.status).toBe(400);
+    expect(automatic.body).toMatchObject({ error: "invalid_lease_management" });
+
+    const opened = await auth(request(app).post("/api/sessions").send({
+      codexSessionId: "codex-manual-coverage",
+      turnId: "turn-manual-coverage",
+      activityEpoch: 1,
+    }), owner.body.token);
+    const covered = await auth(request(app).post("/api/edits/prepare").send({
+      sessionId: opened.body.session.id,
+      title: "Agent call covered by manual scope",
+      paths: ["src/manual-standard.ts"],
+      invocationId: "manual-coverage-invocation",
+      toolName: "apply_patch",
+      stage: "pre",
+      turnId: "turn-manual-coverage",
+      activityEpoch: 1,
+    }), owner.body.token);
+    expect(covered.body.claim).toMatchObject({
+      acquired: true,
+      lease: { id: standard.body.lease.id, managedBy: "manual" },
+      coverage: [{
+        leaseId: standard.body.lease.id,
+        managedBy: "manual",
+        paths: ["src/manual-standard.ts"],
+        action: "covered",
+      }],
+    });
+
+    const scopeEvents = await auth(
+      request(app).get(`/api/leases/${standard.body.lease.id}/scope-events`),
+      bob.body.token,
+    );
+    expect(scopeEvents.status).toBe(200);
+    expect(scopeEvents.body.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "lease.scope_covered",
+        metadata: expect.objectContaining({
+          invocationId: "manual-coverage-invocation",
+          source: "hook",
+          stage: "pre",
+          turnId: "turn-manual-coverage",
+          coveredPaths: ["src/manual-standard.ts"],
+        }),
+      }),
+    ]));
+  });
+
+  it("projects managed session identities and pages member-only scope history", async () => {
+    let currentTime = new Date("2026-08-29T03:00:00.000Z");
+    const { app } = testApp(() => currentTime);
+    const owner = await createRoom(app);
+    const bob = await joinRoom(app, owner.body.inviteCode, "Bob");
+    const opened = await auth(request(app).post("/api/sessions").send({
+      codexSessionId: "codex-rest-scope",
+      turnId: "turn-rest-0",
+      activityEpoch: 4,
+      repository: "C:/project",
+      branch: "main",
+      baseCommit: "rest-base",
+    }), owner.body.token);
+    const sessionId = opened.body.session.id as string;
+
+    const first = await auth(request(app).post("/api/edits/prepare").send({
+      sessionId,
+      title: "REST managed scope",
+      branch: "main",
+      baseCommit: "rest-base",
+      paths: ["src/rest-first.ts"],
+      invocationId: "rest-invocation-1",
+      toolName: "apply_patch",
+      stage: "pre",
+      turnId: "turn-rest-0",
+      activityEpoch: 4,
+    }), owner.body.token);
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect(first.body).toMatchObject({
+      claim: {
+        acquired: true,
+        lease: { managedBy: "agent", createdVia: "hook", sessionId },
+      },
+      managedLease: { managedBy: "agent", sessionId },
+    });
+    const leaseId = first.body.managedLease.id as string;
+    currentTime = new Date("2026-08-29T03:00:01.000Z");
+
+    await auth(request(app).post("/api/edits/prepare").send({
+      sessionId,
+      title: "REST managed scope",
+      branch: "main",
+      baseCommit: "rest-base",
+      paths: ["src/rest-second.ts"],
+      invocationId: "rest-invocation-2",
+      toolName: "Bash",
+      stage: "post",
+      actualPaths: ["src/rest-second.ts"],
+      turnId: "turn-rest-0",
+      activityEpoch: 4,
+    }), owner.body.token);
+
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: leaseId, sessionId, managedBy: "agent", createdVia: "hook" }),
+    ]));
+    expect(dashboard.body.sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: sessionId,
+        codexSessionId: "codex-rest-scope",
+        currentTurnId: "turn-rest-0",
+        activityEpoch: 4,
+      }),
+    ]));
+
+    expect((await request(app).get(`/api/leases/${leaseId}/scope-events`)).status).toBe(401);
+    const pageOne = await auth(request(app)
+      .get(`/api/leases/${leaseId}/scope-events?limit=1`), bob.body.token);
+    expect(pageOne.status).toBe(200);
+    expect(pageOne.body).toMatchObject({
+      items: [{ metadata: { invocationId: "rest-invocation-2", stage: "post" } }],
+    });
+    expect(typeof pageOne.body.nextBefore).toBe("string");
+    const pageTwo = await auth(request(app)
+      .get(`/api/leases/${leaseId}/scope-events?limit=1&before=${encodeURIComponent(pageOne.body.nextBefore)}`), bob.body.token);
+    expect(pageTwo.body).toMatchObject({
+      items: [{ metadata: { invocationId: "rest-invocation-1", stage: "pre" } }],
+    });
+  });
+
+  it("records empty Hook audits without inventing a path and denies an unprovable protected target", async () => {
+    const { app } = testApp();
+    const owner = await createRoom(app);
+    const opened = await auth(request(app).post("/api/sessions").send({
+      turnId: "turn-empty-audit",
+      activityEpoch: 1,
+      branch: "main",
+      baseCommit: "empty-audit-base",
+    }), owner.body.token);
+    const sessionId = opened.body.session.id as string;
+    const claimed = await auth(request(app).post("/api/edits/prepare").send({
+      sessionId,
+      title: "Empty Hook audit",
+      branch: "main",
+      baseCommit: "empty-audit-base",
+      paths: ["src/owned.ts"],
+      invocationId: "empty-audit-claim",
+      toolName: "apply_patch",
+      stage: "pre",
+      turnId: "turn-empty-audit",
+      activityEpoch: 1,
+    }), owner.body.token);
+    const leaseId = claimed.body.managedLease.id as string;
+
+    const ignoredPre = await auth(request(app).post("/api/edits/prepare").send({
+      sessionId,
+      title: "Ignored temporary log",
+      branch: "main",
+      baseCommit: "empty-audit-base",
+      paths: [],
+      ignoredPaths: [".tmp/agent-hub.log"],
+      invocationId: "empty-audit-ignored",
+      toolName: "Bash",
+      stage: "pre",
+      turnId: "turn-empty-audit",
+      activityEpoch: 1,
+    }), owner.body.token);
+    expect(ignoredPre.status, JSON.stringify(ignoredPre.body)).toBe(200);
+    expect(ignoredPre.body).toMatchObject({
+      check: { allowed: true, blockers: [], coveredPaths: [], uncoveredPaths: [] },
+      managedLease: { id: leaseId, paths: ["src/owned.ts"] },
+    });
+    expect(ignoredPre.body.claim).toBeUndefined();
+
+    const emptyPost = await auth(request(app).post("/api/edits/prepare").send({
+      sessionId,
+      title: "No observed Git change",
+      branch: "main",
+      baseCommit: "empty-audit-base",
+      paths: [],
+      actualPaths: [],
+      invocationId: "empty-audit-post",
+      toolName: "Bash",
+      stage: "post",
+      turnId: "turn-empty-audit",
+      activityEpoch: 1,
+    }), owner.body.token);
+    expect(emptyPost.status, JSON.stringify(emptyPost.body)).toBe(200);
+    expect(emptyPost.body.check).toMatchObject({ allowed: true, blockers: [], uncoveredPaths: [] });
+
+    const dynamicPre = await auth(request(app).post("/api/edits/prepare").send({
+      sessionId,
+      title: "Unprovable dynamic target",
+      branch: "main",
+      baseCommit: "empty-audit-base",
+      paths: [],
+      pathDiagnostics: ["A dynamic path could not be statically proven."],
+      invocationId: "empty-audit-dynamic",
+      toolName: "Bash",
+      stage: "pre",
+      turnId: "turn-empty-audit",
+      activityEpoch: 1,
+    }), owner.body.token);
+    expect(dynamicPre.status, JSON.stringify(dynamicPre.body)).toBe(200);
+    expect(dynamicPre.body.check).toMatchObject({
+      allowed: false,
+      blockers: [expect.objectContaining({ code: "uncovered_path", path: "." })],
+      uncoveredPaths: ["."],
+    });
+
+    const scopeEvents = await auth(request(app).get(`/api/leases/${leaseId}/scope-events`), owner.body.token);
+    expect(scopeEvents.body.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ metadata: expect.objectContaining({ invocationId: "empty-audit-ignored", stage: "pre" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ invocationId: "empty-audit-post", stage: "post" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ invocationId: "empty-audit-dynamic", stage: "pre" }) }),
+    ]));
+    const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
+    expect(dashboard.body.leases.find((lease: { id: string }) => lease.id === leaseId).paths).toEqual(["src/owned.ts"]);
+  });
+
   it("finalizes sessions idempotently while rejecting normal work in the background phase", async () => {
     const { app } = testApp();
     const owner = await createRoom(app);
     const opened = await auth(request(app).post("/api/sessions").send({
       agentName: "Codex",
+      codexSessionId: "codex-finalizing-visible",
+      turnId: "turn-finalizing-visible",
+      activityEpoch: 12,
       repository: "C:/project",
       branch: "main",
       baseCommit: "0123456789abcdef",
@@ -57,6 +390,15 @@ describe("Agent Hub REST API", () => {
       autoClaim: true,
     }), owner.body.token);
     expect(lease.body.acquired).toBe(true);
+
+    const stopped = await auth(request(app)
+      .post(`/api/sessions/${sessionId}/stop`)
+      .send({
+        operationId: "stop-finalizing-visible",
+        turnId: "turn-finalizing-visible",
+        activityEpoch: 12,
+      }), owner.body.token);
+    expect(stopped.body.result).toBe("awaiting_commit");
 
     const started = await auth(request(app)
       .post(`/api/sessions/${sessionId}/finalize/start`)
@@ -111,8 +453,17 @@ describe("Agent Hub REST API", () => {
       expect.objectContaining({
         id: lease.body.lease.id,
         status: "active",
-        phase: "working",
+        phase: "awaiting_commit",
         expiresAt: lease.body.lease.expiresAt,
+      }),
+    ]));
+    expect(dashboard.body.sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: sessionId,
+        status: "closed",
+        codexSessionId: "codex-finalizing-visible",
+        currentTurnId: "turn-finalizing-visible",
+        activityEpoch: 12,
       }),
     ]));
     expect(dashboard.body.records.filter(
@@ -286,7 +637,7 @@ describe("Agent Hub REST API", () => {
       sessionId,
       title: "Automatic REST edit",
       paths: ["src/rest-auto.ts"],
-      kind: "automatic",
+      autoClaim: true,
     }), owner.body.token);
     const standard = await auth(request(app).post("/api/leases").send({
       sessionId,
@@ -538,8 +889,15 @@ describe("Agent Hub REST API", () => {
     }), owner.body.token);
     expect(ownExclusiveWarning.body).toMatchObject({
       acquired: true,
-      decision: "warn",
-      conflicts: [expect.objectContaining({ severity: "critical", decision: "warn" })],
+      decision: "allow",
+      lease: { id: exclusive.body.lease.id, managedBy: "manual" },
+      conflicts: [],
+      coverage: [{
+        leaseId: exclusive.body.lease.id,
+        managedBy: "manual",
+        paths: ["src/locked/file.ts"],
+        action: "covered",
+      }],
     });
     const otherMemberDenied = await auth(request(app).post("/api/leases").send({
       title: "Bob inside owner exclusive",
@@ -565,12 +923,16 @@ describe("Agent Hub REST API", () => {
       warnings: [expect.objectContaining({ code: "uncovered_path" })],
     });
 
+    const bobSession = await auth(request(app).post("/api/sessions").send({
+      task: "Large monitor-only path set",
+    }), bob.body.token);
     const manyPaths = Array.from({ length: 101 }, (_, index) => `src/bulk/file-${index}.ts`);
     const bulkPrepared = await auth(request(app).post("/api/edits/prepare").send({
+      sessionId: bobSession.body.session.id,
       title: "Large monitor-only path set",
       paths: manyPaths,
     }), bob.body.token);
-    expect(bulkPrepared.status).toBe(200);
+    expect(bulkPrepared.status, JSON.stringify(bulkPrepared.body)).toBe(200);
     expect(bulkPrepared.body).toMatchObject({
       check: { allowed: true, blockers: [] },
       claim: { acquired: true },
@@ -617,16 +979,21 @@ describe("Agent Hub REST API", () => {
     });
   });
 
-  it("freezes a session and cancels its leases when the branch changes", async () => {
+  it("freezes a session and cancels only its Agent-managed leases when the branch changes", async () => {
     const { app } = testApp();
     const owner = await createRoom(app);
     const session = await auth(request(app).post("/api/sessions").send({ branch: "feature/a", baseCommit: "aaaa1111" }), owner.body.token);
-    const lease = await auth(request(app).post("/api/leases").send({ title: "Work", paths: ["src/a.ts"], branch: "feature/a", baseCommit: "aaaa1111", sessionId: session.body.session.id }), owner.body.token);
-    expect(lease.body.acquired).toBe(true);
+    const agentLease = await auth(request(app).post("/api/leases").send({ title: "Agent work", paths: ["src/a.ts"], branch: "feature/a", baseCommit: "aaaa1111", sessionId: session.body.session.id, autoClaim: true }), owner.body.token);
+    const manualLease = await auth(request(app).post("/api/leases").send({ title: "Manual work", paths: ["src/manual.ts"], branch: "feature/a", baseCommit: "aaaa1111", sessionId: session.body.session.id, kind: "standard" }), owner.body.token);
+    expect(agentLease.body.acquired).toBe(true);
+    expect(manualLease.body.acquired).toBe(true);
     const changed = await auth(request(app).post(`/api/sessions/${session.body.session.id}/sync`).send({ branch: "feature/b", baseCommit: "bbbb2222" }), owner.body.token);
     expect(changed.status).toBe(409);
     const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
-    expect(dashboard.body.leases).toHaveLength(0);
+    expect(dashboard.body.leases).toEqual([
+      expect.objectContaining({ id: manualLease.body.lease.id, managedBy: "manual" }),
+    ]);
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).not.toContain(agentLease.body.lease.id);
     expect(dashboard.body.sessions[0].status).toBe("frozen");
   });
   it("creates a room, stores only a token hash, joins a member, and protects the dashboard", async () => {
@@ -1538,6 +1905,20 @@ describe("Agent Hub REST API", () => {
       acquired: true,
       lease: { id: approved.body.releaseRequest.transferredLeaseId },
     });
+    const mixedLegacyRetry = await auth(request(app).post("/api/leases").send({
+      title: "Legacy retry with a new path",
+      autoClaim: true,
+      paths: ["src/critical.cs", "src/new.cs"],
+    }), bob.body.token);
+    expect(mixedLegacyRetry.body).toMatchObject({
+      acquired: true,
+      lease: { managedBy: "agent", createdVia: "legacy" },
+    });
+    expect(mixedLegacyRetry.body.lease.id).not.toBe(approved.body.releaseRequest.transferredLeaseId);
+    const afterMixedRetry = await auth(request(app).get("/api/dashboard"), bob.body.token);
+    expect(afterMixedRetry.body.leases.find(
+      (lease: { id: string }) => lease.id === approved.body.releaseRequest.transferredLeaseId,
+    ).paths).toEqual(["src/critical.cs"]);
   });
 
   it("keeps a broad holder scope while carving out an approved child path for the requester", async () => {
@@ -1629,7 +2010,7 @@ describe("Agent Hub REST API", () => {
     ]));
   });
 
-  it("shares and heartbeat-renews a member's sessionless manual standard lease", async () => {
+  it("attributes Agent work to and heartbeat-renews a member's sessionless manual standard lease", async () => {
     let currentTime = Date.parse("2026-08-25T10:00:00.000Z");
     const { app } = testApp(() => new Date(currentTime));
     const owner = await createRoom(app);
@@ -1647,7 +2028,17 @@ describe("Agent Hub REST API", () => {
       autoClaim: true,
       paths: ["Assets/Scenes/Main.unity"],
     }), owner.body.token);
-    expect(agentLease.body).toMatchObject({ acquired: true, decision: "warn" });
+    expect(agentLease.body).toMatchObject({
+      acquired: true,
+      decision: "allow",
+      lease: { id: manual.body.lease.id, managedBy: "manual" },
+      coverage: [{
+        leaseId: manual.body.lease.id,
+        managedBy: "manual",
+        paths: ["Assets/Scenes/Main.unity"],
+        action: "covered",
+      }],
+    });
 
     const otherMember = await auth(request(app).post("/api/leases").send({
       title: "Other member scene work",
@@ -1662,12 +2053,9 @@ describe("Agent Hub REST API", () => {
       .send({}), owner.body.token);
     const renewedIds = heartbeat.body.renewedLeases.map((lease: { id: string }) => lease.id);
     expect(renewedIds).toContain(manual.body.lease.id);
-    expect(renewedIds).toContain(agentLease.body.lease.id);
     currentTime += 2 * 60_000;
     const dashboard = await auth(request(app).get("/api/dashboard"), owner.body.token);
-    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).toEqual(
-      expect.arrayContaining([manual.body.lease.id, agentLease.body.lease.id]),
-    );
+    expect(dashboard.body.leases.map((lease: { id: string }) => lease.id)).toEqual([manual.body.lease.id]);
   });
 
   it("transactionally cancels a removed member's leases and pending release requests", async () => {

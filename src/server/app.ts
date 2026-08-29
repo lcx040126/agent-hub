@@ -249,6 +249,9 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
   app.post("/api/leases", (request, response) => {
     const body = bodyObject(request);
     const ttlMinutes = optionalNumber(body.ttlMinutes);
+    // schema 5 及更早的 Hook 会在这个旧入口发送 autoClaim；来源固定记为 legacy，
+    // 新版 UI 仍只能创建人工租约，且不能伪造 mcp/hook 来源。
+    const legacyAgentClaim = body.autoClaim === true;
     const result = service.claimLease({
       memberToken: bearerToken(request),
       sessionId: optionalValue(body, "sessionId"),
@@ -258,9 +261,10 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       baseCommit: optionalValue(body, "baseCommit"),
       paths: stringArrayValue(body.paths),
       mode: optionalValue(body, "mode") as "read" | "write" | undefined,
-      kind: optionalValue(body, "kind") as LeaseKind | undefined,
+      kind: legacyAgentClaim ? "automatic" : optionalValue(body, "kind") as LeaseKind | undefined,
       overrideReason: optionalValue(body, "overrideReason"),
-      autoClaim: body.autoClaim === true,
+      managedBy: legacyAgentClaim ? "agent" : "manual",
+      createdVia: legacyAgentClaim ? "legacy" : "ui",
       ttlMinutes,
       ttlMs: optionalNumber(body.ttlMs),
     });
@@ -270,7 +274,23 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       lease: result.acquired ? leaseResponse(result.lease) : undefined,
       conflicts: result.conflicts.map(conflictResponse),
       releaseRequests: result.releaseRequests,
+      coverage: result.coverage,
       waitingFor: "waitingFor" in result ? result.waitingFor : undefined,
+    });
+  });
+
+  app.get("/api/leases/:id/scope-events", (request, response) => {
+    const limit = optionalNumber(request.query.limit);
+    const before = typeof request.query.before === "string" ? request.query.before : undefined;
+    const result = service.listLeaseScopeEvents(
+      bearerToken(request),
+      parameter(request, "id"),
+      limit,
+      before,
+    );
+    response.json({
+      items: result.items.map(activityResponse),
+      nextBefore: result.nextBefore,
     });
   });
 
@@ -337,6 +357,12 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       operationId: optionalValue(body, "operationId"),
       turnId: optionalValue(body, "turnId"),
       activityEpoch: optionalNumber(body.activityEpoch),
+      invocationId: optionalValue(body, "invocationId"),
+      toolName: optionalValue(body, "toolName"),
+      stage: optionalValue(body, "stage") as "pre" | "post" | undefined,
+      ignoredPaths: stringArrayValue(body.ignoredPaths),
+      actualPaths: stringArrayValue(body.actualPaths),
+      pathDiagnostics: stringArrayValue(body.pathDiagnostics),
     });
     response.json({
       check: result.check,
@@ -348,8 +374,10 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
         lease: result.claim.acquired ? leaseResponse(result.claim.lease) : undefined,
         conflicts: result.claim.conflicts.map(conflictResponse),
         releaseRequests: result.claim.releaseRequests,
+        coverage: result.claim.coverage,
         waitingFor: "waitingFor" in result.claim ? result.claim.waitingFor : undefined,
       } : undefined,
+      managedLease: result.managedLease ? leaseResponse(result.managedLease) : undefined,
     });
   });
 
@@ -573,7 +601,7 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
 
   app.post("/api/sessions/:id/heartbeat", (request, response) => {
     const body = optionalBodyObject(request);
-    response.json(service.heartbeatSession({
+    const result = service.heartbeatSession({
       memberToken: bearerToken(request),
       sessionId: parameter(request, "id"),
       clientVersion: optionalValue(body, "clientVersion"),
@@ -581,7 +609,12 @@ export function createAgentHubApp(options: CreateAgentHubAppOptions = {}): expre
       schemaVersion: optionalNumber(body.schemaVersion),
       turnId: optionalValue(body, "turnId"),
       activityEpoch: optionalNumber(body.activityEpoch),
-    }));
+    });
+    response.json({
+      session: result.session,
+      renewedLeases: result.renewedLeases.map(leaseResponse),
+      managedLease: result.managedLease ? leaseResponse(result.managedLease) : undefined,
+    });
   });
 
   app.post("/api/sessions/:id/scan", (request, response) => {
@@ -759,6 +792,8 @@ function leaseResponse(lease: ReturnType<AgentHubService["renewLease"]>) {
     highRiskPaths: lease.paths.filter((path) => path.risk === "high").map((path) => path.path),
     mode: lease.mode,
     kind: lease.kind,
+    managedBy: lease.managedBy,
+    createdVia: lease.createdVia,
     phase: lease.phase,
     status: lease.status === "cancelled" ? "released" : lease.status,
     decision: lease.decision,
@@ -851,6 +886,9 @@ function dashboardSessionResponse(
     clientVersion: session.clientVersion ?? undefined,
     protocolVersion: session.protocolVersion ?? undefined,
     schemaVersion: session.schemaVersion ?? undefined,
+    codexSessionId: session.codexSessionId ?? undefined,
+    currentTurnId: session.currentTurnId ?? undefined,
+    activityEpoch: session.activityEpoch,
   };
 }
 

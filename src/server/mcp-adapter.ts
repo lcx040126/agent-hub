@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type {
   AgentHubMemberIdentity,
   AgentHubServiceLike,
@@ -63,6 +64,12 @@ export function createMcpServiceAdapter(service: AgentHubService): AgentHubServi
         baseCommit: input.baseCommit,
         paths: input.paths,
         mode: "write",
+        kind: "automatic",
+        managedBy: "agent",
+        createdVia: "mcp",
+        invocationId: randomUUID(),
+        toolName: "lease_acquire",
+        stage: "pre",
         overrideReason: input.overrideReason,
         ttlMs: input.ttlSeconds === undefined ? undefined : input.ttlSeconds * 1000,
       });

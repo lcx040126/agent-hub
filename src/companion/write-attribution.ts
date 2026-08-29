@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { parsePowerShellWriteTargets } from "./powershell-path-parser.js";
 
 export type EditPrecision = "symbol" | "resource" | "path";
 export type EditOperation = "add" | "update" | "delete" | "move" | "generate";
@@ -16,6 +17,7 @@ export interface AttributedWriteIntent {
   targets: AttributedEditTarget[];
   proposalHash: string | null;
   attributedSideEffects: boolean;
+  pathDiagnostics: string[];
 }
 
 export interface ChangeFingerprintState {
@@ -36,12 +38,13 @@ export function extractAttributedWriteIntent(
   if (toolName === "apply_patch") return extractPatchIntent(command);
   if (toolName !== "Bash" || !isPotentialWriteCommand(command)) return emptyIntent();
 
-  const pathCandidates = extractShellPathCandidates(command);
+  const parsed = parsePowerShellWriteTargets(command);
+  const pathCandidates = parsed.pathCandidates;
   const attributedSideEffects = KNOWN_SIDE_EFFECT_COMMAND.test(command);
-  const targets = pathCandidates.map((pathCandidate) => ({
-    pathCandidate,
-    operation: attributedSideEffects ? "generate" as const : "update" as const,
-    precision: resourcePrecision(pathCandidate),
+  const targets = parsed.targets.map((target) => ({
+    pathCandidate: target.pathCandidate,
+    operation: attributedSideEffects ? "generate" as const : target.operation,
+    precision: resourcePrecision(target.pathCandidate),
     symbols: [],
   }));
   return {
@@ -50,6 +53,7 @@ export function extractAttributedWriteIntent(
     targets,
     proposalHash: proposalHash(toolName, command),
     attributedSideEffects,
+    pathDiagnostics: parsed.diagnostics,
   };
 }
 
@@ -77,23 +81,7 @@ export function attributedChangedPaths(
 }
 
 export function extractShellPathCandidates(command: string): string[] {
-  const candidates: string[] = [];
-  const patterns = [
-    /(?:^|[^>])>{1,2}\s*("[^"]+"|'[^']+'|[^\s;&|]+)/gm,
-    /-(?:Path|LiteralPath|Destination)\s+("[^"]+"|'[^']+'|[^\s;&|]+)/gim,
-    /(?:Set-Content|Add-Content|Out-File|New-Item|Remove-Item|Move-Item|Copy-Item|Rename-Item|rm|mv|cp|touch|tee)\s+(?:-[A-Za-z]+(?:\s+[^\s;&|]+)?\s+)*("[^"]+"|'[^']+'|[^\s;&|]+)/gim,
-  ];
-  for (const pattern of patterns) {
-    for (const match of command.matchAll(pattern)) {
-      const candidate = sanitizeShellCandidate(match[1]);
-      if (candidate) candidates.push(candidate);
-    }
-  }
-  for (const match of command.matchAll(/"([A-Za-z]:\\[^"]+|[^"\r\n]+[\\/][^"\r\n]+)"|'([^'\r\n]+[\\/][^'\r\n]+)'/g)) {
-    const candidate = sanitizeShellCandidate(match[1] ?? match[2]);
-    if (candidate) candidates.push(candidate);
-  }
-  return unique(candidates);
+  return parsePowerShellWriteTargets(command).pathCandidates;
 }
 
 function extractPatchIntent(command: string): AttributedWriteIntent {
@@ -143,6 +131,7 @@ function extractPatchIntent(command: string): AttributedWriteIntent {
     targets,
     proposalHash: proposalHash("apply_patch", command),
     attributedSideEffects: false,
+    pathDiagnostics: [],
   };
 }
 
@@ -169,20 +158,6 @@ function isPotentialWriteCommand(command: string): boolean {
     || /(^|[^<>])>{1,2}(?!=)/m.test(command);
 }
 
-function sanitizeShellCandidate(value: string | undefined): string | undefined {
-  if (!value) return undefined;
-  const candidate = stripWrappingQuotes(value).trim().replace(/[),]+$/, "");
-  if (
-    !candidate
-    || candidate.startsWith("$")
-    || candidate.startsWith("-")
-    || /^(?:Directory|File|Junction|SymbolicLink|HardLink)$/i.test(candidate)
-    || /^[{}[\]()]+$/.test(candidate)
-    || /^https?:\/\//i.test(candidate)
-  ) return undefined;
-  return candidate;
-}
-
 function resourcePrecision(pathCandidate: string): EditPrecision {
   return /\.(?:anim|asset|controller|lighting|mat|meta|overridecontroller|physicmaterial|playable|prefab|rendertexture|unity)$/i.test(pathCandidate)
     ? "resource"
@@ -200,7 +175,14 @@ function proposalHash(toolName: string | undefined, command: string): string {
 }
 
 function emptyIntent(): AttributedWriteIntent {
-  return { writes: false, pathCandidates: [], targets: [], proposalHash: null, attributedSideEffects: false };
+  return {
+    writes: false,
+    pathCandidates: [],
+    targets: [],
+    proposalHash: null,
+    attributedSideEffects: false,
+    pathDiagnostics: [],
+  };
 }
 
 function pathScopeCovers(scope: string, candidate: string): boolean {
@@ -213,14 +195,6 @@ function pathScopeCovers(scope: string, candidate: string): boolean {
 
 function pathKey(value: string): string {
   return value.replaceAll("\\", "/").replace(/^\.\//, "").toLocaleLowerCase("en-US");
-}
-
-function stripWrappingQuotes(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.length >= 2 && ((trimmed[0] === '"' && trimmed.at(-1) === '"') || (trimmed[0] === "'" && trimmed.at(-1) === "'"))) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed;
 }
 
 function unique(values: string[]): string[] {

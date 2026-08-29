@@ -57,6 +57,11 @@ type CompletionResult = "released" | "awaiting_commit" | "already_applied" | "su
 
 interface StopResponse {
   result: StopResult;
+  managedLeases?: Array<{
+    id: string;
+    paths: string[];
+    expiresAt: string;
+  }>;
   awaitingAutomaticLeases?: Array<{
     id: string;
     expiresAt: string;
@@ -72,6 +77,12 @@ interface ResumeResponse {
     activityEpoch?: number;
     turnStoppedAt?: string | null;
   };
+}
+
+interface CompletionResponse {
+  result: CompletionResult;
+  previousResult?: Exclude<CompletionResult, "already_applied">;
+  releasedLeaseIds?: string[];
 }
 
 const DEFAULT_INTERVAL_MS = 15_000;
@@ -197,7 +208,28 @@ export async function processTurnCompletionJob(
     return null;
   }
 
-  if (Array.isArray(stop.awaitingAutomaticLeases)) {
+  if (Array.isArray(stop.managedLeases)) {
+    const validationError = validateManagedLeaseManifest(stop.managedLeases);
+    if (validationError) return { error: validationError };
+    if (stop.managedLeases.length > 1) {
+      return {
+        error: new Error("Agent Hub returned more than one canonical Agent-managed lease; preserving protection until TTL."),
+      };
+    }
+    job.leaseIds = stop.managedLeases.map((lease) => lease.id);
+    job.leaseAttributionComplete = true;
+    if (stop.managedLeases.length > 0) {
+      job.expiresAt = new Date(Math.max(
+        Date.parse(job.expiresAt),
+        ...stop.managedLeases.map((lease) => Date.parse(lease.expiresAt)),
+      )).toISOString();
+    }
+    await adoptManagedLeaseManifest(options.userDataPath, job, stop.managedLeases);
+    if (stop.managedLeases.length === 0 && job.attributedPaths.length === 0) {
+      await markStoppedState(options.userDataPath, job);
+      return null;
+    }
+  } else if (Array.isArray(stop.awaitingAutomaticLeases)) {
     const serverLeases = stop.awaitingAutomaticLeases;
     const malformed = serverLeases.some((lease) =>
       !lease || typeof lease.id !== "string" || !lease.id.trim()
@@ -240,10 +272,8 @@ export async function processTurnCompletionJob(
   if (evidence.status === "awaiting_commit") return { error: null };
   if (evidence.status === "incomplete") return { error: new Error(evidence.reason) };
 
-  const completion = await options.client.post<{
-    result: CompletionResult;
-    releasedLeaseIds?: string[];
-  }>(`/api/sessions/${encodeURIComponent(job.hubSessionId)}/completion/check`, {
+  const completion = await options.client.post<CompletionResponse>(
+    `/api/sessions/${encodeURIComponent(job.hubSessionId)}/completion/check`, {
     operationId: job.operationId,
     turnId: job.turnId,
     activityEpoch: job.activityEpoch,
@@ -255,8 +285,64 @@ export async function processTurnCompletionJob(
   });
   if (completion.result === "awaiting_commit") return { error: null };
   if (completion.result === "superseded") await clearPendingState(options.userDataPath, job);
-  else await markStoppedState(options.userDataPath, job);
+  else {
+    await markStoppedState(
+      options.userDataPath,
+      job,
+      confirmedReleasedLeaseIds(job, completion),
+    );
+  }
   return null;
+}
+
+function confirmedReleasedLeaseIds(
+  job: TurnCompletionJob,
+  completion: CompletionResponse,
+): string[] {
+  const confirmsRelease = completion.result === "released"
+    || (completion.result === "already_applied" && completion.previousResult === "released");
+  if (!confirmsRelease || !Array.isArray(completion.releasedLeaseIds)) return [];
+  const expected = new Set(job.leaseIds);
+  return [...new Set(completion.releasedLeaseIds
+    .filter((leaseId): leaseId is string => typeof leaseId === "string")
+    .map((leaseId) => leaseId.trim())
+    .filter((leaseId) => leaseId && expected.has(leaseId)))];
+}
+
+function validateManagedLeaseManifest(
+  leases: NonNullable<StopResponse["managedLeases"]>,
+): Error | undefined {
+  const malformed = leases.some((lease) =>
+    !lease
+    || typeof lease.id !== "string"
+    || !lease.id.trim()
+    || !Array.isArray(lease.paths)
+    || lease.paths.some((candidate) => typeof candidate !== "string" || !candidate.trim())
+    || typeof lease.expiresAt !== "string"
+    || !Number.isFinite(Date.parse(lease.expiresAt)));
+  return malformed
+    ? new Error("Agent Hub returned incomplete managed lease evidence; preserving protection until TTL.")
+    : undefined;
+}
+
+async function adoptManagedLeaseManifest(
+  userDataPath: string,
+  job: TurnCompletionJob,
+  leases: NonNullable<StopResponse["managedLeases"]>,
+): Promise<void> {
+  const stateStore = new CodexHookStateStore(userDataPath);
+  await stateStore.runExclusive(job.codexSessionId, async () => {
+    const state = await stateStore.load(job.codexSessionId);
+    if (!state || !matchesTurnCompletionJob(job, state)) return;
+    state.leases = leases.map((lease) => ({
+      id: lease.id,
+      paths: [...new Set(lease.paths.map((candidate) => candidate.trim()).filter(Boolean))],
+      expiresAt: lease.expiresAt,
+      coordinationState: state.leases.find((candidate) => candidate.id === lease.id)?.coordinationState,
+    }));
+    state.leaseAttributionComplete = true;
+    await stateStore.save(state);
+  });
 }
 
 /**
@@ -396,7 +482,11 @@ async function clearPendingState(userDataPath: string, job: TurnCompletionJob): 
   });
 }
 
-async function markStoppedState(userDataPath: string, job: TurnCompletionJob): Promise<void> {
+async function markStoppedState(
+  userDataPath: string,
+  job: TurnCompletionJob,
+  releasedLeaseIds: string[] = [],
+): Promise<void> {
   const stateStore = new CodexHookStateStore(userDataPath);
   await stateStore.runExclusive(job.codexSessionId, async () => {
     const state = await stateStore.load(job.codexSessionId);
@@ -407,6 +497,14 @@ async function markStoppedState(userDataPath: string, job: TurnCompletionJob): P
       || state.pendingCompletion.operationId !== job.operationId
       || state.pendingCompletion.activityEpoch !== job.activityEpoch
     ) return;
+    if (releasedLeaseIds.length > 0) {
+      // 只删除当前 completion 明确释放的租约；上面的 generation/operation/epoch 围栏保护新 Turn 的 canonical 状态。
+      const released = new Set(releasedLeaseIds);
+      state.leases = state.leases.filter((lease) => !released.has(lease.id));
+      if (state.leases.length === 0 && job.leaseAttributionComplete) {
+        state.leaseAttributionComplete = true;
+      }
+    }
     state.pendingCompletion.phase = "stopped";
     await stateStore.save(state);
   });

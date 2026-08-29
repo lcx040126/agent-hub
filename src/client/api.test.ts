@@ -6,6 +6,7 @@ import {
   createRoom,
   deleteSavedConnection,
   getDashboard,
+  getLeaseScopeEvents,
   joinRoom,
   loadSession,
   pauseSavedConnection,
@@ -78,6 +79,140 @@ afterEach(() => {
 });
 
 describe("desktop room transport", () => {
+  it("sends only manual standard or exclusive lease kinds from the UI client", async () => {
+    const requestRoomServer = vi.fn(async (_input: { body?: unknown }) => ({
+      status: 200,
+      body: { acquired: false, decision: "warn", conflicts: [] },
+    }));
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: { requestRoomServer },
+      },
+    });
+
+    await createLease(desktopSession("connection-a"), {
+      title: "Manual standard scope",
+      paths: ["src/client"],
+      ttlMinutes: 10,
+    });
+    await createLease(desktopSession("connection-a"), {
+      title: "Manual exclusive scope",
+      paths: ["ProjectSettings"],
+      ttlMinutes: 60,
+      kind: "exclusive",
+    });
+
+    expect(requestRoomServer).toHaveBeenCalledTimes(2);
+    const standardBody = requestRoomServer.mock.calls[0]![0].body;
+    const exclusiveBody = requestRoomServer.mock.calls[1]![0].body;
+    expect(standardBody).toMatchObject({ kind: "standard", mode: "write" });
+    expect(exclusiveBody).toMatchObject({ kind: "exclusive", mode: "write" });
+    for (const body of [standardBody, exclusiveBody]) {
+      expect(body).not.toHaveProperty("autoClaim");
+      expect(body).not.toHaveProperty("managedBy");
+      expect(body).not.toHaveProperty("createdVia");
+    }
+  });
+
+  it("loads paged lease scope events and normalizes structured call metadata", async () => {
+    const requestRoomServer = vi.fn(async () => ({
+      status: 200,
+      body: {
+        items: [{
+          id: "activity-19",
+          type: "lease.scope_expanded",
+          actorName: "成员 A",
+          title: "Lease scope expanded",
+          summary: "Added one repository path.",
+          metadata: {
+            invocationId: "invocation-1234567890",
+            source: "hook",
+            toolName: "exec_command",
+            stage: "post",
+            turnId: "turn-1234567890",
+            requestedPaths: ["src/client/api.ts", 42],
+            coveredPaths: ["src/client/api.ts"],
+            addedPaths: ["src/client/App.tsx"],
+            ignoredPaths: ["C:/Temp/test.log"],
+            actualPaths: ["src/client/App.tsx"],
+            pathDiagnostics: ["Join-Path target could not be proven statically.", 42],
+          },
+          createdAt: "2026-08-29T02:00:00.000Z",
+        }],
+        nextBefore: "activity-19",
+      },
+    }));
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: { requestRoomServer },
+      },
+    });
+
+    const result = await getLeaseScopeEvents(desktopSession("connection-a"), "lease/agent", {
+      limit: 150,
+      before: "activity/20",
+    });
+
+    expect(requestRoomServer).toHaveBeenCalledWith(expect.objectContaining({
+      method: "GET",
+      path: "/api/leases/lease%2Fagent/scope-events?limit=100&before=activity%2F20",
+    }));
+    expect(result).toEqual({
+      items: [expect.objectContaining({
+        id: "activity-19",
+        type: "lease.scope_expanded",
+        actorName: "成员 A",
+        metadata: {
+          invocationId: "invocation-1234567890",
+          source: "hook",
+          toolName: "exec_command",
+          stage: "post",
+          turnId: "turn-1234567890",
+          requestedPaths: ["src/client/api.ts"],
+          coveredPaths: ["src/client/api.ts"],
+          addedPaths: ["src/client/App.tsx"],
+          ignoredPaths: ["C:/Temp/test.log"],
+          actualPaths: ["src/client/App.tsx"],
+          pathDiagnostics: ["Join-Path target could not be proven statically."],
+        },
+      })],
+      nextBefore: "activity-19",
+    });
+  });
+
+  it("drops unsupported scope-event sources while preserving path diagnostics", async () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: {
+          requestRoomServer: vi.fn(async () => ({
+            status: 200,
+            body: {
+              items: [{
+                id: "activity-unsupported-source",
+                type: "lease.scope_observed",
+                metadata: {
+                  source: "public-request-spoof",
+                  pathDiagnostics: ["The target remained dynamic."],
+                },
+              }],
+            },
+          })),
+        },
+      },
+    });
+
+    const result = await getLeaseScopeEvents(desktopSession("connection-a"), "lease-agent");
+
+    expect(result.items[0]?.metadata.source).toBeUndefined();
+    expect(result.items[0]?.metadata.pathDiagnostics).toEqual(["The target remained dynamic."]);
+  });
+
   it("does not infer a denial when a legacy lease response omits decision", async () => {
     Object.defineProperty(globalThis, "window", {
       configurable: true,
@@ -108,8 +243,44 @@ describe("desktop room transport", () => {
     expect(result).toMatchObject({
       acquired: false,
       decision: "warn",
+      coverage: [],
       conflicts: [expect.objectContaining({ severity: "blocking", decision: "warn" })],
     });
+  });
+
+  it("normalizes manual coverage and Agent scope additions from a claim response", async () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { origin: "http://127.0.0.1:4173" },
+        agentHubDesktop: {
+          requestRoomServer: vi.fn(async () => ({
+            status: 200,
+            body: {
+              acquired: true,
+              decision: "allow",
+              conflicts: [],
+              coverage: [
+                { leaseId: "manual-1", managedBy: "manual", paths: ["src/client/api.ts"], action: "covered" },
+                { leaseId: "agent-1", managedBy: "agent", paths: ["src/client/App.tsx"], action: "added" },
+                { leaseId: "invalid", managedBy: "unknown", paths: ["ignored"], action: "added" },
+              ],
+            },
+          })),
+        },
+      },
+    });
+
+    const result = await createLease(desktopSession("connection-a"), {
+      title: "Expand scope",
+      paths: ["src/client/api.ts", "src/client/App.tsx"],
+      ttlMinutes: 10,
+    });
+
+    expect(result.coverage).toEqual([
+      { leaseId: "manual-1", managedBy: "manual", paths: ["src/client/api.ts"], action: "covered" },
+      { leaseId: "agent-1", managedBy: "agent", paths: ["src/client/App.tsx"], action: "added" },
+    ]);
   });
 
   it("preserves structured server error details for monitor-mode upgrade guidance", async () => {
@@ -621,12 +792,15 @@ describe("dashboard lease compatibility", () => {
               leases: [
                 {
                   id: "lease-awaiting",
+                  sessionId: "hub-session-1234567890",
                   title: "等待提交",
                   memberId: "member-a",
                   memberName: "成员 A",
                   paths: ["src/client/App.tsx"],
                   mode: "write",
                   kind: "automatic",
+                  managedBy: "agent",
+                  createdVia: "mcp",
                   phase: "awaiting_commit",
                   status: "active",
                   expiresAt: "2026-08-27T08:10:00.000Z",
@@ -677,6 +851,9 @@ describe("dashboard lease compatibility", () => {
               sessions: [{
                 id: "session-stopped",
                 memberId: "member-a",
+                codexSessionId: "codex-session-1234567890",
+                currentTurnId: "turn-1234567890",
+                activityEpoch: 4,
                 status: "active",
                 lastSeenAt: "2026-08-27T08:00:00.000Z",
                 turnStoppedAt: "2026-08-27T08:00:00.000Z",
@@ -703,7 +880,19 @@ describe("dashboard lease compatibility", () => {
       ["lease-legacy", "working"],
       ["lease-unknown", "working"],
     ]);
-    expect(result.sessions[0]?.turnStoppedAt).toBe("2026-08-27T08:00:00.000Z");
+    expect(result.leases[0]).toMatchObject({
+      sessionId: "hub-session-1234567890",
+      managedBy: "agent",
+      createdVia: "mcp",
+    });
+    expect(result.leases[1]).toMatchObject({ managedBy: "agent", createdVia: "legacy" });
+    expect(result.leases[2]).toMatchObject({ managedBy: "manual", createdVia: "legacy" });
+    expect(result.sessions[0]).toMatchObject({
+      codexSessionId: "codex-session-1234567890",
+      currentTurnId: "turn-1234567890",
+      activityEpoch: 4,
+      turnStoppedAt: "2026-08-27T08:00:00.000Z",
+    });
     expect(result.releaseRequests[0]).toMatchObject({
       id: "request-1",
       requestedPaths: ["Assets/Scenes/Main.unity"],

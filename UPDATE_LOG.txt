@@ -626,3 +626,46 @@ v0.2.6 正式发布审计（2026-08-29）
 - GitHub Release `378691606` 已于 `2026-08-29 02:41:03`（Asia/Shanghai）正式公开并设为 latest：https://github.com/lcx040126/agent-hub/releases/tag/v0.2.6
 - 正式资产：`AgentHub-Setup-0.2.6-x64.exe` 119,754,894 字节，SHA-256 `f0a9db4363dbc06f0d7e3aec01c1427d28de8ca8573d55bc66d25993282fe03d`；`AgentHub-Setup-0.2.6-x64.exe.blockmap` 126,391 字节，SHA-256 `ba44465f84557e10c1b98aa3108e3cfc1654fbd595f5b2f4f07405be6ad67e92`；`latest.yml` 353 字节，SHA-256 `557c08e2f6049443bf1a23e14027e904e41a3bd98a9dcc705318a3a8309aa4ca`；`agent-hub-update.json` 3,987 字节，SHA-256 `165ee013f94e571e99327bae098a62c15e3e6ab26befee7e39b6004b0b36ef62`；`agent-hub-update.sig` 89 字节，SHA-256 `ffa8452cf373048fddca94eab684dbb45d808a5df413174059ee6bd38f5cd2be`；`SHA256SUMS.txt` 456 字节，SHA-256 `a08a7f902a29d6f7eb764ca3d684d19815bd96ce07a6ae2fcdaa5ed8249a8426`。已下载的五项被清单覆盖资产与 SHA256SUMS.txt 逐项匹配。
 - 正式安装目录覆盖升级、真实 Codex 多轮写入、长时间房间轮询和双机协作仍未完成，不能以本次自动化和远端发布替代实机验收。
+
+v0.2.7 已确认更新（已实现源码候选，2026-08-29）
+
+同一任务的自动范围合并与路径提取修正
+- 同一 Codex Hook session、任务、分支和 Git 基线下，连续工具调用产生的自动范围合并为一份持续更新的有效租约，不再按每次 `PreToolUse` 调用创建多张并列的“Codex 自动范围”卡片。
+- 当前任务已经拥有 Agent 通过 MCP `lease_acquire` 领取的任务范围时，MCP 与 Hook 必须落到同一份 Agent 托管租约，不再同时创建 `standard` 与 `automatic` 两套范围；出现未覆盖但属于同一任务的真实仓库路径时，原子扩展该任务租约的路径并集。
+- 路径已被用户从界面手动领取的普通或独占范围覆盖时，只登记当前任务的路径归因和活动证据，不得把人工租约转换为 Agent 托管租约，也不得在 Agent Stop 时自动释放人工范围。
+- 自动范围合并后统一续期、到期、完成与释放；界面展示一张任务级有效范围卡片，并可在详情中追溯各次工具调用新增或命中的路径，不能因合并丢失冲突审计证据。
+- 修正 PowerShell 写入目标提取：使用可验证的参数和路径语义解析并标准化到当前仓库，只登记真实仓库路径；`(Join-Path)`、`SilentlyContinue`、变量名、命令开关、枚举值和其他表达式片段不得成为租约路径。
+- 系统临时目录以及仓库内被任务清理的临时测试日志，只记录为工具调用副作用或本机诊断，不因命令文本误判而生成面向协作成员的独立任务租约卡片。
+
+Agent 托管租约与人工租约生命周期分流
+- 修复 MCP 指令要求 Agent 在写入前调用 `lease_acquire`，但该入口未声明租约类型而被服务端默认保存为 `standard`，导致 Hook 后续又创建 `automatic` 租约、任务完成后只释放自动租约而普通租约持续被心跳续期的问题。
+- 复用 Codex Hook sessionId 的 Agent 调用 `lease_acquire` 时，创建或更新带明确 Agent 托管来源的任务租约；这类范围与 Hook 自动领取使用同一身份和生命周期。用户在界面手动领取的普通范围继续保持 `standard`，手动独占继续保持 `exclusive`。
+- Agent 托管任务在 `Stop` 后进入 `awaiting_commit` 并停止续期；归因改动已完整进入当前分支 HEAD 或完全撤销时自动完成并释放，仍有未提交、部分提交或证据不完整的改动时保留到现有 TTL，用户不需要手动清理正常完成的任务租约。
+- `Stop` 的 3 秒宿主预算内只持久化幂等 completion job 和活动围栏；即使 Hook 进程超时、网络请求未完成或桌面端暂时离线，后台 worker 仍必须完成 `working -> awaiting_commit -> released/expired` 收尾，不能让已结束 Turn 继续心跳续租。
+- 升级时只对能够由 Hook session、MCP 调用审计和创建来源共同证明为 Agent 领取的旧 `standard` 租约进行托管迁移；来源不明确的普通租约保持人工生命周期，避免误释放用户范围。
+
+实时工作会话定位增强
+- “实时工作”中的每个任务在具备关联数据时显示 `Codex Session ID`、`Hub Session ID` 和“当前 Turn ID”，帮助成员明确任务所属的 Codex 对话、Agent Hub 工作会话以及当前对话轮次。
+- 卡片默认显示可区分的缩略 ID，提供完整值查看与一键复制，避免长 ID 撑宽任务卡；`activityEpoch` 作为诊断字段放入展开详情，不占用主界面。
+- 同一任务跨越多轮对话时保持一张任务卡并更新“当前 Turn ID”；每轮实际工具调用继续保存当时的 Turn ID 和归因记录，不能因当前值更新或任务级租约合并而覆盖历史审计。
+- 手动领取、MCP-only 或旧版本客户端未提供 Codex/Turn 标识时，对应字段明确显示“未关联”或“客户端未提供”，不得生成伪 ID，也不得把 Hub Session ID 误标为 Codex Session ID。
+- 会话标识仅向已加入房间的成员展示；它们不作为访问凭据，匿名导出与公开诊断信息默认不包含完整 ID。
+
+验收标准
+- 在同一任务中依次调用 MCP `lease_acquire`、执行脚本补丁、Unity 测试、`ProjectSettings` collateral 恢复和临时日志清理后，界面最多保留一份对应的 Agent 托管范围，不得同时出现同任务 `standard` 与 `automatic` 租约。
+- 上述流程中不得出现 `(Join-Path)`、`SilentlyContinue`、`Directory`、`Junction` 等伪路径，所有展示路径都能解析为当前仓库内的真实文件或目录。
+- 后续工具调用新增真实仓库路径时，同一租约的路径并集、到期时间和活动记录正确更新；完成并释放任务时不会遗留同 session 的孤立自动租约。
+- 合并只减少同任务内部的重复范围，不削弱跨成员冲突检测；服务端在线明确确认的其他成员手动独占仍按当前房间策略阻止重叠写入。
+- 自动化测试覆盖普通租约已覆盖、自动范围连续扩展、并发工具调用、PowerShell 动态路径、仓库外临时文件和任务结束释放；界面回归确认任务级卡片与调用级审计详情一致。
+- 自动化测试覆盖 Agent 通过 MCP 领取后由 Hook 扩展、提交完成自动释放、未提交改动保留到 TTL、Stop 三秒超时与离线重试；正常完成的任务不得要求用户点击“完成并释放”。
+- 用户从界面创建的 `standard`/`exclusive` 租约不参与 Agent Stop 自动释放；升级迁移对来源不明确的旧普通租约保持保守，不得仅凭存在 `session_id` 就改写其生命周期。
+- Codex Hook 任务卡能够同时显示并复制三类完整 ID；提交新一轮用户消息后只更新当前 Turn，不产生重复任务卡，上一轮 Turn 仍能从调用级审计中追溯。
+- 手动任务、MCP-only 会话、缺失字段和旧客户端兼容路径具有明确的空值展示；不同 Hub 会话或不同 Codex Session 的并行任务不会被错误合并或串用 Turn ID。
+
+当前状态
+- 已实现 v0.2.7 源码候选：版本为 `0.2.7`，protocol 为 `2`，数据库 schema 为 `6`，最低来源 protocol/schema 仍为 `1/2`。任务级 Agent 租约合并、保守迁移、MCP/Hook 固定来源、PowerShell AST 路径识别、Pre/Post 调用审计、Stop 后台收尾、三类会话 ID 和范围历史界面均已落地。
+- 最终审查额外确认并修复：匿名及房间上下文导出统一脱敏完整 Hub/Codex/Turn/finalization 标识；仍有活动 Agent 租约的 closed session 继续进入 Dashboard；纯监测模式下 finalizing/closed session 不再续期 Agent 租约；明确释放后清理本地旧租约；`Rename-Item` 新名称按源文件父目录解析；PowerShell AST 冷启动超时放宽到 5 秒。
+- 自动验证已通过：两套 TypeScript 配置检查；62 个测试文件共 594 项串行测试；Vite 与服务端生产构建；schema `2/3/3 失败重试/3 手工修复/4/5 -> 6` 及新建 schema 6 的打包数据库迁移与重复启动探针；完整工作树 `git diff --check`。
+- Windows 解包构建在短路径 `D:\ah-v027-probe\win-unpacked` 成功；长工作区路径两次因目录重命名 `EPERM` 失败，失败生成目录已清理。打包更新恢复探针通过，`app.asar` 为 47,047,270 字节，SHA-256 `92fe14e719df28664c9bdb7ff3de8df3241496bc932d99e973d6b2179e28a5f6`，backup health 为 `ok`。这些均为本地候选证据，不是正式发布资产。
+- 桌面与窄屏视觉验收尚未完成：本机应用内浏览器初始化因 `failed to write kernel assets: 系统找不到指定的路径。` 阻塞，不能用自动化测试替代该项检查。
+- 当前修改尚未提交、推送、打标签或发布。正式安装目录覆盖升级、真实 Codex 多轮流程和双机协作仍需单独实机验收。

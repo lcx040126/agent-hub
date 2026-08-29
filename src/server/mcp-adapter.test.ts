@@ -132,7 +132,14 @@ describe("Agent Hub MCP session lifecycle", () => {
       title: "First task tries the second scene",
       paths: ["Assets/Scenes/Second.unity"],
     });
-    expect(overlapping).toMatchObject({ acquired: false, decision: "deny" });
+    expect(overlapping).toMatchObject({
+      acquired: false,
+      decision: "wait",
+      waitingFor: {
+        leaseId: secondLease.lease.id,
+        sessionId: second.session.id,
+      },
+    });
     expect(service.getDashboard(context.memberToken).leases.find(
       (lease) => lease.id === secondLease.lease.id,
     )).toMatchObject({ status: "active", sessionId: second.session.id });
@@ -172,7 +179,7 @@ describe("Agent Hub MCP session lifecycle", () => {
     )).toMatchObject({ status: "active", sessionId: hookSession.id });
   });
 
-  it("shares a legacy manual standard range through a warned MCP session lease", async () => {
+  it("uses a same-member manual standard range as MCP coverage without creating an Agent lease", async () => {
     const { service, adapter, context } = setup();
     const legacyLease = service.claimLease({
       memberToken: context.memberToken,
@@ -185,11 +192,15 @@ describe("Agent Hub MCP session lifecycle", () => {
     expect(legacyLease.lease.sessionId).toBeNull();
 
     const opened = await adapter.sessionOpen(context, { objective: "New MCP task" }) as OpenResult;
-    expect(() => adapter.editCheck(context, {
+    expect(adapter.editCheck(context, {
       sessionId: opened.session.id,
       leaseId: legacyLease.lease.id,
       paths: ["Assets/Scenes/Legacy.unity"],
-    })).toThrow(expect.objectContaining({ code: "lease_not_found", status: 404 }));
+    })).toMatchObject({
+      allowed: true,
+      coveredPaths: ["Assets/Scenes/Legacy.unity"],
+      uncoveredPaths: [],
+    });
 
     const overlapping = await adapter.leaseAcquire(context, {
       sessionId: opened.session.id,
@@ -198,9 +209,67 @@ describe("Agent Hub MCP session lifecycle", () => {
     });
     expect(overlapping).toMatchObject({
       acquired: true,
-      decision: "warn",
-      lease: { sessionId: opened.session.id, kind: "standard" },
+      decision: "allow",
+      lease: {
+        id: legacyLease.lease.id,
+        sessionId: null,
+        kind: "standard",
+        managedBy: "manual",
+      },
+      coverage: [{
+        leaseId: legacyLease.lease.id,
+        managedBy: "manual",
+        paths: ["Assets/Scenes/Legacy.unity"],
+        action: "covered",
+      }],
     });
+    expect(service.getDashboard(context.memberToken).leases.filter(
+      (lease) => lease.sessionId === opened.session.id && lease.managedBy === "agent",
+    )).toHaveLength(0);
+  });
+
+  it("does not treat a same-member manual read range as MCP write coverage", async () => {
+    const { service, adapter, context } = setup();
+    const manualRead = service.claimLease({
+      memberToken: context.memberToken,
+      title: "Read-only source review",
+      paths: ["src/reviewed.ts"],
+      mode: "read",
+      kind: "standard",
+      managedBy: "manual",
+      createdVia: "ui",
+    });
+    expect(manualRead.acquired).toBe(true);
+    if (!manualRead.acquired) throw new Error("Expected the manual read lease to be acquired.");
+
+    const opened = await adapter.sessionOpen(context, { objective: "Write the reviewed source" }) as OpenResult;
+    const acquired = await adapter.leaseAcquire(context, {
+      sessionId: opened.session.id,
+      title: "Write reviewed source",
+      paths: ["src/reviewed.ts"],
+    });
+
+    expect(acquired).toMatchObject({
+      acquired: true,
+      lease: {
+        sessionId: opened.session.id,
+        mode: "write",
+        kind: "automatic",
+        managedBy: "agent",
+        createdVia: "mcp",
+      },
+      coverage: [{
+        managedBy: "agent",
+        paths: ["src/reviewed.ts"],
+        action: "added",
+      }],
+    });
+    if (!acquired.acquired) throw new Error("Expected the MCP write lease to be acquired.");
+    expect(acquired.lease.id).not.toBe(manualRead.lease.id);
+    expect(service.getDashboard(context.memberToken).leases).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: manualRead.lease.id, mode: "read", managedBy: "manual" }),
+      expect.objectContaining({ id: acquired.lease.id, mode: "write", managedBy: "agent" }),
+    ]));
   });
 
   it("does not let one MCP session append evidence to another session's lease", async () => {
@@ -225,7 +294,7 @@ describe("Agent Hub MCP session lifecycle", () => {
     })).toThrow(expect.objectContaining({ code: "lease_session_mismatch", status: 409 }));
   });
 
-  it("cancels only automatic work when a session closes", async () => {
+  it("cancels the canonical MCP Agent lease while preserving manual and other-session work", async () => {
     const { service, adapter, context } = setup();
     const first = await adapter.sessionOpen(context, { objective: "First task" }) as OpenResult;
     const second = await adapter.sessionOpen(context, { objective: "Second task" }) as OpenResult;
@@ -251,12 +320,36 @@ describe("Agent Hub MCP session lifecycle", () => {
       paths: ["src/first-automatic.ts"],
       kind: "automatic",
     });
+    const firstManual = service.claimLease({
+      memberToken: context.memberToken,
+      sessionId: first.session.id,
+      title: "First manual task",
+      paths: ["src/first-manual.ts"],
+      kind: "standard",
+    });
     expect(
-      firstLeaseA.acquired && firstLeaseB.acquired && secondLease.acquired && firstAutomatic.acquired,
+      firstLeaseA.acquired
+        && firstLeaseB.acquired
+        && secondLease.acquired
+        && firstAutomatic.acquired
+        && firstManual.acquired,
     ).toBe(true);
-    if (!firstLeaseA.acquired || !firstLeaseB.acquired || !secondLease.acquired || !firstAutomatic.acquired) {
+    if (
+      !firstLeaseA.acquired
+      || !firstLeaseB.acquired
+      || !secondLease.acquired
+      || !firstAutomatic.acquired
+      || !firstManual.acquired
+    ) {
       throw new Error("Expected every independent lease to be acquired.");
     }
+    expect(firstLeaseB.lease.id).toBe(firstLeaseA.lease.id);
+    expect(firstAutomatic.lease.id).toBe(firstLeaseA.lease.id);
+    expect(firstAutomatic.lease.paths.map((path) => path.path)).toEqual(expect.arrayContaining([
+      "src/first-a.ts",
+      "src/first-b.ts",
+      "src/first-automatic.ts",
+    ]));
 
     await adapter.sessionClose(context, {
       sessionId: first.session.id,
@@ -267,9 +360,10 @@ describe("Agent Hub MCP session lifecycle", () => {
       .prepare("SELECT id, status FROM leases ORDER BY id")
       .all() as Array<{ id: string; status: string }>;
     const statusById = new Map(rows.map((row) => [row.id, row.status]));
-    expect(statusById.get(firstLeaseA.lease.id)).toBe("active");
-    expect(statusById.get(firstLeaseB.lease.id)).toBe("active");
+    expect(statusById.get(firstLeaseA.lease.id)).toBe("cancelled");
+    expect(statusById.get(firstLeaseB.lease.id)).toBe("cancelled");
     expect(statusById.get(firstAutomatic.lease.id)).toBe("cancelled");
+    expect(statusById.get(firstManual.lease.id)).toBe("active");
     expect(statusById.get(secondLease.lease.id)).toBe("active");
   });
 

@@ -68,11 +68,21 @@ export interface HookProposedEditState {
 export interface HookPendingWriteState {
   proposalHash: string;
   toolName: string;
+  /** PreToolUse 生成并由对应 PostToolUse 复用的调用级审计 ID。 */
+  invocationId?: string;
   proposedEdits: HookProposedEditState[];
   attributedSideEffects: boolean;
+  pathDiagnostics?: string[];
+  ignoredPaths?: string[];
   baselineChangedPaths: string[];
   baselineChangedFingerprints: Record<string, string>;
   recordedAt: string;
+}
+
+export interface HookLeaseRefreshResult {
+  renewedLeases: Array<Pick<HookLeaseState, "id" | "expiresAt">>;
+  /** 新服务端返回当前 Hub session 唯一的 Agent 托管租约；旧服务端可省略。 */
+  managedLease?: HookLeaseState;
 }
 
 export interface HookExternalChangeDiagnostic {
@@ -272,19 +282,40 @@ export class CodexHookStateStore {
     codexSessionId: string,
     operation: (
       state: CodexHookSessionState,
-    ) => Promise<Array<Pick<HookLeaseState, "id" | "expiresAt">> | undefined>,
+    ) => Promise<
+      Array<Pick<HookLeaseState, "id" | "expiresAt">>
+      | HookLeaseRefreshResult
+      | undefined
+    >,
   ): Promise<CodexHookSessionState | undefined> {
     return this.runExclusive(codexSessionId, async () => {
       const state = await this.load(codexSessionId);
       if (!state) return undefined;
-      const renewedLeases = await operation(state);
-      if (renewedLeases === undefined) return state;
+      const refresh = await operation(state);
+      if (refresh === undefined) return state;
+      const renewedLeases = Array.isArray(refresh) ? refresh : refresh.renewedLeases;
       const normalizedRenewals = new Map(renewedLeases.map((lease) => [
         requiredText(lease.id, "lease ID"),
         isoText(lease.expiresAt, "lease expiry"),
       ]));
       let changed = false;
-      const leases = state.leases.map((lease) => {
+      let leases = state.leases;
+      if (!Array.isArray(refresh) && refresh.managedLease) {
+        const canonical = parseLease(refresh.managedLease);
+        const previous = state.leases.find((lease) => lease.id === canonical.id);
+        const adopted = {
+          ...canonical,
+          coordinationState: canonical.coordinationState ?? previous?.coordinationState,
+        };
+        changed = state.leases.length !== 1
+          || JSON.stringify(state.leases[0]) !== JSON.stringify(adopted);
+        leases = [adopted];
+        if (state.leaseAttributionComplete === false) {
+          state.leaseAttributionComplete = true;
+          changed = true;
+        }
+      }
+      leases = leases.map((lease) => {
         const expiresAt = normalizedRenewals.get(lease.id);
         if (!expiresAt || expiresAt === lease.expiresAt) return lease;
         changed = true;
@@ -535,8 +566,17 @@ function parsePendingWrite(value: unknown): HookPendingWriteState {
   return {
     proposalHash: requiredHash(value.proposalHash, "proposal hash"),
     toolName: requiredText(value.toolName, "tool name"),
+    invocationId: value.invocationId === undefined
+      ? undefined
+      : requiredIdentifier(value.invocationId, "write invocation ID"),
     proposedEdits: value.proposedEdits.map(parseProposedEdit),
     attributedSideEffects: value.attributedSideEffects === true,
+    pathDiagnostics: value.pathDiagnostics === undefined
+      ? undefined
+      : stringArray(value.pathDiagnostics),
+    ignoredPaths: value.ignoredPaths === undefined
+      ? undefined
+      : stringArray(value.ignoredPaths),
     baselineChangedPaths: stringArray(value.baselineChangedPaths),
     baselineChangedFingerprints: stringMap(value.baselineChangedFingerprints),
     recordedAt: isoText(value.recordedAt, "pending write recordedAt"),

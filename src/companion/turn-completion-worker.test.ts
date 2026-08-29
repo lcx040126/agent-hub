@@ -775,6 +775,70 @@ describe("Stop hook and turn completion worker", () => {
     expect(job.expiresAt).toBe("2026-08-27T00:30:00.000Z");
   }, 10_000);
 
+  it("adopts then removes the canonical lease after confirmed Git completion", async () => {
+    const repositoryPath = await createRepository();
+    const stateStore = new CodexHookStateStore(repositoryPath);
+    const state = hookState(repositoryPath);
+    state.branch = (await git(repositoryPath, ["branch", "--show-current"])).trim();
+    state.baseCommit = (await git(repositoryPath, ["rev-parse", "HEAD"])).trim();
+    state.leases = [];
+    state.leaseAttributionComplete = false;
+    state.attributedChangedPaths = [];
+    state.attributedPathEvidence = [];
+    const queue = new TurnCompletionQueueStore(repositoryPath);
+    const job = await queue.enqueue({
+      operationId: "completion-managed-recovery",
+      turnId: "turn-managed-recovery",
+      activityEpoch: 2,
+      state,
+    }, new Date("2026-08-27T00:00:00.000Z"));
+    state.pendingCompletion = {
+      operationId: job.operationId,
+      turnId: job.turnId,
+      activityEpoch: job.activityEpoch,
+      phase: "awaiting_commit",
+      recordedAt: job.createdAt,
+    };
+    await stateStore.save(state);
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const client = new AgentHubClient({
+      serverUrl: "http://127.0.0.1:4173",
+      memberToken: "member-token",
+      fetchImpl: vi.fn(async (url, init) => {
+        const request = { url: String(url), body: JSON.parse(String(init?.body)) as Record<string, unknown> };
+        requests.push(request);
+        if (request.url.endsWith("/stop")) {
+          return jsonResponse(200, {
+            result: "awaiting_commit",
+            managedLeases: [{
+              id: "mcp-managed-lease",
+              paths: ["src/mcp.ts"],
+              expiresAt: "2026-08-27T00:30:00.000Z",
+            }],
+            awaitingAutomaticLeases: [],
+          });
+        }
+        return jsonResponse(200, { result: "released", releasedLeaseIds: ["mcp-managed-lease"] });
+      }) as typeof fetch,
+    });
+
+    await expect(processTurnCompletionJob(job, { userDataPath: repositoryPath, client }))
+      .resolves.toBeNull();
+
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.body).toMatchObject({ leaseIds: ["mcp-managed-lease"] });
+    expect(job).toMatchObject({
+      leaseIds: ["mcp-managed-lease"],
+      leaseAttributionComplete: true,
+    });
+    expect(Date.parse(job.expiresAt)).toBeGreaterThanOrEqual(Date.parse("2026-08-27T00:30:00.000Z"));
+    await expect(stateStore.load(state.codexSessionId)).resolves.toMatchObject({
+      leaseAttributionComplete: true,
+      leases: [],
+      pendingCompletion: { phase: "stopped" },
+    });
+  }, 10_000);
+
   it("preserves protection when Stop omits its automatic lease manifest", async () => {
     const repositoryPath = await createRepository();
     const state = hookState(repositoryPath);

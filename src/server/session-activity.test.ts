@@ -612,6 +612,414 @@ describe("Codex turn activity fencing", () => {
     ]));
     database.close();
   });
+
+  it("does not renew Agent leases from finalizing or closed monitor-only sessions", () => {
+    let currentTime = new Date("2026-08-27T12:00:00.000Z");
+    const { database, service, memberToken } = testService(() => currentTime);
+    const session = service.openSession({
+      memberToken,
+      codexSessionId: "codex-monitor-finalization",
+      turnId: "turn-monitor-finalization",
+      activityEpoch: 4,
+    });
+    const automatic = service.claimLease({
+      memberToken,
+      sessionId: session.id,
+      title: "Monitor-only Agent scope",
+      paths: ["src/monitor-agent.ts"],
+      kind: "automatic",
+    });
+    const standard = service.claimLease({
+      memberToken,
+      title: "Sessionless manual heartbeat scope",
+      paths: ["src/monitor-manual.ts"],
+      kind: "standard",
+    });
+    if (!automatic.acquired || !standard.acquired) throw new Error("Test leases were not acquired.");
+
+    service.heartbeatSession({
+      memberToken,
+      sessionId: session.id,
+      clientVersion: "0.2.7",
+      protocolVersion: 2,
+      schemaVersion: 6,
+      turnId: "turn-monitor-finalization",
+      activityEpoch: 4,
+    });
+    service.updateRoomSettings({ memberToken, blockingProtectionEnabled: false });
+    const agentExpiry = service.getDashboard(memberToken).leases
+      .find((lease) => lease.id === automatic.lease.id)?.expiresAt;
+    service.startSessionFinalization({
+      memberToken,
+      sessionId: session.id,
+      finalizationId: "finalization-monitor-heartbeat",
+    });
+
+    currentTime = new Date("2026-08-27T12:01:00.000Z");
+    const finalizingHeartbeat = service.heartbeatSession({
+      memberToken,
+      sessionId: session.id,
+      turnId: "turn-monitor-finalization",
+      activityEpoch: 4,
+    });
+    expect(finalizingHeartbeat.renewedLeases.map((lease) => lease.id)).toEqual([standard.lease.id]);
+    expect(service.getDashboard(memberToken).leases
+      .find((lease) => lease.id === automatic.lease.id)?.expiresAt).toBe(agentExpiry);
+
+    service.completeSessionFinalization({
+      memberToken,
+      sessionId: session.id,
+      finalizationId: "finalization-monitor-heartbeat",
+    });
+    currentTime = new Date("2026-08-27T12:02:00.000Z");
+    const closedHeartbeat = service.heartbeatSession({
+      memberToken,
+      sessionId: session.id,
+      turnId: "turn-monitor-finalization",
+      activityEpoch: 4,
+    });
+    expect(closedHeartbeat.renewedLeases.map((lease) => lease.id)).toEqual([standard.lease.id]);
+    expect(service.getDashboard(memberToken).leases
+      .find((lease) => lease.id === automatic.lease.id)?.expiresAt).toBe(agentExpiry);
+    database.close();
+  });
+
+  it("merges MCP and Hook paths into one Agent-managed lease with invocation history", () => {
+    let currentTime = new Date("2026-08-27T12:00:00.000Z");
+    const { database, service, memberToken } = testService(() => currentTime);
+    const session = service.openSession({
+      memberToken,
+      codexSessionId: "codex-managed-scope",
+      turnId: "turn-managed-0",
+      activityEpoch: 0,
+      branch: "main",
+      baseCommit: "base-managed",
+      metadata: { source: "codex-hook" },
+    });
+    const mcpClaim = service.claimLease({
+      memberToken,
+      sessionId: session.id,
+      title: "Managed scope",
+      paths: ["src/first.ts"],
+      kind: "automatic",
+      managedBy: "agent",
+      createdVia: "mcp",
+      invocationId: "mcp-call-1",
+      toolName: "lease_acquire",
+      stage: "pre",
+      turnId: "turn-managed-0",
+    });
+    if (!mcpClaim.acquired) throw new Error("MCP lease was not acquired.");
+    currentTime = new Date("2026-08-27T12:00:01.000Z");
+
+    const prepared = service.prepareEdits({
+      memberToken,
+      sessionId: session.id,
+      title: "Hook fallback title",
+      branch: "main",
+      baseCommit: "base-managed",
+      paths: ["src/second.ts"],
+      invocationId: "hook-call-2",
+      toolName: "Bash",
+      stage: "pre",
+      turnId: "turn-managed-0",
+      activityEpoch: 0,
+    });
+    expect(prepared.check.allowed).toBe(true);
+    expect(prepared.claim).toMatchObject({
+      acquired: true,
+      lease: {
+        id: mcpClaim.lease.id,
+        managedBy: "agent",
+        createdVia: "mcp",
+        title: "Managed scope",
+      },
+      coverage: [expect.objectContaining({
+        leaseId: mcpClaim.lease.id,
+        action: "added",
+        paths: ["src/second.ts"],
+      })],
+    });
+    expect(prepared.managedLease?.id).toBe(mcpClaim.lease.id);
+    expect(service.getDashboard(memberToken).leases).toEqual([
+      expect.objectContaining({
+        id: mcpClaim.lease.id,
+        paths: expect.arrayContaining([
+          expect.objectContaining({ path: "src/first.ts" }),
+          expect.objectContaining({ path: "src/second.ts" }),
+        ]),
+      }),
+    ]);
+    expect(database.connection.prepare(`
+      SELECT COUNT(*) AS count FROM leases
+      WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
+    `).get(session.id)).toEqual({ count: 1 });
+    const history = service.listLeaseScopeEvents(memberToken, mcpClaim.lease.id, 10);
+    expect(history.items.map((event) => event.metadata.invocationId)).toEqual([
+      "hook-call-2",
+      "mcp-call-1",
+    ]);
+    database.close();
+  });
+
+  it("preserves full invocation audit and manual coverage when Agent claims wait or are denied", () => {
+    const { database, service, memberToken, room } = testService();
+    const sharedManual = service.claimLease({
+      memberToken,
+      title: "Owner manual coverage",
+      paths: ["src/manual-covered.ts"],
+      mode: "write",
+      kind: "standard",
+      managedBy: "manual",
+      createdVia: "ui",
+    });
+    const holderSession = service.openSession({
+      memberToken,
+      codexSessionId: "codex-audit-holder",
+      turnId: "turn-holder-0",
+      activityEpoch: 0,
+    });
+    const waitingSession = service.openSession({
+      memberToken,
+      codexSessionId: "codex-audit-waiting",
+      turnId: "turn-waiting-0",
+      activityEpoch: 0,
+    });
+    const holder = service.claimLease({
+      memberToken,
+      sessionId: holderSession.id,
+      title: "Held Agent scope",
+      paths: ["src/held.ts"],
+      mode: "write",
+      kind: "automatic",
+      managedBy: "agent",
+      createdVia: "hook",
+    });
+    if (!sharedManual.acquired || !holder.acquired) throw new Error("Expected owner leases to be acquired.");
+
+    const waiting = service.claimLease({
+      memberToken,
+      sessionId: waitingSession.id,
+      title: "Waiting mixed scope",
+      paths: ["src/manual-covered.ts", "src/held.ts"],
+      mode: "write",
+      kind: "automatic",
+      managedBy: "agent",
+      createdVia: "hook",
+      invocationId: "wait-invocation",
+      toolName: "Bash",
+      stage: "pre",
+      turnId: "turn-waiting-0",
+      ignoredPaths: [".tmp/wait.log"],
+      actualPaths: [],
+      pathDiagnostics: ["Wait diagnostic"],
+    });
+    expect(waiting).toMatchObject({
+      acquired: false,
+      decision: "wait",
+      coverage: [{
+        leaseId: sharedManual.lease.id,
+        managedBy: "manual",
+        paths: ["src/manual-covered.ts"],
+        action: "covered",
+      }],
+      waitingFor: { leaseId: holder.lease.id },
+    });
+
+    const bob = service.joinRoom({
+      roomToken: room.roomToken,
+      displayName: "Bob",
+    });
+    const exclusive = service.claimLease({
+      memberToken,
+      title: "Owner exclusive scope",
+      paths: ["src/exclusive"],
+      mode: "write",
+      kind: "exclusive",
+      managedBy: "manual",
+      createdVia: "ui",
+      ttlMinutes: 60,
+    });
+    const bobManual = service.claimLease({
+      memberToken: bob.memberToken,
+      title: "Bob manual coverage",
+      paths: ["src/bob-covered.ts"],
+      mode: "write",
+      kind: "standard",
+      managedBy: "manual",
+      createdVia: "ui",
+    });
+    const bobSession = service.openSession({
+      memberToken: bob.memberToken,
+      codexSessionId: "codex-audit-denied",
+      turnId: "turn-denied-0",
+      activityEpoch: 0,
+    });
+    if (!exclusive.acquired || !bobManual.acquired) throw new Error("Expected manual leases to be acquired.");
+
+    const denied = service.claimLease({
+      memberToken: bob.memberToken,
+      sessionId: bobSession.id,
+      title: "Denied mixed scope",
+      paths: ["src/bob-covered.ts", "src/exclusive/file.ts"],
+      mode: "write",
+      kind: "automatic",
+      managedBy: "agent",
+      createdVia: "hook",
+      invocationId: "deny-invocation",
+      toolName: "apply_patch",
+      stage: "pre",
+      turnId: "turn-denied-0",
+      ignoredPaths: [".tmp/deny.log"],
+      actualPaths: ["src/exclusive/file.ts"],
+      pathDiagnostics: ["Deny diagnostic"],
+    });
+    expect(denied).toMatchObject({
+      acquired: false,
+      decision: "deny",
+      coverage: [{
+        leaseId: bobManual.lease.id,
+        managedBy: "manual",
+        paths: ["src/bob-covered.ts"],
+        action: "covered",
+      }],
+    });
+
+    const activities = (database.connection.prepare(`
+      SELECT actor_member_id, type, entity_type, entity_id, metadata_json
+      FROM activities
+      WHERE type IN ('lease.waiting', 'lease.rejected', 'lease.scope_observed')
+    `).all() as Array<{
+      actor_member_id: string;
+      type: string;
+      entity_type: string;
+      entity_id: string | null;
+      metadata_json: string;
+    }>).map((activity) => ({
+      ...activity,
+      metadata: JSON.parse(activity.metadata_json) as Record<string, unknown>,
+    }));
+    const waitMetadata = {
+      invocationId: "wait-invocation",
+      source: "hook",
+      toolName: "Bash",
+      stage: "pre",
+      turnId: "turn-waiting-0",
+      requestedPaths: ["src/manual-covered.ts", "src/held.ts"],
+      coveredPaths: ["src/manual-covered.ts"],
+      addedPaths: [],
+      ignoredPaths: [".tmp/wait.log"],
+      actualPaths: [],
+      pathDiagnostics: ["Wait diagnostic"],
+    };
+    expect(activities).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "lease.waiting",
+        entity_type: "lease",
+        entity_id: holder.lease.id,
+        metadata: expect.objectContaining(waitMetadata),
+      }),
+      expect.objectContaining({
+        type: "lease.scope_observed",
+        entity_type: "session",
+        entity_id: waitingSession.id,
+        metadata: expect.objectContaining(waitMetadata),
+      }),
+      expect.objectContaining({
+        actor_member_id: bob.member.id,
+        type: "lease.rejected",
+        entity_type: "lease",
+        entity_id: null,
+        metadata: expect.objectContaining({
+          invocationId: "deny-invocation",
+          source: "hook",
+          toolName: "apply_patch",
+          stage: "pre",
+          turnId: "turn-denied-0",
+          requestedPaths: ["src/bob-covered.ts", "src/exclusive/file.ts"],
+          coveredPaths: ["src/bob-covered.ts"],
+          addedPaths: [],
+          ignoredPaths: [".tmp/deny.log"],
+          actualPaths: ["src/exclusive/file.ts"],
+          pathDiagnostics: ["Deny diagnostic"],
+        }),
+      }),
+      expect.objectContaining({
+        actor_member_id: bob.member.id,
+        type: "lease.scope_observed",
+        entity_type: "session",
+        entity_id: bobSession.id,
+        metadata: expect.objectContaining({ invocationId: "deny-invocation" }),
+      }),
+    ]));
+    database.close();
+  });
+
+  it("attributes manually covered paths without converting or releasing the manual lease", () => {
+    const { database, service, memberToken } = testService();
+    const session = service.openSession({
+      memberToken,
+      codexSessionId: "codex-manual-coverage",
+      turnId: "turn-manual-0",
+      activityEpoch: 0,
+      branch: "main",
+      baseCommit: "base-manual",
+    });
+    const manual = service.claimLease({
+      memberToken,
+      title: "Manual source scope",
+      paths: ["src/manual"],
+      kind: "standard",
+      managedBy: "manual",
+      createdVia: "ui",
+    });
+    if (!manual.acquired) throw new Error("Manual lease was not acquired.");
+
+    const prepared = service.prepareEdits({
+      memberToken,
+      sessionId: session.id,
+      title: "Covered Agent write",
+      branch: "main",
+      baseCommit: "base-manual",
+      paths: ["src/manual/file.ts"],
+      invocationId: "manual-covered-call",
+      toolName: "apply_patch",
+      stage: "pre",
+      turnId: "turn-manual-0",
+      activityEpoch: 0,
+    });
+    expect(prepared).toMatchObject({
+      check: { allowed: true },
+      claim: {
+        acquired: true,
+        lease: { id: manual.lease.id, managedBy: "manual", createdVia: "ui" },
+        coverage: [{
+          leaseId: manual.lease.id,
+          managedBy: "manual",
+          paths: ["src/manual/file.ts"],
+          action: "covered",
+        }],
+      },
+    });
+    expect(prepared.managedLease).toBeUndefined();
+    expect(database.connection.prepare(`
+      SELECT COUNT(*) AS count FROM leases
+      WHERE session_id = ? AND status = 'active' AND managed_by = 'agent'
+    `).get(session.id)).toEqual({ count: 0 });
+
+    const stopped = service.stopSessionActivity({
+      memberToken,
+      sessionId: session.id,
+      operationId: "stop-manual-coverage",
+      turnId: "turn-manual-0",
+      activityEpoch: 0,
+    });
+    expect(stopped.managedLeases).toEqual([]);
+    expect(service.getDashboard(memberToken).leases).toEqual([
+      expect.objectContaining({ id: manual.lease.id, managedBy: "manual", status: "active" }),
+    ]);
+    database.close();
+  });
 });
 
 function testService(now: () => Date = () => new Date("2026-08-27T12:00:00.000Z")) {
@@ -623,5 +1031,5 @@ function testService(now: () => Date = () => new Date("2026-08-27T12:00:00.000Z"
     repository: "https://example.invalid/activity.git",
     hostName: "Alice",
   });
-  return { database, service, memberToken: room.memberToken };
+  return { database, service, memberToken: room.memberToken, room };
 }

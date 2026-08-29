@@ -89,6 +89,7 @@ describe("member integration pause", () => {
       paths: ["Assets/Scenes/Old.unity"],
       mode: "write",
       autoClaim: true,
+      createdVia: "legacy",
     });
     expect(blocked.acquired).toBe(false);
     if (blocked.acquired) throw new Error("Expected a blocking release request.");
@@ -110,6 +111,7 @@ describe("member integration pause", () => {
       paths: ["Assets/Scenes/Old-aux.unity"],
       mode: "write",
       autoClaim: true,
+      createdVia: "legacy",
     });
     expect(orphanBlocked.acquired).toBe(false);
     if (orphanBlocked.acquired) throw new Error("Expected an orphan lease release request.");
@@ -142,6 +144,7 @@ describe("member integration pause", () => {
       paths: ["Assets/Scenes/New.unity"],
       mode: "write",
       autoClaim: true,
+      createdVia: "legacy",
     });
     expect(newerBlocked.acquired).toBe(false);
     if (newerBlocked.acquired) throw new Error("Expected a newer blocking release request.");

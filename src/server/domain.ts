@@ -29,6 +29,8 @@ export type ConflictSeverity = "warning" | "blocking";
 export type ConflictDecision = "allow" | "warn" | "deny";
 export type LeaseMode = "read" | "write";
 export type LeaseKind = "automatic" | "standard" | "exclusive";
+export type LeaseManagement = "manual" | "agent";
+export type LeaseSource = "ui" | "mcp" | "hook" | "legacy";
 export type AutomaticLeasePhase = "working" | "waiting" | "blocked" | "awaiting_commit";
 export type ReleaseRequestStatus = "pending" | "approved" | "rejected" | "cancelled";
 export type MemberCompatibility = "compatible" | "incompatible" | "unknown";
@@ -97,6 +99,8 @@ export interface Lease {
   baseCommit: string | null;
   mode: LeaseMode;
   kind: LeaseKind;
+  managedBy: LeaseManagement;
+  createdVia: LeaseSource;
   phase?: AutomaticLeasePhase;
   decision: ConflictDecision;
   overrideReason: string | null;
@@ -123,6 +127,13 @@ export interface LeaseConflict {
   existingLeaseKind: LeaseKind;
 }
 
+export interface LeaseCoverage {
+  leaseId: string;
+  managedBy: LeaseManagement;
+  paths: string[];
+  action: "covered" | "added";
+}
+
 export type LeaseClaimResult =
   | {
       acquired: true;
@@ -130,12 +141,14 @@ export type LeaseClaimResult =
       lease: Lease;
       conflicts: LeaseConflict[];
       releaseRequests: ReleaseRequest[];
+      coverage: LeaseCoverage[];
     }
   | {
       acquired: false;
       decision: "warn" | "deny" | "wait";
       conflicts: LeaseConflict[];
       releaseRequests: ReleaseRequest[];
+      coverage: LeaseCoverage[];
       waitingFor?: {
         leaseId: string;
         sessionId: string | null;
@@ -559,6 +572,15 @@ export interface ClaimLeaseInput {
   paths: string[];
   mode?: LeaseMode;
   kind?: LeaseKind;
+  managedBy?: LeaseManagement;
+  createdVia?: LeaseSource;
+  invocationId?: string;
+  toolName?: string;
+  stage?: "pre" | "post";
+  turnId?: string;
+  ignoredPaths?: string[];
+  actualPaths?: string[];
+  pathDiagnostics?: string[];
   overrideReason?: string;
   ttlMs?: number;
   ttlMinutes?: number;

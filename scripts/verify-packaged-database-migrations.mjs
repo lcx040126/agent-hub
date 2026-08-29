@@ -27,13 +27,14 @@ try {
     { name: "schema-3-failed-retry", schemaVersion: 3, failedUpgrade: true },
     { name: "schema-3-manual-repair", schemaVersion: 3, repaired: true },
     { name: "schema-4", schemaVersion: 4 },
+    { name: "schema-5", schemaVersion: 5 },
   ]) {
     const dataDirectory = path.join(probeRoot, testCase.name);
     const databasePath = path.join(dataDirectory, "agent-hub.sqlite");
     createHistoricalFixture(databasePath, testCase.schemaVersion, testCase.repaired === true);
     if (testCase.failedUpgrade) simulateFailedUpgrade(databasePath);
 
-    // 两次启动分别验证升级和已迁移 schema 5 的幂等重开。
+    // 两次启动分别验证升级和已迁移 schema 6 的幂等重开。
     await startAndStopPackagedService(dataDirectory);
     validateMigratedDatabase(databasePath, testCase.schemaVersion, testCase.repaired === true);
     await startAndStopPackagedService(dataDirectory);
@@ -41,15 +42,15 @@ try {
     results.push({ name: testCase.name, status: "ok", reopened: true });
   }
 
-  const newDataDirectory = path.join(probeRoot, "new-schema-5");
+  const newDataDirectory = path.join(probeRoot, "new-schema-6");
   const newDatabasePath = path.join(newDataDirectory, "agent-hub.sqlite");
   await startAndStopPackagedService(newDataDirectory);
   validateNewDatabase(newDatabasePath);
   await startAndStopPackagedService(newDataDirectory);
   validateNewDatabase(newDatabasePath);
-  results.push({ name: "new-schema-5", status: "ok", reopened: true });
+  results.push({ name: "new-schema-6", status: "ok", reopened: true });
 
-  process.stdout.write(`${JSON.stringify({ status: "ok", version: "0.2.6", results })}\n`);
+  process.stdout.write(`${JSON.stringify({ status: "ok", version: "0.2.7", results })}\n`);
 } finally {
   rmSync(probeRoot, { recursive: true, force: true });
 }
@@ -76,13 +77,15 @@ function createHistoricalFixture(databasePath, schemaVersion, repaired) {
     client_version TEXT, protocol_version INTEGER, schema_version INTEGER`;
   const leaseKindColumn = schemaVersion === 2 ? "" : `,
     kind TEXT NOT NULL DEFAULT 'standard' CHECK (kind IN ('automatic', 'standard', 'exclusive'))`;
-  const automaticPhaseColumn = schemaVersion === 4 ? `,
+  const automaticPhaseColumn = schemaVersion >= 4 ? `,
     automatic_phase TEXT NOT NULL DEFAULT 'working' CHECK (automatic_phase IN ('working', 'awaiting_commit'))` : "";
-  const sessionLifecycleColumns = schemaVersion === 4 ? `,
+  const coordinationStateColumn = schemaVersion >= 5 ? `,
+    coordination_state TEXT NOT NULL DEFAULT 'working' CHECK (coordination_state IN ('working', 'waiting', 'blocked', 'awaiting_commit'))` : "";
+  const sessionLifecycleColumns = schemaVersion >= 4 ? `,
     finalization_id TEXT, finalizing_at TEXT, finalization_error TEXT,
     codex_session_id TEXT, current_turn_id TEXT,
     activity_epoch INTEGER NOT NULL DEFAULT 0, turn_stopped_at TEXT` : "";
-  const hasFinalizationColumn = schemaVersion === 4 || repaired;
+  const hasFinalizationColumn = schemaVersion >= 4 || repaired;
   const finalizationColumn = hasFinalizationColumn ? ", finalization_id TEXT" : "";
   database.exec(`
     PRAGMA foreign_keys = ON;
@@ -118,7 +121,7 @@ function createHistoricalFixture(databasePath, schemaVersion, repaired) {
       updated_at TEXT NOT NULL, completed_at TEXT, completion_summary TEXT, outcome TEXT,
       changed_paths_json TEXT NOT NULL DEFAULT '[]', commit_hash TEXT,
       validations_json TEXT NOT NULL DEFAULT '[]', remaining_risks_json TEXT NOT NULL DEFAULT '[]',
-      handoff TEXT${automaticPhaseColumn}
+      handoff TEXT${automaticPhaseColumn}${coordinationStateColumn}
     );
     CREATE TABLE local_scans (
       id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES work_sessions(id) ON DELETE CASCADE,
@@ -166,12 +169,12 @@ function createHistoricalFixture(databasePath, schemaVersion, repaired) {
     INSERT INTO leases (
       id, room_id, member_id, session_id, title, intent, branch, base_commit, mode,
       ${schemaVersion === 2 ? "" : "kind, "}status, decision, expires_at, created_at, updated_at,
-      changed_paths_json${schemaVersion === 4 ? ", automatic_phase" : ""}
+      changed_paths_json${schemaVersion >= 4 ? ", automatic_phase" : ""}${schemaVersion >= 5 ? ", coordination_state" : ""}
     ) VALUES ('${prefix}-lease', '${prefix}-room', '${prefix}-member', '${prefix}-session',
       'Packaged lease', 'Preserve packaged lease', 'main', 'base-${schemaVersion}', 'write',
       ${schemaVersion === 2 ? "" : "'automatic', "}'active', 'allow', '2099-01-01T00:00:00.000Z',
       '2026-08-20T08:15:00.000Z', '2026-08-20T09:00:00.000Z', '["src/packaged.ts"]'
-      ${schemaVersion === 4 ? ", 'awaiting_commit'" : ""});
+      ${schemaVersion >= 4 ? ", 'awaiting_commit'" : ""}${schemaVersion >= 5 ? ", 'awaiting_commit'" : ""});
     INSERT INTO local_scans (
       id, session_id, room_id, member_id, repository, branch, worktree, base_commit,
       changed_paths_json, rule_files_json, systems_json, metadata_json, scanned_at
@@ -179,7 +182,7 @@ function createHistoricalFixture(databasePath, schemaVersion, repaired) {
     ) VALUES ('${prefix}-scan', '${prefix}-session', '${prefix}-room', '${prefix}-member',
       'C:/packaged/repo', 'main', 'C:/packaged/repo', 'base-${schemaVersion}',
       '["src/packaged.ts"]', '[]', '["packaged-system"]', '{"preserved":true}',
-      '2026-08-20T09:00:00.000Z'${hasFinalizationColumn ? `, '${repaired ? "packaged-manual-repair" : "packaged-schema4"}'` : ""});
+      '2026-08-20T09:00:00.000Z'${hasFinalizationColumn ? `, '${repaired ? "packaged-manual-repair" : `packaged-schema${schemaVersion}`}'` : ""});
     PRAGMA user_version = ${schemaVersion};
   `);
   database.close();
@@ -226,8 +229,8 @@ async function startAndStopPackagedService(dataDirectory) {
         if (
           response.ok
           && health.status === "ok"
-          && health.version === "0.2.6"
-          && health.schemaVersion === 5
+          && health.version === "0.2.7"
+          && health.schemaVersion === 6
           && health.database?.status === "ok"
         ) return;
       } catch {
@@ -246,7 +249,7 @@ async function startAndStopPackagedService(dataDirectory) {
 function validateMigratedDatabase(databasePath, sourceSchemaVersion, repaired) {
   const prefix = `schema${sourceSchemaVersion}`;
   const database = new DatabaseSync(databasePath);
-  assertEqual(database.prepare("PRAGMA user_version").get().user_version, 5, "user_version");
+  assertEqual(database.prepare("PRAGMA user_version").get().user_version, 6, "user_version");
   assertEqual(
     database.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('local_scans') WHERE name = 'finalization_id'").get().count,
     1,
@@ -262,6 +265,16 @@ function validateMigratedDatabase(databasePath, sourceSchemaVersion, repaired) {
     1,
     "coordination_state column count",
   );
+  assertEqual(
+    database.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('leases') WHERE name = 'managed_by'").get().count,
+    1,
+    "managed_by column count",
+  );
+  assertEqual(
+    database.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('leases') WHERE name = 'created_via'").get().count,
+    1,
+    "created_via column count",
+  );
   for (const [table, id] of [
     ["rooms", `${prefix}-room`],
     ["members", `${prefix}-member`],
@@ -274,12 +287,15 @@ function validateMigratedDatabase(databasePath, sourceSchemaVersion, repaired) {
   assertEqual(scan.metadata_json, '{"preserved":true}', "scan metadata");
   assertEqual(
     scan.finalization_id,
-    repaired ? "packaged-manual-repair" : sourceSchemaVersion === 4 ? "packaged-schema4" : null,
+    repaired ? "packaged-manual-repair" : sourceSchemaVersion >= 4 ? `packaged-schema${sourceSchemaVersion}` : null,
     "scan finalization_id",
   );
-  const lease = database.prepare("SELECT automatic_phase, coordination_state FROM leases WHERE id = ?").get(`${prefix}-lease`);
-  assertEqual(lease.automatic_phase, sourceSchemaVersion === 4 ? "awaiting_commit" : "working", "automatic_phase");
-  assertEqual(lease.coordination_state, sourceSchemaVersion === 4 ? "awaiting_commit" : "working", "coordination_state");
+  const lease = database.prepare("SELECT automatic_phase, coordination_state, managed_by, created_via FROM leases WHERE id = ?").get(`${prefix}-lease`);
+  assertEqual(lease.automatic_phase, sourceSchemaVersion >= 4 ? "awaiting_commit" : "working", "automatic_phase");
+  assertEqual(lease.coordination_state, sourceSchemaVersion >= 4 ? "awaiting_commit" : "working", "coordination_state");
+  assertEqual(lease.managed_by, sourceSchemaVersion === 2 ? "manual" : "agent", "managed_by");
+  assertEqual(lease.created_via, "legacy", "created_via");
+  assertAgentLeaseIndex(database);
   assertCodexIdentityIndex(database);
   if (sourceSchemaVersion === 4) {
     const generations = database.prepare(`
@@ -330,8 +346,9 @@ function validateMigratedDatabase(databasePath, sourceSchemaVersion, repaired) {
 
 function validateNewDatabase(databasePath) {
   const database = new DatabaseSync(databasePath);
-  assertEqual(database.prepare("PRAGMA user_version").get().user_version, 5, "new user_version");
+  assertEqual(database.prepare("PRAGMA user_version").get().user_version, 6, "new user_version");
   assertCodexIdentityIndex(database);
+  assertAgentLeaseIndex(database);
   assertEqual(database.prepare("PRAGMA integrity_check").get().integrity_check, "ok", "new integrity_check");
   assertEqual(database.prepare("PRAGMA foreign_key_check").all().length, 0, "new foreign_key_check");
   database.close();
@@ -357,6 +374,29 @@ function assertCodexIdentityIndex(database) {
   assertEqual(
     predicate,
     "codex_session_id is not null and closed_at is null and finalizing_at is null",
+    `${indexName} predicate`,
+  );
+}
+
+function assertAgentLeaseIndex(database) {
+  const indexName = "leases_active_agent_session_idx";
+  const index = database.prepare("PRAGMA index_list('leases')").all()
+    .find((candidate) => candidate.name === indexName);
+  assertEqual(index?.unique, 1, `${indexName} unique flag`);
+  assertEqual(index?.partial, 1, `${indexName} partial flag`);
+  const columns = database.prepare(`PRAGMA index_info('${indexName}')`).all()
+    .map((column) => column.name)
+    .join(",");
+  assertEqual(columns, "room_id,member_id,session_id", `${indexName} columns`);
+  const definition = database.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?
+  `).get(indexName)?.sql;
+  const predicate = typeof definition === "string"
+    ? definition.split(/\bWHERE\b/i).slice(1).join(" WHERE ").replace(/\s+/g, " ").trim().toLowerCase()
+    : "";
+  assertEqual(
+    predicate,
+    "status = 'active' and managed_by = 'agent' and session_id is not null",
     `${indexName} predicate`,
   );
 }
