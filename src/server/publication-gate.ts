@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { resolveGitExecutable } from "../companion/git-executable.js";
 
 const DEFAULT_SHARED_BRANCHES = ["main", "master", "develop", "development", "release/*"];
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -428,7 +429,7 @@ function normalizeTimeout(value: number | undefined): number {
 
 function detectCurrentBranch(): string {
   try {
-    return execFileSync("git", ["branch", "--show-current"], {
+    return execFileSync(resolveGitExecutable(), ["branch", "--show-current"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();

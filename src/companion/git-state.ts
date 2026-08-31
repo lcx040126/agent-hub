@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs";
 import { lstat, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { formatGitExecutionError, resolveGitExecutable } from "./git-executable.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -25,7 +26,7 @@ export async function inspectGitWorkingState(
   selectedPath: string,
   options: GitWorkingStateOptions = {},
 ): Promise<GitWorkingState> {
-  const git = options.gitExecutable ?? "git";
+  const git = resolveGitExecutable(options.gitExecutable);
   const identity = await inspectGitIdentity(selectedPath, options);
   return inspectGitWorkingStateFromIdentity(identity, { gitExecutable: git });
 }
@@ -34,7 +35,7 @@ export async function inspectGitWorkingStateFromIdentity(
   identity: GitIdentity,
   options: GitWorkingStateOptions = {},
 ): Promise<GitWorkingState> {
-  const git = options.gitExecutable ?? "git";
+  const git = resolveGitExecutable(options.gitExecutable);
   const [unstaged, staged, untracked] = await Promise.all([
     safeGit(git, identity.repositoryRoot, ["diff", "--name-only", "-z"]),
     safeGit(git, identity.repositoryRoot, ["diff", "--cached", "--name-only", "-z"]),
@@ -47,7 +48,7 @@ export async function inspectGitIdentity(
   selectedPath: string,
   options: GitWorkingStateOptions = {},
 ): Promise<GitIdentity> {
-  const git = options.gitExecutable ?? "git";
+  const git = resolveGitExecutable(options.gitExecutable);
   const cwd = await realpath(selectedPath);
   const root = await runGit(git, cwd, ["rev-parse", "--show-toplevel"]);
   const repositoryRoot = await realpath(root.trim());
@@ -67,7 +68,7 @@ export async function inspectGitWorkingPaths(
   repositoryPaths: string[],
   options: GitWorkingStateOptions = {},
 ): Promise<GitWorkingState> {
-  const git = options.gitExecutable ?? "git";
+  const git = resolveGitExecutable(options.gitExecutable);
   const identity = await inspectGitIdentity(selectedPath, options);
   return inspectGitWorkingPathsFromIdentity(identity, repositoryPaths, { gitExecutable: git });
 }
@@ -77,7 +78,7 @@ export async function inspectGitWorkingPathsFromIdentity(
   repositoryPaths: string[],
   options: GitWorkingStateOptions = {},
 ): Promise<GitWorkingState> {
-  const git = options.gitExecutable ?? "git";
+  const git = resolveGitExecutable(options.gitExecutable);
   const paths = [...new Set(repositoryPaths.map((value) => value.trim()).filter(Boolean))];
   if (paths.length === 0) return { ...identity, changedPaths: [], changedPathFingerprints: {} };
   const pathspec = ["--", ...paths];
@@ -101,7 +102,7 @@ export async function trackedRepositoryScopes(
   const requested = [...new Set(repositoryPaths.map((value) => value.trim()).filter(Boolean))];
   if (requested.length === 0) return new Set();
   const output = await safeGit(
-    options.gitExecutable ?? "git",
+    resolveGitExecutable(options.gitExecutable),
     identity.repositoryRoot,
     ["ls-files", "-z", "--", ...requested],
   );
@@ -172,7 +173,7 @@ async function runGit(executable: string, cwd: string, args: string[]): Promise<
     });
     return result.stdout;
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
+    const detail = formatGitExecutionError(error, executable);
     throw new Error(`Git command failed in ${cwd}: ${detail}`);
   }
 }

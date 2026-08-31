@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import csharp from "@ast-grep/lang-csharp";
 import { parse, registerDynamicLanguage, type SgNode } from "@ast-grep/napi";
+import { formatGitExecutionError, resolveGitExecutable } from "./git-executable.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_FILE_BYTES = 1_500_000;
@@ -215,12 +216,16 @@ async function runGit(
   args: string[],
   maxBuffer = 16 * 1024 * 1024,
 ): Promise<string> {
-  const { stdout } = await execFileAsync(gitExecutable, ["-C", repositoryPath, ...args], {
-    encoding: "utf8",
-    windowsHide: true,
-    maxBuffer,
-  });
-  return stdout;
+  try {
+    const { stdout } = await execFileAsync(gitExecutable, ["-C", repositoryPath, ...args], {
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer,
+    });
+    return stdout;
+  } catch (error) {
+    throw new Error(formatGitExecutionError(error, gitExecutable), { cause: error });
+  }
 }
 
 async function safeGit(
@@ -433,7 +438,7 @@ export async function inspectRepository(
   selectedPath: string,
   options: InspectRepositoryOptions = {},
 ): Promise<RepositorySnapshot> {
-  const gitExecutable = options.gitExecutable ?? "git";
+  const gitExecutable = resolveGitExecutable(options.gitExecutable);
   const selectedRealPath = await realpath(selectedPath);
   const rootOutput = await runGit(gitExecutable, selectedRealPath, ["rev-parse", "--show-toplevel"]);
   const repositoryRoot = await realpath(rootOutput.trim());

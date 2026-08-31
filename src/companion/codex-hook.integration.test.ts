@@ -135,7 +135,7 @@ describe("Codex hook integration", () => {
         tool_input: { command: patchCommand },
       }),
     )).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     const preState = (await stateStore.load(fixture.sessionId))!;
     expect(preState).toMatchObject({
@@ -184,7 +184,7 @@ describe("Codex hook integration", () => {
         tool_input: { command: cleanupCommand },
       }),
     )).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(prepareBodies.at(-1)).toMatchObject({
       paths: [],
@@ -231,7 +231,7 @@ describe("Codex hook integration", () => {
           command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch",
         },
       }),
-    )).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    )).resolves.toMatchObject({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
 
     expect((await stateStore.load(fixture.sessionId))?.leases).toEqual([]);
   }, 20_000);
@@ -493,7 +493,7 @@ describe("Codex hook integration", () => {
       },
     }));
     expect(offlineExplicitWrite).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(JSON.stringify(offlineExplicitWrite)).toContain("暂时无法连接");
     failPrepare = false;
@@ -585,7 +585,7 @@ describe("Codex hook integration", () => {
         command: "*** Begin Patch\n*** Update File: src/value.ts\n@@\n-export const value = 1;\n+export const value = 2;\n*** End Patch",
       },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(fixture.service.listRoomSessions(fixture.room.memberToken).sessions).toEqual(
       expect.arrayContaining([expect.objectContaining({
@@ -706,7 +706,7 @@ describe("Codex hook integration", () => {
         command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch",
       },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(prepareSessionIds.at(-1)).toBe(adopted.hubSessionId);
   }, 20_000);
@@ -751,7 +751,7 @@ describe("Codex hook integration", () => {
         command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch",
       },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     const adopted = (await stateStore.load(fixture.sessionId))!;
     expect(adopted.hubSessionId).not.toBe(oldState.hubSessionId);
@@ -909,7 +909,7 @@ describe("Codex hook integration", () => {
         turn_id: turnId,
         tool_name: "apply_patch",
         tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
-      }))).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+      }))).resolves.toMatchObject({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
       await handleCodexHook(options("PostToolUse"), fixture.input("PostToolUse", {
         turn_id: turnId,
         tool_name: "apply_patch",
@@ -968,7 +968,7 @@ describe("Codex hook integration", () => {
         command: "*** Begin Patch\n*** Update File: src/value.ts\n@@\n-export const value = 1;\n+export const value = 2;\n*** End Patch",
       },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(promptAttempts).toBe(1);
     expect(prepareAttempts).toBe(2);
@@ -1046,7 +1046,7 @@ describe("Codex hook integration", () => {
     })).resolves.toBe(0);
     const allowed = JSON.parse(output) as Record<string, unknown>;
     expect(allowed).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(JSON.stringify(allowed)).toContain("权威恢复未完成");
     expect(prepareAttempts).toBe(2);
@@ -1113,7 +1113,7 @@ describe("Codex hook integration", () => {
       stdout,
     })).resolves.toBe(0);
     expect(JSON.parse(output)).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(output).toContain("权威恢复未完成");
   }, 20_000);
@@ -1233,7 +1233,7 @@ describe("Codex hook integration", () => {
       },
     }));
     expect(firstWrite).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     const pendingState = (await stateStore.load(fixture.sessionId))!;
     expect(pendingState).toMatchObject({ pendingWrite: { toolName: "apply_patch" } });
@@ -1354,7 +1354,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: ownedCommand },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     const ownedState = (await stateStore.load(fixture.sessionId))!;
     expect(ownedState.leases).toHaveLength(1);
@@ -1460,7 +1460,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: completedCommand },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     await writeFile(path.join(fixture.repository, "src", "value.ts"), "export const value = 2;\n", "utf8");
 
@@ -1546,7 +1546,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: ownedCommand },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     await handleCodexHook(options("PostToolUse"), fixture.input("PostToolUse", {
       turn_id: turnId,
@@ -1660,7 +1660,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     const claimedState = (await stateStore.load(fixture.sessionId))!;
     expect(claimedState.leases).toHaveLength(1);
@@ -1826,7 +1826,7 @@ describe("Codex hook integration", () => {
       },
     }));
     expect(reclaimed).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     const reclaimedState = (await stateStore.load(fixture.sessionId))!;
     expect(reclaimedState.passiveWriteBlock).toBeUndefined();
@@ -1900,7 +1900,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: partialCommand },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     await expect(stateStore.load(fixture.sessionId)).resolves.toMatchObject({
       passiveWriteBlock: {
@@ -1933,7 +1933,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: fullCommand },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect((await stateStore.load(fixture.sessionId))!.passiveWriteBlock).toBeUndefined();
   }, 30_000);
@@ -2170,7 +2170,6 @@ describe("Codex hook integration", () => {
 
     expect(JSON.parse(output)).toMatchObject({
       hookSpecificOutput: {
-        permissionDecision: "allow",
         additionalContext: expect.stringContaining("退出清理"),
       },
     });
@@ -2217,7 +2216,6 @@ describe("Codex hook integration", () => {
 
     expect(JSON.parse(output)).toMatchObject({
       hookSpecificOutput: {
-        permissionDecision: "allow",
         additionalContext: expect.stringContaining("不会被 Agent Hub 阻止"),
       },
     });
@@ -2285,7 +2283,7 @@ describe("Codex hook integration", () => {
       tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
     });
     expect(pre).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     const resuming = (await stateStore.load("resume-unconfirmed-session"))!;
     expect(resuming.pendingCompletion).toMatchObject({
@@ -2986,7 +2984,7 @@ describe("Codex hook integration", () => {
         tool_input: { command: "*** Begin Patch\n*** Add File: src/reopened.ts\n*** End Patch" },
       }),
     )).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
 
     const finalizer = startSessionEndFinalizationWorker({
@@ -3109,7 +3107,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command },
     }))).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     await runGit(repository, ["restore", "--", "src/value.ts"]);
     await rm(path.join(repository, "src", "preexisting.ts"));
@@ -3315,7 +3313,7 @@ describe("Codex hook integration", () => {
       }),
     );
     expect(addBaz).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
 
     const updateBarCommand = [
@@ -3383,7 +3381,7 @@ describe("Codex hook integration", () => {
       }),
     );
     expect(protectedRetry).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
 
     const preEdit = await handleCodexHook(
@@ -3396,11 +3394,10 @@ describe("Codex hook integration", () => {
     expect(
       (preEdit?.hookSpecificOutput as Record<string, unknown> | undefined)?.permissionDecision,
       JSON.stringify(preEdit),
-    ).toBe("allow");
+    ).toBeUndefined();
     expect(preEdit).toMatchObject({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "allow",
       },
     });
     expect(service.getDashboard(room.memberToken).leases).toEqual(
@@ -3460,7 +3457,6 @@ describe("Codex hook integration", () => {
     expect(preGenerator).toMatchObject({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "allow",
       },
     });
     await writeFile(path.join(repository, "src", "generated.ts"), "export const generated = true;\n", "utf8");
@@ -3489,7 +3485,6 @@ describe("Codex hook integration", () => {
     expect(nextWrite).toMatchObject({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "allow",
       },
     });
     expect(service.getDashboard(room.memberToken).records).not.toEqual(
@@ -3562,7 +3557,7 @@ describe("Codex hook integration", () => {
       tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
     }));
     expect(redWarning).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(JSON.stringify(redWarning)).toContain("提醒");
     await writeFile(path.join(fixture.repository, "src", "value.ts"), "export const value = 2;\n", "utf8");
@@ -3777,7 +3772,7 @@ describe("Codex hook integration", () => {
       writeInput("PreToolUse"),
     );
     expect(unchangedPre).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(unchangedPreFetch.settingsReads()).toBe(2);
 
@@ -3787,7 +3782,7 @@ describe("Codex hook integration", () => {
       writeInput("PreToolUse"),
     );
     expect(offlinePre).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(offlinePreFetch.settingsReads()).toBe(2);
 
@@ -3797,7 +3792,7 @@ describe("Codex hook integration", () => {
       writeInput("PreToolUse"),
     );
     expect(disabledPre).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(disabledPreFetch.settingsReads()).toBe(2);
 
@@ -3807,7 +3802,7 @@ describe("Codex hook integration", () => {
       writeInput("PreToolUse"),
     );
     expect(disabledAfterError).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     expect(disabledAfterErrorFetch.settingsReads()).toBe(2);
 
@@ -3858,7 +3853,7 @@ describe("Codex hook integration", () => {
       tool_name: "Bash",
       tool_input: { command: "pnpm run generate" },
     }));
-    expect(pathless).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    expect(pathless).toMatchObject({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
 
     const tooManyPatch = [
       "*** Begin Patch",
@@ -3870,7 +3865,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: tooManyPatch },
     }));
-    expect(overflowPre).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    expect(overflowPre).toMatchObject({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
     expect(JSON.stringify(overflowPre)).toContain("101");
 
     await handleCodexHook(options("PreToolUse"), fixture.input("PreToolUse", {
@@ -3903,7 +3898,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: "*** Begin Patch\n*** Update File: src/foo.ts\n*** End Patch" },
     }));
-    expect(branchWarning).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    expect(branchWarning).toMatchObject({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
 
     const staleFetch = vi.fn<typeof fetch>((request, init) => {
       const pathname = new URL(request instanceof Request ? request.url : String(request)).pathname;
@@ -3921,7 +3916,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: "*** Begin Patch\n*** Update File: src/protected.ts\n*** End Patch" },
     }));
-    expect(staleWarning).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    expect(staleWarning).toMatchObject({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
 
     const stateBeforeFence = (await stateStore.load(fixture.sessionId))!;
     await new TurnCompletionQueueStore(fixture.userDataPath).enqueue({
@@ -3935,7 +3930,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
     }));
-    expect(stopFenceWarning).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    expect(stopFenceWarning).toMatchObject({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
 
     for (const status of [401, 409]) {
       const settingsFailure = vi.fn<typeof fetch>(async (request, init) => {
@@ -3953,7 +3948,7 @@ describe("Codex hook integration", () => {
         tool_name: "apply_patch",
         tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
       }));
-      expect(allowed).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+      expect(allowed).toMatchObject({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
     }
 
     const [stateFile] = await readdir(stateStore.directory);
@@ -3962,7 +3957,7 @@ describe("Codex hook integration", () => {
       tool_name: "apply_patch",
       tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },
     }));
-    expect(damagedPre).toMatchObject({ hookSpecificOutput: { permissionDecision: "allow" } });
+    expect(damagedPre).toMatchObject({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
     const damagedPost = await handleCodexHook(options("PostToolUse"), fixture.input("PostToolUse", {
       tool_name: "apply_patch",
       tool_input: { command: "*** Begin Patch\n*** Update File: src/value.ts\n*** End Patch" },

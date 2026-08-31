@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { formatGitExecutionError, resolveGitExecutable } from "./git-executable.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
@@ -49,7 +50,7 @@ export async function collectFeatureGitEvidence(
   baseCommit: string,
   options: CollectFeatureEvidenceOptions = {},
 ): Promise<FeatureGitEvidence> {
-  const git = options.gitExecutable ?? "git";
+  const git = resolveGitExecutable(options.gitExecutable);
   const root = path.resolve(repositoryRoot);
   const includedPathKeys = options.includePaths === undefined
     ? undefined
@@ -223,7 +224,7 @@ async function runGit(executable: string, cwd: string, args: string[]): Promise<
     });
     return result.stdout;
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
+    const detail = formatGitExecutionError(error, executable);
     throw new Error(`Git evidence command failed in ${cwd}: ${detail}`);
   }
 }

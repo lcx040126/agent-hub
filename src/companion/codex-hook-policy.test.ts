@@ -59,7 +59,7 @@ describe("Codex Hook monitor-only policy", () => {
     })).toBe(true);
   });
 
-  it("normalizes every unmarked PreToolUse denial to allow", () => {
+  it("normalizes every unmarked PreToolUse denial to a context-only warning", () => {
     const result = enforceWriteHookPolicy("PreToolUse", {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -71,9 +71,10 @@ describe("Codex Hook monitor-only policy", () => {
     expect(result).toMatchObject({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "allow",
+        additionalContext: expect.stringContaining("Agent Hub 风险提醒"),
       },
     });
+    expect(result?.hookSpecificOutput).not.toHaveProperty("permissionDecision");
     expect(JSON.stringify(result)).toContain("local state is damaged");
   });
 
@@ -115,9 +116,11 @@ describe("Codex Hook monitor-only policy", () => {
     expect(enforceWriteHookPolicy("PreToolUse", blocked, monitorPolicy)).toMatchObject({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "allow",
+        additionalContext: expect.stringContaining("Agent Hub 风险提醒"),
       },
     });
+    expect(enforceWriteHookPolicy("PreToolUse", blocked, monitorPolicy)?.hookSpecificOutput)
+      .not.toHaveProperty("permissionDecision");
     expect(requiresAuthoritativeModeRecheck("PreToolUse", blocked)).toBe(true);
   });
 

@@ -706,6 +706,9 @@ v0.2.8 已确认更新（源码候选，2026-08-29）
 - 增加桌面代理成功读取、分页参数和未知参数拒绝测试，保持未知 GET 路由、路径编码和敏感参数保护不变。
 - 精简未领取租期的实时会话行：移除常驻的 Codex Session ID、Hub Session ID 和当前 Turn ID，并隐藏包含完整 ID 的自动生成 `Codex session <ID>` 占位文案；成员、客户端、分支、`activityEpoch` 和真实任务描述继续显示。
 - 三类 ID、缩略显示和复制入口统一保留在领取租期后的任务卡中；历史调用归因继续保存对应 Turn ID。本次只调整展示层，不删除或改变会话、租约及审计数据。
+- 修复 Codex 当前 Hook 协议不接受不带 `updatedInput` 的 `PreToolUse permissionDecision: "allow"`：允许执行并附带提示时改为仅返回 `additionalContext`，避免 Hook 被标记为错误并丢失风险提示；真实 `deny`、纯监测模式放行、租约和审计语义保持不变。
 - 包版本候选更新为 `0.2.8`，protocol 保持 `2`，schema 保持 `6`；发布说明位于 `docs/releases/v0.2.8.md`。
 - 两套 TypeScript 检查、62 个测试文件共 611 项串行全量测试、生产构建和 `git diff --check` 通过；1264x710 桌面与 390x844 窄屏本地界面确认实时会话行不显示 ID、租期任务卡继续显示 ID，且布局无横向溢出。
 - 本轮仅创建 v0.2.8 本地功能提交，不推送、不打标签、不发布；NSIS 安装包、签名清单、正式安装覆盖升级和双机验收待后续验证。
+- 修复桌面端 `spawn git ENOENT`：Agent Hub 统一解析 Git 可执行文件，按显式配置、PATH、Windows 标准安装目录和 UGit 内置 Git 目录依次探测，并在缺失时返回可操作诊断。
+- Git 路径解析接入本地项目选择、仓库扫描、Hook 归因、Stop/SessionEnd/TurnCompletion 证据和其他生产 Git 调用；不改变租约、MCP、Hook、纯监测模式、protocol 或 schema 语义。

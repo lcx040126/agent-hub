@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { formatGitExecutionError, resolveGitExecutable } from "./git-executable.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -43,7 +44,7 @@ export async function collectAttributedPathEvidence(
   attributedPaths: string[],
   options: CollectAttributedPathEvidenceOptions = {},
 ): Promise<AttributedPathEvidence[]> {
-  const git = options.gitExecutable ?? "git";
+  const git = resolveGitExecutable(options.gitExecutable);
   const timeoutMs = options.timeoutMs ?? 5_000;
   const paths = concretePaths(attributedPaths);
   return Promise.all(paths.map(async (relativePath) => {
@@ -63,7 +64,7 @@ export async function evaluateTurnCompletionEvidence(
   input: TurnCompletionEvidenceInput,
   options: CollectAttributedPathEvidenceOptions = {},
 ): Promise<TurnCompletionEvidenceResult> {
-  const git = options.gitExecutable ?? "git";
+  const git = resolveGitExecutable(options.gitExecutable);
   const timeoutMs = options.timeoutMs ?? 5_000;
   const attributedPaths = concretePaths(input.attributedPaths);
   if (
@@ -240,7 +241,7 @@ async function runGit(
     });
     return result.stdout;
   } catch (error) {
-    throw new Error(`Git completion check failed in ${cwd}: ${errorMessage(error)}`, { cause: error });
+    throw new Error(`Git completion check failed in ${cwd}: ${formatGitExecutionError(error, executable)}`, { cause: error });
   }
 }
 

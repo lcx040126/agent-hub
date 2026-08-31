@@ -93,7 +93,6 @@ export function failOpenWriteHookOutput(
     return {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "allow",
         additionalContext: warning,
       },
     };

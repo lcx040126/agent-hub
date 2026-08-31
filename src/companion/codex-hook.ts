@@ -2429,10 +2429,10 @@ function appendMonitorDiagnostic(
 
 function allowOutput(additionalContext?: string): Record<string, unknown> | undefined {
   if (!additionalContext) return undefined;
+  // Codex reserves permissionDecision=allow for calls that also provide updatedInput.
   return {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
-      permissionDecision: "allow",
       additionalContext,
     },
   };
