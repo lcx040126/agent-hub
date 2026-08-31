@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import express from "express";
 import { createAgentHubApp } from "./app.js";
+import { startActivityRetentionScheduler } from "./activity-retention.js";
 import type { AgentHubDatabase } from "./db.js";
 import { UpdateCoordinator } from "./update-coordinator.js";
 
@@ -68,6 +69,21 @@ export async function startAgentHubServer(
   const address = server.address() as AddressInfo;
   const port = address.port;
   const database = app.locals.agentHubDatabase as AgentHubDatabase;
+  const activityRetention = startActivityRetentionScheduler({
+    database,
+    onReport: (report) => {
+      for (const stat of report.stats) {
+        console.info(
+          `[agent-hub] activity cleanup room=${stat.roomId} type=${stat.activityType} deleted=${stat.deleted} before=${stat.cutoffAt}`,
+        );
+      }
+      for (const failure of report.failures) {
+        console.warn(
+          `[agent-hub] activity cleanup deferred room=${failure.roomId} type=${failure.activityType}: ${failure.error}`,
+        );
+      }
+    },
+  });
 
   return {
     server,
@@ -75,6 +91,7 @@ export async function startAgentHubServer(
     port,
     localUrl: `http://127.0.0.1:${port}`,
     async close() {
+      await activityRetention.stop();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
