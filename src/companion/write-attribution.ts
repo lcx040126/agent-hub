@@ -38,9 +38,13 @@ export function extractAttributedWriteIntent(
   if (toolName === "apply_patch") return extractPatchIntent(command);
   if (toolName !== "Bash" || !isPotentialWriteCommand(command)) return emptyIntent();
 
-  const parsed = parsePowerShellWriteTargets(command);
-  const pathCandidates = parsed.pathCandidates;
   const attributedSideEffects = KNOWN_SIDE_EFFECT_COMMAND.test(command);
+  // 构建器、生成器与格式化器的真实输出只能由 PostToolUse Git 差异确认，
+  // 对这类纯副作用命令启动 PowerShell AST 既得不到路径，也会把冷启动超时误报为路径诊断。
+  const parsed = requiresPowerShellPathParsing(command)
+    ? parsePowerShellWriteTargets(command)
+    : { pathCandidates: [], targets: [], diagnostics: [] };
+  const pathCandidates = parsed.pathCandidates;
   const targets = parsed.targets.map((target) => ({
     pathCandidate: target.pathCandidate,
     operation: attributedSideEffects ? "generate" as const : target.operation,
@@ -156,6 +160,10 @@ function isPotentialWriteCommand(command: string): boolean {
     || /(?:^|\s)(?:npm|pnpm|yarn)\s+(?:install|add|remove|uninstall|update|run\s+(?:build|generate|gen|format))(?:\s|$)/i.test(command)
     || KNOWN_SIDE_EFFECT_COMMAND.test(command)
     || /(^|[^<>])>{1,2}(?!=)/m.test(command);
+}
+
+function requiresPowerShellPathParsing(command: string): boolean {
+  return SHELL_WRITE_COMMAND.test(command) || /(^|[^<>])>{1,2}(?!=)/m.test(command);
 }
 
 function resourcePrecision(pathCandidate: string): EditPrecision {

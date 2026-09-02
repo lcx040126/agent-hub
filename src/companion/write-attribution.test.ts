@@ -218,6 +218,16 @@ describe("Agent write attribution", () => {
     expect(result.external).toEqual([]);
   });
 
+  it("keeps package builds pathless without PowerShell parser diagnostics", () => {
+    expect(extractAttributedWriteIntent("Bash", { command: "pnpm run build" })).toMatchObject({
+      writes: true,
+      pathCandidates: [],
+      targets: [],
+      attributedSideEffects: true,
+      pathDiagnostics: [],
+    });
+  });
+
   it("attributes a tracked dirty path that the tool restores to clean", () => {
     const result = attributedChangedPaths(
       {
