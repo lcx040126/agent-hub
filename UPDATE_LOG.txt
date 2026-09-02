@@ -730,3 +730,12 @@ v0.2.8 房间重启后的远程清理恢复优化（源码候选，2026-09-02）
 - `pause-retry.json` 继续使用兼容的版本 1 文档，仅增加可选诊断字段；不新增远程 REST/MCP、数据库字段、protocol 或 schema，protocol 保持 `2`，schema 保持 `6`。
 - 房间解散、凭证失效或成员被移除时，界面引导从本机安全移除旧连接并使用房主最新邀请重新加入；不会引导用户手工删除恢复文件。
 - 自动化覆盖旧恢复文件读取、诊断分类、固定请求身份、单连接强制重试去重、跨房间隔离、等待期间不激活接入及恢复成功后的正式激活。发布前另修复 pathless 构建/生成命令无意义启动 PowerShell AST、在 Windows CI 冷启动超时时污染保护诊断的问题；真实变化继续由 PostToolUse Git 差异归因。两套 TypeScript 检查、64 个测试文件共 636 项串行测试、生产构建和 `git diff --check` 通过；异常断电、房主 IP 变化和真实双机恢复仍需单独实机验收。
+
+v0.2.8 正式发布审计（2026-09-02）
+
+- 最终实现提交 `246c98a528b2062c2804e7c9a7efbca3777581f3` 已推送到 `main`；annotated tag `v0.2.8` 固定指向该提交并已推送，发布后未移动标签。
+- 主分支 CI `33612178028` 成功。标签 CI `33612398249` 首次运行中，一项 PowerShell AST 测试因冷启动刚好超过 5 秒而超时；未修改提交或标签，同一提交的失败任务重跑后成功，64 个测试文件共 636 项测试全部通过。Windows Release `33612398305` 成功完成版本与发布说明门禁、两套 TypeScript 检查、串行全量测试、NSIS 打包、更新恢复探针、打包数据库迁移探针、Ed25519 更新清单签名、校验和生成和六项资产上传。
+- GitHub Release `381115429` 已于 `2026-09-02 17:20:02`（Asia/Shanghai）正式公开并设为 Latest：[Agent Hub v0.2.8](https://github.com/lcx040126/agent-hub/releases/tag/v0.2.8)。Release 正文与标签提交中的 `docs/releases/v0.2.8.md` 在统一换行后完全一致；发布页和六项正式资产的公开下载地址均返回 HTTP 200。
+- 六项资产与 GitHub digest、本地重新计算的 SHA-256 和 `SHA256SUMS.txt` 交叉一致：`AgentHub-Setup-0.2.8-x64.exe` 为 119,789,198 字节，SHA-256 `e2e2f574e84b9f90c8958b4c4113966a94f57e85717da7d5bb4da66db88181e5`；`.exe.blockmap` 为 126,133 字节，SHA-256 `902c3953b9be5fac3d4f038e04bd33c9cf57b525950bd40cf89d03cceb97aa24`；`latest.yml` 为 353 字节，SHA-256 `d279b8b5a3b2547dd911ec1598b50aa1f4cf2fb77e4a5a4ca2546def1ef68b39`；`agent-hub-update.json` 为 6,744 字节，SHA-256 `512e17f8701f18e55b0925cff9a380f14f63aa9a30c99550cb90e543d959cdbe`；`agent-hub-update.sig` 为 89 字节，SHA-256 `cc18a8673efaabef742bb3f7d1b8af00c1f3476fba64d802dfac3adc433a5000`；`SHA256SUMS.txt` 为 456 字节，SHA-256 `7e7fd3aa11c4cbd3bd36e58204e0dcc72fd8878a3de7c442e6641f780688a6f8`。
+- Ed25519 更新清单验签通过；清单确认版本/protocol/schema/最低来源为 `0.2.8/2/6/1/2`，安装包名称、正式 URL、大小、SHA-256 和发布说明均匹配。`latest.yml` 指向正式安装包，大小一致，安装包 SHA-512 为 `uVTSlzusg/abrdaagSm53HwajxrkdLcDVy9XaRsqkfh8gOzlw+4O8mcjlw+AmIy9uxaGE2c/2BHpDrWBOAqqpg==`。
+- 本次没有覆盖本机正式安装目录，也没有修改或清理 `%APPDATA%\agent-hub` 用户数据。v0.2.7 正式安装目录覆盖升级、真实 Codex 多轮任务、真实租约范围历史界面、仅存在 UGit 内置 Git 的隔离环境、异常断电/IP 变化恢复和真实双机协作仍是独立实机验收边界；安装程序仍未进行商业代码签名，Windows 可能显示未知发布者提示。
