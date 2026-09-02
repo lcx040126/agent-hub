@@ -74,11 +74,53 @@ export interface PauseRoomConnectionResult {
   localRoomServerStopped: boolean;
 }
 
-export interface ActivateRoomConnectionResult {
+export type RoomCleanupFailureKind =
+  | "unreachable"
+  | "timeout"
+  | "unauthorized"
+  | "member_removed"
+  | "room_dissolved"
+  | "incompatible"
+  | "invalid_response"
+  | "local"
+  | "unknown";
+
+export type RoomConnectionRecoveryStatus =
+  | {
+      status: "ready";
+      connectionId: string;
+      serverUrl: string;
+    }
+  | {
+      status: "waiting-cleanup";
+      connectionId: string;
+      serverUrl: string;
+      phase: "local-drain" | "remote-cleanup";
+      attempts: number;
+      nextAttemptAt?: string;
+      lastError?: string;
+      failureKind: RoomCleanupFailureKind;
+      retryable: boolean;
+    };
+
+export interface ActivatedRoomConnectionResult {
+  status: "activated";
   connection: SavedRoomConnection;
   pausedConnectionIds: string[];
   warnings: string[];
 }
+
+export interface WaitingRoomConnectionResult {
+  status: "waiting-cleanup";
+  connection: SavedRoomConnection;
+  pausedConnectionIds: string[];
+  warnings: string[];
+  recovery: Extract<RoomConnectionRecoveryStatus, { status: "waiting-cleanup" }>;
+}
+
+export type ActivateRoomConnectionResult =
+  | ActivatedRoomConnectionResult
+  | WaitingRoomConnectionResult;
 
 export interface DeleteRoomConnectionResult {
   deletedConnectionId: string;
@@ -136,6 +178,8 @@ export interface AgentHubDesktopApi {
   listRoomConnections(): Promise<SavedRoomConnection[]>;
   pauseRoomConnection(connectionId: string): Promise<PauseRoomConnectionResult>;
   activateRoomConnection(connectionId: string): Promise<ActivateRoomConnectionResult>;
+  getRoomConnectionRecoveryStatus(connectionId: string): Promise<RoomConnectionRecoveryStatus>;
+  retryRoomConnectionCleanup(connectionId: string): Promise<RoomConnectionRecoveryStatus>;
   deleteRoomConnection(connectionId: string): Promise<DeleteRoomConnectionResult>;
   requestRoomServer(input: RoomServerRequestInput): Promise<RoomServerResponse>;
   installCodexIntegration(connectionId: string): Promise<CodexInstallResult>;
@@ -156,6 +200,8 @@ export const DESKTOP_IPC = {
   listRoomConnections: "agent-hub:list-room-connections",
   pauseRoomConnection: "agent-hub:pause-room-connection",
   activateRoomConnection: "agent-hub:activate-room-connection",
+  getRoomConnectionRecoveryStatus: "agent-hub:get-room-connection-recovery-status",
+  retryRoomConnectionCleanup: "agent-hub:retry-room-connection-cleanup",
   deleteRoomConnection: "agent-hub:delete-room-connection",
   requestRoomServer: "agent-hub:request-room-server",
   installCodexIntegration: "agent-hub:install-codex-integration",

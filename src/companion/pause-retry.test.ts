@@ -2,7 +2,12 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PauseRetryQueue, requestMemberPause } from "./pause-retry.js";
+import { AgentHubHttpError } from "./hub-client.js";
+import {
+  PauseRetryQueue,
+  pauseFailureDiagnostic,
+  requestMemberPause,
+} from "./pause-retry.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -29,6 +34,9 @@ describe("pause retry queue", () => {
       requestId: "pause-a",
       attempts: 1,
       lastError: "Member removed.",
+      lastFailureKind: "member_removed",
+      lastErrorCode: "member_removed",
+      lastHttpStatus: 403,
     }]);
     expect(onError).toHaveBeenCalledOnce();
   });
@@ -51,6 +59,77 @@ describe("pause retry queue", () => {
     expect(pending).toHaveLength(1);
     expect(pending[0]).toMatchObject({ requestId: "retry-me", attempts: 1 });
     expect(onError).toHaveBeenCalledOnce();
+  });
+
+  it("reads legacy version-one entries without optional diagnostics", async () => {
+    const directory = await temporaryDirectory();
+    const filePath = path.join(directory, "pause-retry.json");
+    await writeFile(filePath, JSON.stringify({
+      version: 1,
+      requests: [{
+        version: 1,
+        ...entry(),
+        attempts: 7,
+        nextAttemptAt: "2026-08-27T00:05:00.000Z",
+        lastError: "Agent Hub did not respond within 10000 ms.",
+      }],
+    }), "utf8");
+    const queue = new PauseRetryQueue({ filePath, store: createStore() });
+
+    await expect(queue.list()).resolves.toMatchObject([{
+      requestId: "pause-a",
+      attempts: 7,
+      lastFailureKind: undefined,
+    }]);
+  });
+
+  it("forces one connection immediately and deduplicates concurrent clicks", async () => {
+    const directory = await temporaryDirectory();
+    let releaseRequest: (() => void) | undefined;
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
+      await new Promise<void>((resolve) => { releaseRequest = resolve; });
+      return response(200, pauseResponseFromRequest(init));
+    });
+    const queue = new PauseRetryQueue({
+      filePath: path.join(directory, "pause-retry.json"),
+      store: createStore(),
+      fetchImpl,
+      now: () => new Date("2026-08-27T00:00:00.000Z"),
+    });
+    await queue.enqueue(entry({ requestId: "fixed-identity" }));
+    await queue.defer("fixed-identity", new Error("Agent Hub did not respond within 10000 ms."));
+
+    const first = queue.flush({ onlyConnectionId: "connection-a", force: true });
+    const second = queue.flush({ onlyConnectionId: "connection-a", force: true });
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce());
+    expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body))).toMatchObject({
+      requestId: "fixed-identity",
+      cutoffAt: "2026-08-27T00:00:00.000Z",
+    });
+    releaseRequest?.();
+    await Promise.all([first, second]);
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    await expect(queue.list()).resolves.toEqual([]);
+  });
+
+  it("does not automatically repeat terminal diagnostics but permits an explicit retry", async () => {
+    const directory = await temporaryDirectory();
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      response(403, { error: "member_removed", message: "Member removed." }));
+    const queue = new PauseRetryQueue({
+      filePath: path.join(directory, "pause-retry.json"),
+      store: createStore(),
+      fetchImpl,
+      now: () => new Date("2026-08-27T00:00:00.000Z"),
+    });
+    await queue.enqueue(entry());
+    await queue.flush();
+    await queue.flush();
+    expect(fetchImpl).toHaveBeenCalledOnce();
+
+    await queue.flush({ onlyConnectionId: "connection-a", force: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   it("retains protected requests while flushing other due cleanup", async () => {
@@ -201,6 +280,20 @@ describe("pause retry queue", () => {
       now: () => new Date("2026-08-27T00:00:00.000Z"),
       fetchImpl: async () => response(200, withoutRole),
     })).rejects.toThrow("invalid member pause response: memberRole must be host or member");
+  });
+});
+
+describe("pause failure diagnostics", () => {
+  it.each([
+    [new Error("Agent Hub did not respond within 10000 ms."), "timeout"],
+    [new Error("connect ECONNREFUSED 10.0.0.2"), "unreachable"],
+    [new AgentHubHttpError(401, "unauthorized", "Invalid token."), "unauthorized"],
+    [new AgentHubHttpError(403, "member_removed", "Member removed."), "member_removed"],
+    [new AgentHubHttpError(410, "room_dissolved", "Room dissolved."), "room_dissolved"],
+    [new AgentHubHttpError(409, "protocol_incompatible", "Upgrade required."), "incompatible"],
+    [new AgentHubHttpError(200, "invalid_response", "Invalid JSON."), "invalid_response"],
+  ])("classifies %s as %s", (error, expected) => {
+    expect(pauseFailureDiagnostic(error).kind).toBe(expected);
   });
 });
 

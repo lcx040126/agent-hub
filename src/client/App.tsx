@@ -55,6 +55,7 @@ import {
   downloadDesktopUpdate,
   getDashboard,
   getLeaseScopeEvents,
+  getSavedConnectionRecoveryStatus,
   getDesktopUpdateStatus,
   installDesktopUpdate,
   manageMember,
@@ -73,6 +74,7 @@ import {
   loadSession,
   renewLease,
   resumeSavedConnection,
+  retrySavedConnectionCleanup,
   pauseSavedConnection,
   saveSession,
   secureDesktopSession,
@@ -89,6 +91,7 @@ import {
   type ProjectRecord,
   type RecordKind,
   type ReleaseRequest,
+  type RoomConnectionRecoveryStatus,
   type RiskRule,
   type RoomSettings,
   type SavedRoomConnection,
@@ -575,15 +578,24 @@ export function SavedConnectionList({
   openingConnectionId,
   deletingConnectionId,
   notice,
+  recoveries,
+  retryingConnectionId,
   onOpen,
   onDelete,
+  onRetryCleanup,
 }: {
   connections: SavedRoomConnection[];
   openingConnectionId?: string;
   deletingConnectionId?: string;
   notice?: { connectionId: string; notice: Notice } | null;
+  recoveries?: Readonly<Record<
+    string,
+    Extract<RoomConnectionRecoveryStatus, { status: "waiting-cleanup" }>
+  >>;
+  retryingConnectionId?: string;
   onOpen: (connection: SavedRoomConnection) => void;
   onDelete: (connection: SavedRoomConnection) => void;
+  onRetryCleanup?: (connection: SavedRoomConnection) => void;
 }) {
   return (
     <div className="saved-connection-list">
@@ -593,6 +605,7 @@ export function SavedConnectionList({
         const deleting = deletingConnectionId === connection.id;
         const rowBusy = opening || deleting;
         const rowNotice = notice?.connectionId === connection.id ? notice.notice : null;
+        const rowRecovery = recoveries?.[connection.id] ?? null;
         return (
           <div className="saved-connection-item" key={connection.id}>
             <div className="saved-connection-row">
@@ -625,9 +638,81 @@ export function SavedConnectionList({
                 <span>{rowNotice.message}</span>
               </div>
             )}
+            {rowRecovery && (
+              <RoomRecoveryPanel
+                recovery={rowRecovery}
+                retrying={retryingConnectionId === connection.id}
+                onRetry={() => onRetryCleanup?.(connection)}
+              />
+            )}
           </div>
         );
       })}
+    </div>
+  );
+}
+
+export function roomRecoveryGuidance(
+  recovery: Extract<RoomConnectionRecoveryStatus, { status: "waiting-cleanup" }>,
+): string {
+  if (recovery.phase === "local-drain") {
+    return "Agent Hub 正在完成本机操作收尾。旧清理完成前不会启用 Hook 或 MCP。";
+  }
+  switch (recovery.failureKind) {
+    case "timeout":
+    case "unreachable":
+      return "房间服务器暂时无法访问。请确认房主已启动 Agent Hub、地址和端口未变化，并检查局域网或防火墙。";
+    case "unauthorized":
+      return "当前成员凭证已失效。请联系房主确认成员状态，再从本机移除旧连接并使用最新邀请重新加入。";
+    case "member_removed":
+      return "当前成员已被房主移除。请联系房主确认后，从本机移除旧连接并使用最新邀请重新加入。";
+    case "room_dissolved":
+      return "远端房间已解散，可以安全地从本机移除这条旧连接。";
+    case "incompatible":
+    case "invalid_response":
+      return "房主与成员客户端的响应版本可能不兼容。请双方升级到相同版本后再重试。";
+    case "local":
+      return "本机恢复记录暂时无法读取或更新。请重启 Agent Hub；若仍失败，请保留本机连接并检查应用数据目录权限。";
+    default:
+      return "旧清理仍在等待房间服务器确认。Agent Hub 会继续保留安全边界并自动重试。";
+  }
+}
+
+export function recoveryCountdown(nextAttemptAt?: string, now = Date.now()): string | null {
+  if (!nextAttemptAt) return null;
+  const remaining = Math.max(0, Date.parse(nextAttemptAt) - now);
+  if (!Number.isFinite(remaining)) return null;
+  return remaining <= 0 ? "即将重试" : `${Math.ceil(remaining / 1_000)} 秒后重试`;
+}
+
+export function RoomRecoveryPanel({
+  recovery,
+  retrying,
+  onRetry,
+}: {
+  recovery: Extract<RoomConnectionRecoveryStatus, { status: "waiting-cleanup" }>;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  const countdown = recoveryCountdown(recovery.nextAttemptAt);
+  return (
+    <div className="saved-connection-recovery" role="status">
+      <div className="saved-connection-recovery-heading">
+        <Clock3 aria-hidden="true" />
+        <strong>{recovery.phase === "local-drain" ? "正在完成本机收尾" : "正在等待远程清理"}</strong>
+      </div>
+      <p>{roomRecoveryGuidance(recovery)}</p>
+      <dl>
+        <div><dt>房间地址</dt><dd>{recovery.serverUrl}</dd></div>
+        <div><dt>重试状态</dt><dd>已重试 {recovery.attempts} 次{countdown ? ` · ${countdown}` : ""}</dd></div>
+        {recovery.lastError && <div><dt>最后原因</dt><dd>{recovery.lastError}</dd></div>}
+      </dl>
+      {recovery.retryable && (
+        <button type="button" className="secondary-button recovery-retry-button" onClick={onRetry} disabled={retrying}>
+          {retrying ? <LoaderCircle className="spin" aria-hidden="true" /> : <RefreshCw aria-hidden="true" />}
+          {retrying ? "正在重试" : "立即重试"}
+        </button>
+      )}
     </div>
   );
 }
@@ -730,6 +815,12 @@ export function EntryScreen({
     connectionId: string;
     notice: Notice;
   } | null>(null);
+  const [savedConnectionRecoveries, setSavedConnectionRecoveries] = useState<Record<
+    string,
+    Extract<RoomConnectionRecoveryStatus, { status: "waiting-cleanup" }>
+  >>({});
+  const [autoActivateRecoveryId, setAutoActivateRecoveryId] = useState<string>();
+  const [retryingConnectionId, setRetryingConnectionId] = useState<string>();
   const [createValues, setCreateValues] = useState({
     roomName: "",
     projectName: "",
@@ -746,7 +837,22 @@ export function EntryScreen({
   useEffect(() => {
     if (!desktop) return;
     void listSavedConnections()
-      .then(setSavedConnections)
+      .then(async (connections) => {
+        setSavedConnections(connections);
+        const statuses = await Promise.allSettled(
+          connections.map((connection) => getSavedConnectionRecoveryStatus(connection.id)),
+        );
+        const recoveries: Record<
+          string,
+          Extract<RoomConnectionRecoveryStatus, { status: "waiting-cleanup" }>
+        > = {};
+        for (const result of statuses) {
+          if (result.status === "fulfilled" && result.value?.status === "waiting-cleanup") {
+            recoveries[result.value.connectionId] = result.value;
+          }
+        }
+        setSavedConnectionRecoveries(recoveries);
+      })
       .catch((caught) => setError(caught instanceof Error ? caught.message : "无法读取已保存的房间。"));
   }, [connectionsRevision, desktop]);
 
@@ -785,10 +891,10 @@ export function EntryScreen({
     }
   };
 
-  const enterSession = (session: Session, notice?: Notice | null) => {
+  const enterSession = useCallback((session: Session, notice?: Notice | null) => {
     saveSession(session);
     onConnected(session, notice);
-  };
+  }, [onConnected]);
 
   const submitCreate = async (event: FormEvent) => {
     event.preventDefault();
@@ -838,12 +944,27 @@ export function EntryScreen({
     }
   };
 
-  const openSaved = (connection: SavedRoomConnection) => {
+  const openSaved = useCallback((connection: SavedRoomConnection) => {
     setOpeningConnectionId(connection.id);
     setSavedConnectionNotice(null);
     void activateSavedConnection(connection.id)
       .then((activated) => {
+        if (activated?.status === "waiting-cleanup") {
+          setSavedConnectionRecoveries((current) => ({
+            ...current,
+            [connection.id]: activated.recovery,
+          }));
+          setAutoActivateRecoveryId(connection.id);
+          setSavedConnections((current) => current.map((item) =>
+            item.id === connection.id ? activated.connection : item));
+          return;
+        }
         const next = activated?.connection ?? connection;
+        setSavedConnectionRecoveries((current) => {
+          const { [connection.id]: _completed, ...remaining } = current;
+          return remaining;
+        });
+        setAutoActivateRecoveryId(undefined);
         if (activated) {
           const paused = new Set(activated.pausedConnectionIds);
           setSavedConnections((current) => current.map((item) => {
@@ -864,7 +985,93 @@ export function EntryScreen({
         },
       }))
       .finally(() => setOpeningConnectionId(undefined));
-  };
+  }, [enterSession]);
+
+  const retrySavedCleanup = useCallback((connection: SavedRoomConnection) => {
+    if (retryingConnectionId === connection.id) return;
+    setRetryingConnectionId(connection.id);
+    setAutoActivateRecoveryId(connection.id);
+    setSavedConnectionNotice(null);
+    void retrySavedConnectionCleanup(connection.id)
+      .then((status) => {
+        if (!status) return;
+        if (status.status === "ready") {
+          setSavedConnectionRecoveries((current) => {
+            const { [connection.id]: _completed, ...remaining } = current;
+            return remaining;
+          });
+          openSaved(connection);
+        } else {
+          setSavedConnectionRecoveries((current) => ({
+            ...current,
+            [connection.id]: status,
+          }));
+        }
+      })
+      .catch((caught) => setSavedConnectionNotice({
+        connectionId: connection.id,
+        notice: {
+          tone: "danger",
+          message: caught instanceof Error ? caught.message : "无法立即重试远程清理。",
+        },
+      }))
+      .finally(() => setRetryingConnectionId(undefined));
+  }, [openSaved, retryingConnectionId]);
+
+  const recoveryConnectionIds = useMemo(
+    () => Object.keys(savedConnectionRecoveries).sort().join("\n"),
+    [savedConnectionRecoveries],
+  );
+
+  useEffect(() => {
+    if (!recoveryConnectionIds) return;
+    const connectionIds = recoveryConnectionIds.split("\n");
+    let stopped = false;
+    let checking = false;
+    const check = async () => {
+      if (checking || stopped) return;
+      checking = true;
+      try {
+        const results = await Promise.allSettled(
+          connectionIds.map((connectionId) => getSavedConnectionRecoveryStatus(connectionId)),
+        );
+        if (stopped) return;
+        const readyAutoActivation = results.find((result) =>
+          result.status === "fulfilled"
+          && result.value?.status === "ready"
+          && result.value.connectionId === autoActivateRecoveryId);
+        const readyToActivate = readyAutoActivation?.status === "fulfilled"
+          ? savedConnections.find((item) => item.id === readyAutoActivation.value?.connectionId)
+          : undefined;
+        setSavedConnectionRecoveries((current) => {
+          const next = { ...current };
+          for (const result of results) {
+            if (result.status !== "fulfilled" || !result.value) continue;
+            if (result.value.status === "ready") {
+              delete next[result.value.connectionId];
+            } else {
+              next[result.value.connectionId] = result.value;
+            }
+          }
+          return next;
+        });
+        if (readyToActivate) {
+          stopped = true;
+          setAutoActivateRecoveryId(undefined);
+          openSaved(readyToActivate);
+        }
+      } catch {
+        // The persisted recovery status remains visible while the desktop bridge is temporarily busy.
+      } finally {
+        checking = false;
+      }
+    };
+    const timer = window.setInterval(() => void check(), 1_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [autoActivateRecoveryId, openSaved, recoveryConnectionIds, savedConnections]);
 
   const repositoryPicker = desktop && (
     <div className="repository-picker">
@@ -910,8 +1117,11 @@ export function EntryScreen({
                 openingConnectionId={openingConnectionId}
                 deletingConnectionId={deletingConnectionId}
                 notice={savedConnectionNotice}
+                recoveries={savedConnectionRecoveries}
+                retryingConnectionId={retryingConnectionId}
                 onOpen={openSaved}
                 onDelete={onRequestDelete}
+                onRetryCleanup={retrySavedCleanup}
               />
             </section>
           )}

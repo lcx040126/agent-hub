@@ -133,6 +133,73 @@ describe("integration controller lifecycle", () => {
     await expect(controller.pausePreparationQueue.list()).resolves.toEqual([]);
   });
 
+  it("returns structured recovery state and activates only after the fixed cleanup succeeds", async () => {
+    const userDataPath = await temporaryDirectory();
+    const target = connectionRecord("connection-a", false);
+    const unrelated = connectionRecord("connection-b", false, path.resolve("other-project"));
+    const { store, connections } = createMutableStore([target, unrelated]);
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => pauseJsonResponse(init));
+    const controller = new IntegrationController({
+      userDataPath,
+      store,
+      fetchImpl,
+      now: () => new Date("2026-08-27T00:00:00.000Z"),
+      operationTracker: { drain: vi.fn(async () => undefined) },
+    });
+    await controller.pauseQueue.enqueue({
+      connectionId: target.id,
+      reason: "leave-room",
+      cutoffAt: "2026-08-26T23:59:00.000Z",
+      requestId: "fixed-cleanup-a",
+    });
+    await controller.pauseQueue.defer(
+      "fixed-cleanup-a",
+      new Error("Agent Hub did not respond within 10000 ms."),
+    );
+    await controller.pauseQueue.enqueue({
+      connectionId: unrelated.id,
+      reason: "leave-room",
+      cutoffAt: "2026-08-26T23:58:00.000Z",
+      requestId: "fixed-cleanup-b",
+    });
+    await controller.pauseQueue.defer(
+      "fixed-cleanup-b",
+      new Error("connect ECONNREFUSED 10.0.0.2"),
+    );
+
+    await expect(controller.activateExclusiveConnection(target.id)).resolves.toMatchObject({
+      status: "waiting-cleanup",
+      connection: { id: target.id, integrationEnabled: false },
+      recovery: {
+        phase: "remote-cleanup",
+        attempts: 1,
+        failureKind: "timeout",
+        retryable: true,
+      },
+    });
+    expect(store.setRepositoryIntegrationOwner).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    await expect(controller.retryConnectionCleanup(target.id)).resolves.toMatchObject({
+      status: "ready",
+      connectionId: target.id,
+    });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body))).toMatchObject({
+      requestId: "fixed-cleanup-a",
+      cutoffAt: "2026-08-26T23:59:00.000Z",
+    });
+    await expect(controller.pauseQueue.list()).resolves.toMatchObject([
+      { connectionId: unrelated.id, requestId: "fixed-cleanup-b" },
+    ]);
+
+    await expect(controller.activateExclusiveConnection(target.id)).resolves.toMatchObject({
+      status: "activated",
+      connection: { id: target.id, integrationEnabled: true },
+    });
+    expect(connections.get(unrelated.id)?.integrationEnabled).toBe(false);
+  });
+
   it("serializes an immediate reactivation behind an in-flight pause", async () => {
     const userDataPath = await temporaryDirectory();
     const store = createStore();

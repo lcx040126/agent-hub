@@ -8,10 +8,12 @@ import {
   deleteSavedConnection,
   getDashboard,
   getLeaseScopeEvents,
+  getSavedConnectionRecoveryStatus,
   joinRoom,
   loadSession,
   pauseSavedConnection,
   resumeSavedConnection,
+  retrySavedConnectionCleanup,
   saveSession,
   secureDesktopSession,
   updateRoomSettings,
@@ -808,6 +810,7 @@ describe("desktop room transport", () => {
 
   it("returns activation details when switching the active room for a project", async () => {
     const result = {
+      status: "activated" as const,
       connection: {
         id: "connection-b",
         serverUrl: "http://127.0.0.1:4173",
@@ -828,6 +831,41 @@ describe("desktop room transport", () => {
 
     await expect(activateSavedConnection("connection-b")).resolves.toEqual(result);
     expect(activateRoomConnection).toHaveBeenCalledWith("connection-b");
+  });
+
+  it("reads and retries structured cleanup recovery through the desktop bridge", async () => {
+    const waiting = {
+      status: "waiting-cleanup" as const,
+      connectionId: "connection-b",
+      serverUrl: "http://10.20.16.139:4173",
+      phase: "remote-cleanup" as const,
+      attempts: 7,
+      nextAttemptAt: "2026-09-02T08:05:00.000Z",
+      lastError: "Agent Hub did not respond within 10000 ms.",
+      failureKind: "timeout" as const,
+      retryable: true,
+    };
+    const ready = {
+      status: "ready" as const,
+      connectionId: "connection-b",
+      serverUrl: waiting.serverUrl,
+    };
+    const getRoomConnectionRecoveryStatus = vi.fn(async () => waiting);
+    const retryRoomConnectionCleanup = vi.fn(async () => ready);
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        agentHubDesktop: {
+          getRoomConnectionRecoveryStatus,
+          retryRoomConnectionCleanup,
+        },
+      },
+    });
+
+    await expect(getSavedConnectionRecoveryStatus("connection-b")).resolves.toEqual(waiting);
+    await expect(retrySavedConnectionCleanup("connection-b")).resolves.toEqual(ready);
+    expect(getRoomConnectionRecoveryStatus).toHaveBeenCalledWith("connection-b");
+    expect(retryRoomConnectionCleanup).toHaveBeenCalledWith("connection-b");
   });
 
   it("deletes a saved room through the desktop bridge and returns cleanup status", async () => {

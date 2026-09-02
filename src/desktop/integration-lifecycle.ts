@@ -4,6 +4,7 @@ import type {
   ActivateRoomConnectionResult,
   DeleteRoomConnectionResult,
   PauseRoomConnectionResult,
+  RoomConnectionRecoveryStatus,
   SaveRoomConnectionInput,
   SavedRoomConnection,
 } from "./contracts.js";
@@ -63,9 +64,24 @@ export async function activateDesktopRoomConnection(options: {
 }): Promise<ActivateRoomConnectionResult> {
   await options.localServer.start();
   const activated = await options.controller.activateExclusiveConnection(options.connectionId);
+  if (activated.status === "waiting-cleanup") return activated;
   await options.controller.start();
   await options.onActivated?.();
   return activated;
+}
+
+export async function getDesktopRoomConnectionRecoveryStatus(options: {
+  connectionId: string;
+  controller: Pick<IntegrationController, "getConnectionRecoveryStatus">;
+}): Promise<RoomConnectionRecoveryStatus> {
+  return options.controller.getConnectionRecoveryStatus(options.connectionId);
+}
+
+export async function retryDesktopRoomConnectionCleanup(options: {
+  connectionId: string;
+  controller: Pick<IntegrationController, "retryConnectionCleanup">;
+}): Promise<RoomConnectionRecoveryStatus> {
+  return options.controller.retryConnectionCleanup(options.connectionId);
 }
 
 export async function saveAndActivateDesktopRoomConnection(options: {

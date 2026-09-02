@@ -455,6 +455,71 @@ code {
   flex: 0 0 13px;
 }
 
+.saved-connection-recovery {
+  padding: 9px 10px;
+  display: grid;
+  gap: 7px;
+  color: #5f4a2c;
+  background: #fff8e9;
+  border: 1px solid #ead4ad;
+  border-radius: 5px;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.saved-connection-recovery-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.saved-connection-recovery-heading svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  color: #9b6728;
+}
+
+.saved-connection-recovery p {
+  margin: 0;
+}
+
+.saved-connection-recovery dl {
+  margin: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.saved-connection-recovery dl > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 6px;
+}
+
+.saved-connection-recovery dt {
+  color: #8a7557;
+}
+
+.saved-connection-recovery dd {
+  min-width: 0;
+  margin: 0;
+  color: #51493f;
+  overflow-wrap: anywhere;
+}
+
+.recovery-retry-button {
+  width: fit-content;
+  min-height: 30px;
+  padding: 5px 9px;
+  font-size: 10px;
+}
+
+.recovery-retry-button svg {
+  width: 13px;
+  height: 13px;
+}
+
 .segmented-control {
   min-height: 42px;
   padding: 4px;

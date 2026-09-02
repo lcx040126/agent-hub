@@ -265,6 +265,40 @@ describe("desktop integration lifecycle", () => {
     expect(onActivated).toHaveBeenCalledTimes(1);
   });
 
+  it("does not start integrations or schedulers while remote cleanup is pending", async () => {
+    const connection = savedConnection(false);
+    const waiting = {
+      status: "waiting-cleanup" as const,
+      connection,
+      pausedConnectionIds: [],
+      warnings: [],
+      recovery: {
+        status: "waiting-cleanup" as const,
+        connectionId: connection.id,
+        serverUrl: connection.serverUrl,
+        phase: "remote-cleanup" as const,
+        attempts: 3,
+        failureKind: "timeout" as const,
+        retryable: true,
+      },
+    };
+    const startController = vi.fn(async () => undefined);
+    const onActivated = vi.fn();
+
+    await expect(activateDesktopRoomConnection({
+      connectionId: connection.id,
+      controller: {
+        activateExclusiveConnection: vi.fn(async () => waiting),
+        start: startController,
+      },
+      localServer: { start: vi.fn(async () => undefined) },
+      onActivated,
+    })).resolves.toEqual(waiting);
+
+    expect(startController).not.toHaveBeenCalled();
+    expect(onActivated).not.toHaveBeenCalled();
+  });
+
   it("persists a new room paused before activating it exclusively", async () => {
     const calls: string[] = [];
     const paused = savedConnection(false);

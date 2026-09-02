@@ -60,8 +60,10 @@ import {
   activateDesktopRoomConnection,
   deleteDesktopRoomConnection,
   enterDesktopMaintenance,
+  getDesktopRoomConnectionRecoveryStatus,
   pauseDesktopRoomConnection,
   recoverDesktopMaintenance,
+  retryDesktopRoomConnectionCleanup,
   saveAndActivateDesktopRoomConnection,
   shouldStartLocalRoomService,
   shutdownDesktopIntegration,
@@ -596,6 +598,28 @@ function registerIpc(
     return activated;
   });
 
+  ipcMain.handle(DESKTOP_IPC.getRoomConnectionRecoveryStatus, async (event, connectionId: unknown) => {
+    assertTrustedRenderer(event, serverInfo.localServerUrl);
+    if (typeof connectionId !== "string" || !connectionId.trim()) {
+      throw new Error("A saved room connection is required.");
+    }
+    return getDesktopRoomConnectionRecoveryStatus({
+      connectionId: connectionId.trim(),
+      controller,
+    });
+  });
+
+  ipcMain.handle(DESKTOP_IPC.retryRoomConnectionCleanup, async (event, connectionId: unknown) => {
+    assertTrustedRenderer(event, serverInfo.localServerUrl);
+    if (typeof connectionId !== "string" || !connectionId.trim()) {
+      throw new Error("A saved room connection is required.");
+    }
+    return retryDesktopRoomConnectionCleanup({
+      connectionId: connectionId.trim(),
+      controller,
+    });
+  });
+
   ipcMain.handle(DESKTOP_IPC.deleteRoomConnection, async (event, connectionId: unknown) => {
     assertTrustedRenderer(event, serverInfo.localServerUrl);
     if (typeof connectionId !== "string" || !connectionId.trim()) {
@@ -637,7 +661,7 @@ function registerIpc(
     });
     const saved = activated.connection;
     allowedRepositories.add(pathKey(saved.repositoryPath));
-    await activeSchedulers.scanner?.scanNow();
+    if (activated.status === "activated") await activeSchedulers.scanner?.scanNow();
     return activated;
   });
 

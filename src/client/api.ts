@@ -238,10 +238,42 @@ export type SavedRoomConnection = {
   updatedAt: string;
 };
 
+export type RoomCleanupFailureKind =
+  | "unreachable"
+  | "timeout"
+  | "unauthorized"
+  | "member_removed"
+  | "room_dissolved"
+  | "incompatible"
+  | "invalid_response"
+  | "local"
+  | "unknown";
+
+export type RoomConnectionRecoveryStatus =
+  | { status: "ready"; connectionId: string; serverUrl: string }
+  | {
+      status: "waiting-cleanup";
+      connectionId: string;
+      serverUrl: string;
+      phase: "local-drain" | "remote-cleanup";
+      attempts: number;
+      nextAttemptAt?: string;
+      lastError?: string;
+      failureKind: RoomCleanupFailureKind;
+      retryable: boolean;
+    };
+
 export type ActivateRoomConnectionResult = {
+  status: "activated";
   connection: SavedRoomConnection;
   pausedConnectionIds: string[];
   warnings: string[];
+} | {
+  status: "waiting-cleanup";
+  connection: SavedRoomConnection;
+  pausedConnectionIds: string[];
+  warnings: string[];
+  recovery: Extract<RoomConnectionRecoveryStatus, { status: "waiting-cleanup" }>;
 };
 
 export type SecureDesktopSessionResult = {
@@ -296,6 +328,8 @@ type DesktopApi = {
     localRoomServerStopped: boolean;
   }>;
   activateRoomConnection(connectionId: string): Promise<ActivateRoomConnectionResult>;
+  getRoomConnectionRecoveryStatus(connectionId: string): Promise<RoomConnectionRecoveryStatus>;
+  retryRoomConnectionCleanup(connectionId: string): Promise<RoomConnectionRecoveryStatus>;
   deleteRoomConnection(connectionId: string): Promise<DeleteRoomConnectionResult>;
   requestRoomServer(input: RoomServerRequest): Promise<{ status: number; body: unknown }>;
   installCodexIntegration(connectionId: string): Promise<{
@@ -1220,6 +1254,30 @@ export async function activateSavedConnection(connectionId: string): Promise<Act
   }
 }
 
+export async function getSavedConnectionRecoveryStatus(
+  connectionId: string,
+): Promise<RoomConnectionRecoveryStatus | null> {
+  const desktop = window.agentHubDesktop;
+  if (!desktop || typeof desktop.getRoomConnectionRecoveryStatus !== "function") return null;
+  try {
+    return await desktop.getRoomConnectionRecoveryStatus(connectionId);
+  } catch (error) {
+    throw friendlyDesktopError(error);
+  }
+}
+
+export async function retrySavedConnectionCleanup(
+  connectionId: string,
+): Promise<RoomConnectionRecoveryStatus | null> {
+  const desktop = window.agentHubDesktop;
+  if (!desktop || typeof desktop.retryRoomConnectionCleanup !== "function") return null;
+  try {
+    return await desktop.retryRoomConnectionCleanup(connectionId);
+  } catch (error) {
+    throw friendlyDesktopError(error);
+  }
+}
+
 export async function deleteSavedConnection(connectionId: string): Promise<DeleteRoomConnectionResult> {
   const desktop = window.agentHubDesktop;
   if (!desktop || typeof desktop.deleteRoomConnection !== "function") {
@@ -1256,6 +1314,9 @@ export async function secureDesktopSession(
       memberRole: session.member.role === "host" ? "host" : "member",
       integrationEnabled: session.integrationEnabled,
     });
+    if (activation.status === "waiting-cleanup") {
+      throw new Error("旧连接清理尚未完成，当前房间暂时不能安全启用。");
+    }
     const saved = activation.connection;
     return {
       session: {

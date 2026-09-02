@@ -10,6 +10,16 @@ const MAX_BACKOFF_MS = 5 * 60_000;
 const MAX_RETRY_ATTEMPTS = 1_000;
 
 export type PauseReason = "leave-room" | "app-shutdown" | "host-exit";
+export type PauseFailureKind =
+  | "unreachable"
+  | "timeout"
+  | "unauthorized"
+  | "member_removed"
+  | "room_dissolved"
+  | "incompatible"
+  | "invalid_response"
+  | "local"
+  | "unknown";
 
 export interface PauseRetryEntry {
   version: typeof DOCUMENT_VERSION;
@@ -20,6 +30,9 @@ export interface PauseRetryEntry {
   attempts: number;
   nextAttemptAt: string;
   lastError?: string;
+  lastFailureKind?: PauseFailureKind;
+  lastErrorCode?: string;
+  lastHttpStatus?: number;
 }
 
 interface PauseRetryDocument {
@@ -65,6 +78,10 @@ export interface PauseRetryQueueOptions {
 export interface PauseRetryFlushOptions {
   /** Keep entries that still depend on an earlier durable recovery record. */
   shouldRetain?: (entry: Readonly<PauseRetryEntry>) => boolean | Promise<boolean>;
+  /** Restrict a foreground retry to one saved room. */
+  onlyConnectionId?: string;
+  /** Ignore backoff and non-retryable diagnostics for an explicit user retry. */
+  force?: boolean;
 }
 
 /** A durable queue containing only connection IDs and cutoff metadata, never tokens. */
@@ -130,11 +147,15 @@ export class PauseRetryQueue {
         if (entry.requestId !== normalizedId) return entry;
         changed = true;
         const attempts = Math.min(entry.attempts + 1, MAX_RETRY_ATTEMPTS);
+        const diagnostic = pauseFailureDiagnostic(error);
         return {
           ...entry,
           attempts,
           nextAttemptAt: new Date(now.getTime() + retryDelay(attempts)).toISOString(),
           lastError: error.message,
+          lastFailureKind: diagnostic.kind,
+          lastErrorCode: diagnostic.code,
+          lastHttpStatus: diagnostic.httpStatus,
         };
       });
       if (changed) await this.writeDocument({ version: DOCUMENT_VERSION, requests });
@@ -153,7 +174,15 @@ export class PauseRetryQueue {
       let changed = false;
       const remaining: PauseRetryEntry[] = [];
       for (const entry of document.requests) {
-        if (Date.parse(entry.nextAttemptAt) > now.getTime()) {
+        if (options.onlyConnectionId && entry.connectionId !== options.onlyConnectionId) {
+          remaining.push(entry);
+          continue;
+        }
+        if (!options.force && entry.lastFailureKind && !isRetryablePauseFailure(entry.lastFailureKind)) {
+          remaining.push(entry);
+          continue;
+        }
+        if (!options.force && Date.parse(entry.nextAttemptAt) > now.getTime()) {
           remaining.push(entry);
           continue;
         }
@@ -181,11 +210,15 @@ export class PauseRetryQueue {
             continue;
           }
           const attempts = Math.min(entry.attempts + 1, MAX_RETRY_ATTEMPTS);
+          const diagnostic = pauseFailureDiagnostic(error);
           remaining.push({
             ...entry,
             attempts,
             nextAttemptAt: new Date(now.getTime() + retryDelay(attempts)).toISOString(),
             lastError: normalized.message,
+            lastFailureKind: diagnostic.kind,
+            lastErrorCode: diagnostic.code,
+            lastHttpStatus: diagnostic.httpStatus,
           });
           changed = true;
           this.options.onError?.(normalized, entry);
@@ -465,7 +498,93 @@ function parseEntry(value: unknown): PauseRetryEntry {
   const nextAttemptAt = iso(value.nextAttemptAt, "nextAttemptAt");
   const attempts = Number(value.attempts);
   if (!Number.isInteger(attempts) || attempts < 0 || attempts > MAX_RETRY_ATTEMPTS) throw new Error("Agent Hub found an invalid pause retry attempt count.");
-  return { version: DOCUMENT_VERSION, connectionId, reason, cutoffAt, requestId, attempts, nextAttemptAt, lastError: typeof value.lastError === "string" ? value.lastError : undefined };
+  const lastFailureKind = parseFailureKind(value.lastFailureKind);
+  const lastHttpStatus = Number(value.lastHttpStatus);
+  return {
+    version: DOCUMENT_VERSION,
+    connectionId,
+    reason,
+    cutoffAt,
+    requestId,
+    attempts,
+    nextAttemptAt,
+    lastError: typeof value.lastError === "string" ? value.lastError : undefined,
+    lastFailureKind,
+    lastErrorCode: typeof value.lastErrorCode === "string" ? value.lastErrorCode : undefined,
+    lastHttpStatus: Number.isInteger(lastHttpStatus) && lastHttpStatus >= 100 && lastHttpStatus <= 599
+      ? lastHttpStatus
+      : undefined,
+  };
+}
+
+export function pauseFailureDiagnostic(error: unknown): {
+  kind: PauseFailureKind;
+  code?: string;
+  httpStatus?: number;
+} {
+  if (error instanceof AgentHubHttpError) {
+    const code = error.code.toLowerCase();
+    let kind: PauseFailureKind;
+    if (error.status === 401 || code === "unauthorized" || code.includes("credential")) {
+      kind = "unauthorized";
+    } else if (code === "member_removed" || code === "member_not_found") {
+      kind = "member_removed";
+    } else if (code === "room_dissolved" || code === "room_not_found") {
+      kind = "room_dissolved";
+    } else if (code === "invalid_response") {
+      kind = "invalid_response";
+    } else if (/(?:protocol|schema|version|compat|unsupported)/i.test(code)) {
+      kind = "incompatible";
+    } else if (error.status === 408) {
+      kind = "timeout";
+    } else if (error.status === 429 || error.status >= 500) {
+      kind = "unreachable";
+    } else {
+      kind = "unknown";
+    }
+    return { kind, code: error.code, httpStatus: error.status };
+  }
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (/(?:member (?:was )?removed|成员.*移除)/i.test(message)) {
+    return { kind: "member_removed" };
+  }
+  if (/(?:room (?:was )?dissolved|房间.*解散)/i.test(message)) {
+    return { kind: "room_dissolved" };
+  }
+  if (/(?:unauthorized|credential.*(?:invalid|expired)|token.*(?:invalid|expired))/i.test(message)) {
+    return { kind: "unauthorized" };
+  }
+  if (/invalid member pause response|response that was not valid json/i.test(message)) {
+    return { kind: "invalid_response" };
+  }
+  if (/(?:did not respond|timed out|timeout|etimedout|abort)/i.test(message)) {
+    return { kind: "timeout" };
+  }
+  if (/(?:fetch failed|failed to fetch|network|socket|econn|connection reset|connection refused|enotfound)/i.test(message)) {
+    return { kind: "unreachable" };
+  }
+  if (/(?:pause retry storage|connection .* is missing|member token|enoent|eacces|eperm)/i.test(message)) {
+    return { kind: "local" };
+  }
+  return { kind: "unknown" };
+}
+
+export function isRetryablePauseFailure(kind: PauseFailureKind): boolean {
+  return kind === "unreachable" || kind === "timeout" || kind === "unknown";
+}
+
+function parseFailureKind(value: unknown): PauseFailureKind | undefined {
+  return value === "unreachable"
+    || value === "timeout"
+    || value === "unauthorized"
+    || value === "member_removed"
+    || value === "room_dissolved"
+    || value === "incompatible"
+    || value === "invalid_response"
+    || value === "local"
+    || value === "unknown"
+    ? value
+    : undefined;
 }
 
 function shouldRetainPauseError(error: unknown): boolean {

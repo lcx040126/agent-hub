@@ -4,7 +4,11 @@ import {
   canonicalRepositoryIdentity,
   type ConnectionStore,
 } from "../desktop/connection-store.js";
-import type { SavedRoomConnection } from "../desktop/contracts.js";
+import type {
+  ActivateRoomConnectionResult,
+  RoomConnectionRecoveryStatus,
+  SavedRoomConnection,
+} from "../desktop/contracts.js";
 import { CodexHookStateStore } from "./hook-state.js";
 import { SessionEndQueueStore } from "./session-end-queue.js";
 import { TurnCompletionQueueStore } from "./turn-completion-queue.js";
@@ -20,7 +24,8 @@ import {
 import {
   PAUSE_RETRY_FILENAME,
   PauseRetryQueue,
-  hasPendingPauseForConnection,
+  isRetryablePauseFailure,
+  pauseFailureDiagnostic,
   requestMemberPause,
   type PauseReason,
   type PauseRequestResult,
@@ -41,11 +46,7 @@ export interface IntegrationControllerOptions {
     & Partial<Pick<ConnectionOperationTracker, "removeConnectionState">>;
 }
 
-export interface ExclusiveConnectionActivationResult {
-  connection: SavedRoomConnection;
-  pausedConnectionIds: string[];
-  warnings: string[];
-}
+export type ExclusiveConnectionActivationResult = ActivateRoomConnectionResult;
 
 export interface ConnectionDeletionCleanupContext {
   connection: SavedRoomConnection;
@@ -300,6 +301,20 @@ export class IntegrationController {
         throw new Error("Agent Hub cannot reactivate a room while desktop shutdown is in progress.");
       }
       const target = await this.requireConnection(connectionId);
+      const targetRecovery = await this.withConnectionLifecycle(target.id, async () => {
+        await this.flushPausePreparations(true, target.id);
+        await this.flushFixedPauseRetries(target.id);
+        return this.getConnectionRecoveryStatus(target.id);
+      });
+      if (targetRecovery.status === "waiting-cleanup") {
+        return {
+          status: "waiting-cleanup",
+          connection: await this.requireConnection(target.id),
+          pausedConnectionIds: [],
+          warnings: [],
+          recovery: targetRecovery,
+        };
+      }
       const activeConnections = await this.options.store.listActive();
       const peers: SavedRoomConnection[] = [];
       for (const connection of activeConnections) {
@@ -345,21 +360,6 @@ export class IntegrationController {
       }
 
       const connection = await this.withConnectionLifecycle(target.id, async () => {
-        // Keep this connection disabled until any pre-cutoff cleanup intent has
-        // drained and moved to a fixed-cutoff request. The process-wide sentinel
-        // may already be active for other rooms.
-        const pendingPreparations = await this.flushPausePreparations(true, target.id);
-        if (pendingPreparations > 0) {
-          throw new Error(
-            "Agent Hub cannot reactivate this room while an earlier cleanup is still waiting for operations to drain.",
-          );
-        }
-        await this.flushFixedPauseRetries();
-        if (await hasPendingPauseForConnection(this.options.userDataPath, target.id)) {
-          throw new Error(
-            "Agent Hub cannot reactivate this room until its previous remote cleanup reaches the room server.",
-          );
-        }
         const ownership = await this.options.store.setRepositoryIntegrationOwner(
           target.repositoryPath,
           target.id,
@@ -374,6 +374,7 @@ export class IntegrationController {
       });
 
       return {
+        status: "activated",
         connection,
         pausedConnectionIds: pausedConnectionIds.sort(),
         warnings,
@@ -624,6 +625,75 @@ export class IntegrationController {
     await this.flushPauseRetries();
   }
 
+  async getConnectionRecoveryStatus(
+    connectionId: string,
+  ): Promise<RoomConnectionRecoveryStatus> {
+    const connection = await this.requireConnection(connectionId);
+    try {
+      const preparations = (await this.pausePreparationQueue.list())
+        .filter((entry) => entry.connectionId === connection.id);
+      if (preparations.length > 0) {
+        const current = preparations.sort((left, right) => right.attempts - left.attempts)[0]!;
+        return {
+          status: "waiting-cleanup",
+          connectionId: connection.id,
+          serverUrl: connection.serverUrl,
+          phase: "local-drain",
+          attempts: current.attempts,
+          nextAttemptAt: current.nextAttemptAt,
+          lastError: current.lastError,
+          failureKind: "local",
+          retryable: true,
+        };
+      }
+      const retries = (await this.pauseQueue.list())
+        .filter((entry) => entry.connectionId === connection.id);
+      if (retries.length > 0) {
+        const current = retries.sort((left, right) => right.attempts - left.attempts)[0]!;
+        const failureKind = current.lastFailureKind
+          ?? pauseFailureDiagnostic(new Error(current.lastError ?? "Unknown cleanup failure.")).kind;
+        return {
+          status: "waiting-cleanup",
+          connectionId: connection.id,
+          serverUrl: connection.serverUrl,
+          phase: "remote-cleanup",
+          attempts: current.attempts,
+          nextAttemptAt: current.nextAttemptAt,
+          lastError: current.lastError,
+          failureKind,
+          retryable: isRetryablePauseFailure(failureKind),
+        };
+      }
+      return {
+        status: "ready",
+        connectionId: connection.id,
+        serverUrl: connection.serverUrl,
+      };
+    } catch (error) {
+      return {
+        status: "waiting-cleanup",
+        connectionId: connection.id,
+        serverUrl: connection.serverUrl,
+        phase: "local-drain",
+        attempts: 0,
+        lastError: toError(error).message,
+        failureKind: "local",
+        retryable: false,
+      };
+    }
+  }
+
+  /** Retry one room immediately without changing its cleanup identity or enabling integration. */
+  async retryConnectionCleanup(connectionId: string): Promise<RoomConnectionRecoveryStatus> {
+    return this.withRepositoryConnectionLifecycle(connectionId, async () => {
+      await this.flushPausePreparations(true, connectionId);
+      await this.flushFixedPauseRetries(connectionId, true);
+      const status = await this.getConnectionRecoveryStatus(connectionId);
+      if (status.status === "waiting-cleanup" && status.retryable) this.schedulePauseRetry(5_000);
+      return status;
+    });
+  }
+
   private schedulePauseRetry(delayMs = 0): void {
     if (this.retryTimer || this.presence?.record.status !== "active") return;
     this.retryTimer = setTimeout(() => {
@@ -653,7 +723,9 @@ export class IntegrationController {
         this.pausePreparationQueue.list(),
         this.pauseQueue.list(),
       ]);
-      if (preparations.length > 0 || pauses.length > 0) this.schedulePauseRetry(5_000);
+      const hasRetryablePause = pauses.some((entry) =>
+        !entry.lastFailureKind || isRetryablePauseFailure(entry.lastFailureKind));
+      if (preparations.length > 0 || hasRetryablePause) this.schedulePauseRetry(5_000);
     } catch (error) {
       this.options.onError?.(toError(error));
     }
@@ -714,8 +786,10 @@ export class IntegrationController {
     }
   }
 
-  private async flushFixedPauseRetries(): Promise<void> {
+  private async flushFixedPauseRetries(onlyConnectionId?: string, force = false): Promise<void> {
     await this.pauseQueue.flush({
+      onlyConnectionId,
+      force,
       // Preparation is persisted before its fixed cutoff. Recheck for each
       // entry so a foreground pause that interleaves with this flush cannot
       // lose the only record containing its original cutoffAt.

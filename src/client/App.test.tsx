@@ -9,6 +9,7 @@ import {
   RecordModal,
   RecordsView,
   SavedConnectionList,
+  RoomRecoveryPanel,
   WorkItem,
   WorkView,
   StatusSummary,
@@ -27,6 +28,8 @@ import {
   noticeForDeletedConnection,
   monitorModeUpgradeGuidance,
   protectedSystemsForDashboard,
+  recoveryCountdown,
+  roomRecoveryGuidance,
   roomSettingsErrorMessage,
   ScopeEventRow,
   shortIdentifier,
@@ -786,6 +789,50 @@ describe("entry screen updates", () => {
     expect(markup).toContain('aria-label="从本机移除房间 1"');
     expect(markup.match(/ disabled=""/g)).toHaveLength(2);
     expect(markup).not.toMatch(/<button\b[^>]*>(?:(?!<\/button>)[\s\S])*<button\b/);
+  });
+
+  it("renders actionable remote cleanup recovery without a force-enter action", () => {
+    const recovery = {
+      status: "waiting-cleanup" as const,
+      connectionId: "connection-a",
+      serverUrl: "http://10.20.16.139:4173",
+      phase: "remote-cleanup" as const,
+      attempts: 7,
+      nextAttemptAt: "2026-09-02T08:00:30.000Z",
+      lastError: "Agent Hub did not respond within 10000 ms.",
+      failureKind: "timeout" as const,
+      retryable: true,
+    };
+    const markup = renderToStaticMarkup(
+      <RoomRecoveryPanel recovery={recovery} retrying={false} onRetry={() => undefined} />,
+    );
+
+    expect(markup).toContain("正在等待远程清理");
+    expect(markup).toContain("http://10.20.16.139:4173");
+    expect(markup).toContain("已重试 7 次");
+    expect(markup).toContain("立即重试");
+    expect(markup).toContain("房主已启动 Agent Hub");
+    expect(markup).not.toContain("强制进入");
+  });
+
+  it("gives terminal recovery guidance and hides retry for a dissolved room", () => {
+    const recovery = {
+      status: "waiting-cleanup" as const,
+      connectionId: "connection-a",
+      serverUrl: "http://10.20.16.139:4173",
+      phase: "remote-cleanup" as const,
+      attempts: 2,
+      failureKind: "room_dissolved" as const,
+      retryable: false,
+    };
+    const markup = renderToStaticMarkup(
+      <RoomRecoveryPanel recovery={recovery} retrying={false} onRetry={() => undefined} />,
+    );
+
+    expect(roomRecoveryGuidance(recovery)).toContain("从本机移除");
+    expect(markup).not.toContain("立即重试");
+    expect(recoveryCountdown("2026-09-02T08:00:05.000Z", Date.parse("2026-09-02T08:00:00.000Z")))
+      .toBe("5 秒后重试");
   });
 
   it("makes the local-only scope explicit before deletion", () => {
